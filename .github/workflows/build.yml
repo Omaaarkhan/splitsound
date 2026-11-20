@@ -109,10 +109,21 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Set the clock (macOS)
+        # Code signing asks Apple's timestamp service, which refuses a request
+        # from a machine whose clock has drifted, as hosted Macs sometimes have.
+        if: runner.os == 'macOS'
+        run: sudo sntp -sS time.apple.com || true
 
       - name: Build installers
-        run: npm run tauri build -- ${{ matrix.tauri-args }}
+        run: |
+          npm run tauri build -- ${{ matrix.tauri-args }} && exit 0
+          # The compiled app is kept, so a second attempt only repeats bundling and signing.
+          echo "::warning::Bundling failed; trying once more."
+          if [ "$RUNNER_OS" = "macOS" ]; then sudo sntp -sS time.apple.com || true; fi
+          npm run tauri build -- ${{ matrix.tauri-args }}
 
       - name: Collect installers
         run: node scripts/collect-artifacts.mjs --bundle-dir "${{ matrix.bundle-dir }}" --platform "${{ matrix.id }}" --out release-artifacts
