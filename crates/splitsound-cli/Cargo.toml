@@ -1,0 +1,20 @@
+[package]
+name = "splitsound-cli"
+publish = false
+description = "Command-line front end for the SplitSound engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "splitsound"
+path = "src/main.rs"
+
+[dependencies]
+splitsound-core = { path = "../splitsound-core" }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 2,
+  "models": [
+    {
+      "id": "scnet_large",
+      "kind": "scnet",
+      "revision": 1,
+      "name": "SCNet Large",
+      "description": "Best overall quality for vocals, drums, bass and everything else.",
+      "source": "GitHub",
+      "restricted": false,
+      "terms": null,
+      "license": "MIT",
+      "attribution": "SCNet: Sparse Compression Network for Music Source Separation, by Weinan Tong, Jiaxu Zhu, Jun Chen, Shiyin Kang, Tao Jiang, Yang Li, Zhiyong Wu and Helen Meng (ICASSP 2024). Code and pretrained weights MIT License, (c) 2024 starrytong. https://github.com/starrytong/SCNet",
+      "origin": "https://github.com/starrytong/SCNet",
+      "file": "scnet_large.onnx",
+      "sha256": "6f21c2bd71ee38dd49b92d3c04a4a0505f9f876cb4a061e919574bc6ecf02cab",
+      "sizeBytes": 85750454,
+      "acquire": {
+        "type": "download",
+        "file": "scnet_large.onnx.zst",
+        "sha256": "05b28dee5fe5da3456c66d477d2250af70dac0d4d1683666d99a8f81ffc4f338",
+        "sizeBytes": 77996104
+      },
+      "opset": 17,
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "targets": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "sampleRate": 44100,
+      "channels": 2,
+      "segmentSamples": 485100,
+      "strideSamples": 363825,
+      "nfft": 4096,
+      "hop": 1024,
+      "bins": 2049,
+      "frames": 476,
+      "dynamicBatch": true,
+      "window": "rectangular",
+      "weightStorage": "float16"
+    },
+    {
+      "id": "scnet_small",
+      "kind": "scnet",
+      "revision": 1,
+      "name": "SCNet",
+      "description": "Vocals, drums, bass and everything else, about three times faster than SCNet Large and a quarter of the download.",
+      "source": "GitHub",
+      "restricted": false,
+      "terms": null,
+      "license": "MIT",
+      "attribution": "SCNet: Sparse Compression Network for Music Source Separation, by Weinan Tong, Jiaxu Zhu, Jun Chen, Shiyin Kang, Tao Jiang, Yang Li, Zhiyong Wu and Helen Meng (ICASSP 2024). Code and pretrained weights MIT License, (c) 2024 starrytong. https://github.com/starrytong/SCNet",
+      "origin": "https://github.com/starrytong/SCNet",
+      "file": "scnet_small.onnx",
+      "sha256": "358d85f1f89727fa4a64553ab29493d32d70c9be7a888d20ca0fbc2fc7e4a440",
+      "sizeBytes": 22516980,
+      "acquire": {
+        "type": "download",
+        "file": "scnet_small.onnx.zst",
+        "sha256": "1aed68ce5f7454df1a0942e9ffd3b5846d682a0772bed27576b8376a3aeb455c",
+        "sizeBytes": 19752783
+      },
+      "opset": 17,
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "targets": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "sampleRate": 44100,
+      "channels": 2,
+      "segmentSamples": 485100,
+      "strideSamples": 363825,
+      "nfft": 4096,
+      "hop": 1024,
+      "bins": 2049,
+      "frames": 476,
+      "dynamicBatch": true,
+      "window": "rectangular",
+      "weightStorage": "float16"
+    },
+    {
+      "id": "htdemucs_6s",
+      "kind": "htdemucs",
+      "revision": 1,
+      "name": "Demucs 6-stem",
+      "description": "Adds separate guitar and piano stems to vocals, drums, bass and other.",
+      "source": "Meta",
+      "restricted": true,
+      "terms": "Demucs is published by Meta for research. Its weights are not under an open-source licence and are likely limited to non-commercial use (CC BY-NC). SplitSound downloads them directly from Meta and keeps them on this computer.",
+      "license": "Graph: MIT. Weights: not open source (see terms); not distributed by SplitSound.",
+      "attribution": "HTDemucs v4 (Hybrid Transformer Demucs) by Simon Rouard, Francisco Massa and Alexandre Defossez, Meta Platforms, Inc. Code: MIT License, https://github.com/facebookresearch/demucs . The pretrained weights are NOT under the MIT License; see LICENSES.md.",
+      "origin": "https://github.com/facebookresearch/demucs",
+      "file": "htdemucs_6s.onnx",
+      "sha256": "dabfbabffda5c64c8e7645cf8720028189f27825f3b6fb00c19a21d6f622cde2",
+      "sizeBytes": 921793,
+      "acquire": {
+        "type": "download",
+        "file": "htdemucs_6s.onnx.zst",
+        "sha256": "6b650670a4c6dcb0366ef823a84e5f404abea6af59e7de07dc7455d413ae064b",
+        "sizeBytes": 39985
+      },
+      "opset": 17,
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals",
+        "guitar",
+        "piano"
+      ],
+      "targets": [
+        "drums",
+        "bass",
+        "other",
+        "vocals",
+        "guitar",
+        "piano"
+      ],
+      "sampleRate": 44100,
+      "channels": 2,
+      "segmentSamples": 343980,
+      "strideSamples": 257985,
+      "nfft": 4096,
+      "hop": 1024,
+      "bins": 2048,
+      "frames": 336,
+      "dynamicBatch": true,
+      "window": "hann",
+      "weightStorage": "float32",
+      "weights": {
+        "file": "htdemucs_6s.weights",
+        "sha256": "42687f50d153e31e7b2702e603ce4c0ffe3b152c6a5ad684c2da54a702cff3d6",
+        "sizeBytes": 109659984,
+        "tensors": {
+          "file": "htdemucs_6s.tensors.json",
+          "sha256": "37e74ecc3e0983a03bd73a5b957eb29982c3fd5682f9a3bd5513f6d8ba5d1728",
+          "sizeBytes": 85865
+        },
+        "upstream": {
+          "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
+          "sha256": "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+          "sizeBytes": 54996327,
+          "format": "torch-zip"
+        }
+      }
+    },
+    {
+      "id": "efficientat_mn10_as",
+      "kind": "tagger",
+      "revision": 1,
+      "name": "Instrument tagger",
+      "description": "Recognises which instruments and voices are present.",
+      "source": "GitHub",
+      "restricted": false,
+      "terms": null,
+      "license": "MIT",
+      "attribution": "EfficientAT mn10_as by Florian Schmid, Khaled Koutini and Gerhard Widmer (\"Efficient Large-scale Audio Tagging via Transformer-to-CNN Knowledge Distillation\", ICASSP 2023). MIT License. https://github.com/fschmid56/EfficientAT . Trained on AudioSet (Google, CC BY 4.0).",
+      "origin": "https://github.com/fschmid56/EfficientAT",
+      "file": "efficientat_mn10_as.onnx",
+      "sha256": "7cc428d1869758cc3bfb3b3774abec63d525fb48b96d8a08b0eadb9427e5a435",
+      "sizeBytes": 23741689,
+      "acquire": {
+        "type": "download",
+        "file": "efficientat_mn10_as.onnx.zst",
+        "sha256": "42eeeee67ab47511925826ffbb76a7d906303990eaad4170a53be962b38832b7",
+        "sizeBytes": 18989845
+      },
+      "opset": 17,
+      "sampleRate": 32000,
+      "channels": 1,
+      "windowSamples": 320000,
+      "hopSamples": 160000,
+      "numClasses": 527,
+      "dynamicBatch": false,
+      "labels": {
+        "file": "audioset_labels.json",
+        "sha256": "810eedff382eaaa456c1151eceec75e1dfbbbc8949a118752350dbf22648a874",
+        "sizeBytes": 7921
+      },
+      "instrumentMap": {
+        "file": "instrument_map.json",
+        "sha256": "cb9ed79a30f9fb48adcee0f2bc029c0c2c39ff9c53e18c009ee6fd8d4dadbe70",
+        "sizeBytes": 10244
+      }
+    }
+  ]
+}

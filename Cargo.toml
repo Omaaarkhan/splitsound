@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/splitsound-core", "crates/splitsound-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Omaaarkhan/splitsound"
+authors = ["SplitSound contributors"]
+
+# The engine does heavy DSP. Unoptimised it is unusably slow, so optimise it
+# (and every dependency) even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.splitsound-core]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

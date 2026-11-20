@@ -1,0 +1,64 @@
+# cargo-deny configuration: what the Rust dependency tree is allowed to contain.
+# Run with `cargo deny check`. CI runs it on every change.
+
+[graph]
+# Only the platforms the app ships for.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every entry needs a reason and should be revisited when dependencies move.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licences, plus MPL-2.0 (file-level copyleft; these crates are used unmodified).
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+# MP3 export uses LAME, which is LGPL. It is compiled from source into the app
+# behind the engine's default-on `mp3` feature. Because the whole app is open
+# source, anyone can rebuild it against a different LAME, which is what the
+# licence asks for. Building with `--no-default-features` leaves it out.
+[[licenses.exceptions]]
+crate = "mp3lame-encoder"
+allow = ["LGPL-3.0"]
+
+[[licenses.exceptions]]
+crate = "mp3lame-sys"
+allow = ["LGPL-3.0"]
+
+[bans]
+# Tauri's tree legitimately carries a few duplicate versions.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Nothing from git or private registries: every crate comes from crates.io,
+# pinned by Cargo.lock.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
