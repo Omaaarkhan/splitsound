@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-playback-set-source"
+description = "Enables the playback_set_source command without any pre-configured scope."
+commands.allow = ["playback_set_source"]
+
+[[permission]]
+identifier = "deny-playback-set-source"
+description = "Denies the playback_set_source command without any pre-configured scope."
+commands.deny = ["playback_set_source"]

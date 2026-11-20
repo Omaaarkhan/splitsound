@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-model-files"
+description = "Enables the import_model_files command without any pre-configured scope."
+commands.allow = ["import_model_files"]
+
+[[permission]]
+identifier = "deny-import-model-files"
+description = "Denies the import_model_files command without any pre-configured scope."
+commands.deny = ["import_model_files"]

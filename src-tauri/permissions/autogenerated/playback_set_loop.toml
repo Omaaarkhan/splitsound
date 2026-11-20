@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-playback-set-loop"
+description = "Enables the playback_set_loop command without any pre-configured scope."
+commands.allow = ["playback_set_loop"]
+
+[[permission]]
+identifier = "deny-playback-set-loop"
+description = "Denies the playback_set_loop command without any pre-configured scope."
+commands.deny = ["playback_set_loop"]

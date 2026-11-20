@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-artwork"
+description = "Enables the get_artwork command without any pre-configured scope."
+commands.allow = ["get_artwork"]
+
+[[permission]]
+identifier = "deny-get-artwork"
+description = "Denies the get_artwork command without any pre-configured scope."
+commands.deny = ["get_artwork"]
