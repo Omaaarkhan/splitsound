@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import type { ModelStatus, Quality, Settings } from "../ipc/contract";
+import type { ModelStatus, Quality, Settings, UpdateInfo } from "../ipc/contract";
 import { invoke } from "../ipc/client";
-import { checkForAppUpdate, pickAnyFiles, type UpdateCheckResult } from "../ipc/platform";
+import { pickAnyFiles } from "../ipc/platform";
 import { useStore } from "../stores/createStore";
+import { checkForUpdatesManually, startInstallUpdate } from "../stores/index";
 import { cancelModelDownloads, modelsStore, removeModel } from "../stores/modelsStore";
 import { settingsStore, updateSettings } from "../stores/settingsStore";
 import { showNotice } from "../stores/uiStore";
@@ -35,7 +36,9 @@ export function SettingsPanel({
   const { settings, appInfo } = useStore(settingsStore);
   const { models } = useStore(modelsStore);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [updateResult, setUpdateResult] = useState<
+    { status: "up-to-date" } | { status: "available"; update: UpdateInfo } | null
+  >(null);
 
   const threadOptions = useMemo<SelectOption<number>[]>(() => {
     const opts: SelectOption<number>[] = [{ value: 0, label: "Automatic" }];
@@ -55,8 +58,12 @@ export function SettingsPanel({
   const handleCheckUpdates = async () => {
     if (checkingUpdate) return;
     setCheckingUpdate(true);
-    const res = await checkForAppUpdate();
-    setUpdateResult(res);
+    const res = await checkForUpdatesManually();
+    if (res.status === "error") {
+      setUpdateResult(null);
+    } else {
+      setUpdateResult(res);
+    }
     setCheckingUpdate(false);
   };
 
@@ -265,9 +272,7 @@ export function SettingsPanel({
                 <span className="settings-row__sub">
                   {updateResult.status === "up-to-date"
                     ? "SplitSound is up to date."
-                    : updateResult.status === "available"
-                      ? `Version ${updateResult.version} is available.`
-                      : updateResult.message}
+                    : `SplitSound ${updateResult.update.version} is available.`}
                 </span>
               ) : null}
             </div>
@@ -276,9 +281,12 @@ export function SettingsPanel({
                 <button
                   type="button"
                   className="console-key console-key--compact console-key--lit"
-                  onClick={() => void updateResult.install()}
+                  onClick={() => {
+                    onClose();
+                    void startInstallUpdate();
+                  }}
                 >
-                  Install and restart
+                  Update and restart
                 </button>
               ) : null}
               <button

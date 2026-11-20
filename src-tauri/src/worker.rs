@@ -113,6 +113,19 @@ impl<J: Job> Worker<J> {
         self.inner.cv.notify_all();
     }
 
+    /// Queues `job` if fewer than `max_pending` jobs are waiting; otherwise
+    /// returns `Err(job)` without queueing it.
+    pub fn try_push(&self, job: J, max_pending: usize) -> Result<(), J> {
+        let mut st = lock(&self.inner.state);
+        if st.pending.len() >= max_pending {
+            return Err(job);
+        }
+        st.pending.push_back(job);
+        drop(st);
+        self.inner.cv.notify_all();
+        Ok(())
+    }
+
     pub fn cancel(&self, key: &str) -> Cancelled<J> {
         let mut st = lock(&self.inner.state);
         if let Some(i) = st.pending.iter().position(|j| j.key() == key) {
@@ -125,6 +138,16 @@ impl<J: Job> Worker<J> {
             }
             _ => Cancelled::Idle,
         }
+    }
+
+    /// Removes every queued job and cancels the running job, if any.
+    pub fn cancel_all(&self) -> Vec<J> {
+        let mut st = lock(&self.inner.state);
+        let drained: Vec<J> = st.pending.drain(..).collect();
+        if let Some((_, token)) = &st.running {
+            token.cancel();
+        }
+        drained
     }
 
     /// True if a job with this key is queued or running.
@@ -237,6 +260,23 @@ mod tests {
         assert!(w.wait_until_stopped("slow", Duration::from_secs(2)));
         assert_eq!(w.cancel("nothing"), Cancelled::Idle);
         assert!(!w.contains("queued"));
+
+        // Bounded queue cap and cancel_all.
+        w.push("slow".into());
+        while !w.is_running("slow") {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(w.try_push("q1".into(), 2).is_ok());
+        assert!(w.try_push("q2".into(), 2).is_ok());
+        assert_eq!(w.try_push("q3".into(), 2), Err("q3".to_string()));
+        let drained = w.cancel_all();
+        assert_eq!(drained, vec!["q1".to_string(), "q2".to_string()]);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "slow cancelled"
+        );
+        assert!(w.wait_until_stopped("slow", Duration::from_secs(2)));
+        assert!(!w.contains("q1") && !w.contains("q2"));
         w.shutdown();
     }
 }

@@ -19,6 +19,7 @@ import type {
   SplitProgress,
   StemId,
   StemInfo,
+  UpdateInfo,
 } from "../contract";
 import { STEMS_BY_MODE } from "../contract";
 import { AUDIO_EXTENSIONS, EXPORT_FORMATS, stemName } from "../../utils/stems";
@@ -56,6 +57,12 @@ export interface MockBackendOptions {
   timeScale?: number;
   /** Simulate model downloads failing mid-flight. */
   failModelDownloads?: boolean;
+  /** Simulated newer version returned by check_for_update, or null when up to date. */
+  availableUpdate?: UpdateInfo | null;
+  /** Simulate check_for_update rejecting. */
+  failUpdateCheck?: boolean;
+  /** Emit update:progress with totalBytes: null when installing an update. */
+  updateTotalBytesUnknown?: boolean;
 }
 
 type Listener<E extends EventName> = (payload: Events[E]) => void;
@@ -131,6 +138,15 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
   const scene = opts.scene ?? null;
   const timeScale = opts.timeScale ?? 1;
   const failModelDownloads = opts.failModelDownloads ?? false;
+  const failUpdateCheck = opts.failUpdateCheck ?? false;
+  const updateTotalBytesUnknown = opts.updateTotalBytesUnknown ?? false;
+  const availableUpdate: UpdateInfo | null =
+    opts.availableUpdate !== undefined
+      ? opts.availableUpdate
+      : scene === "update"
+        ? { version: "26.48.0", notes: "Faster separation and fixes." }
+        : null;
+  let lastFoundUpdate: UpdateInfo | null = null;
   const listeners = new Map<EventName, Set<(payload: unknown) => void>>();
 
   const models: ModelStatus[] = createInitialModels();
@@ -1178,6 +1194,30 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
 
       case "reveal_path":
         return null as Commands[K]["result"];
+
+      case "check_for_update": {
+        if (failUpdateCheck) {
+          throw makeError("offline", "Couldn't check for updates. Try again later.");
+        }
+        lastFoundUpdate = availableUpdate ? clone(availableUpdate) : null;
+        return clone(lastFoundUpdate) as Commands[K]["result"];
+      }
+
+      case "install_update": {
+        if (!lastFoundUpdate) {
+          throw makeError("not_found", "There is no update to install.");
+        }
+        const totalBytes = updateTotalBytesUnknown ? null : 40_000_000;
+        const fractions = [0.15, 0.4, 0.75, 1];
+        for (const frac of fractions) {
+          await new Promise<void>((resolve) => scheduleTimeout(resolve, 180));
+          emit("update:progress", {
+            downloadedBytes: Math.round(40_000_000 * frac),
+            totalBytes,
+          });
+        }
+        return null as Commands[K]["result"];
+      }
 
       default:
         throw makeError("internal", `Unknown command: ${String(command)}`);

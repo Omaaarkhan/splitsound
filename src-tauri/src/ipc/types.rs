@@ -570,6 +570,20 @@ pub struct OpenFiles {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub version: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the JSON shape of every payload type against the contract.
@@ -658,6 +672,27 @@ mod tests {
             restricted: false,
             terms: None,
         }
+    }
+
+    #[test]
+    fn update_payload_keys_match_contract() {
+        let info = UpdateInfo {
+            version: "2.0.0".into(),
+            notes: None,
+        };
+        assert_eq!(
+            serde_json::to_value(info).unwrap(),
+            json!({"version":"2.0.0","notes":null})
+        );
+        let event = crate::ipc::AppEvent::UpdateProgress(UpdateProgress {
+            downloaded_bytes: 1024,
+            total_bytes: None,
+        });
+        assert_eq!(event.name(), "update:progress");
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({"downloadedBytes":1024,"totalBytes":null})
+        );
     }
 
     #[test]

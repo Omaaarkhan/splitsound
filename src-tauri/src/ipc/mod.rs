@@ -88,6 +88,7 @@ pub enum AppEvent {
     ModelsProgress(ModelDownloadProgress),
     ModelsChanged(Vec<ModelStatus>),
     OpenFiles(OpenFiles),
+    UpdateProgress(UpdateProgress),
 }
 
 impl AppEvent {
@@ -102,6 +103,7 @@ impl AppEvent {
             AppEvent::ModelsProgress(_) => "models:progress",
             AppEvent::ModelsChanged(_) => "models:changed",
             AppEvent::OpenFiles(_) => "app:open-files",
+            AppEvent::UpdateProgress(_) => "update:progress",
         }
     }
 }

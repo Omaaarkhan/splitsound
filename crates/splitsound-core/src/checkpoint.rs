@@ -53,6 +53,8 @@ pub const MAX_PICKLE_BYTES: usize = 1024 * 1024;
 pub const MAX_OPCODES: usize = 200_000;
 /// Deepest interpreter stack.
 pub const MAX_STACK_DEPTH: usize = 4096;
+/// Deepest constructed value, including values shared through the memo.
+const MAX_NESTING_DEPTH: u8 = 64;
 /// Most memo slots.
 pub const MAX_MEMO_ENTRIES: usize = 65_536;
 /// Longest string or name line in the pickle. The real maximum is 71.
@@ -142,13 +144,29 @@ enum Value {
     Persistent(Rc<[Value]>),
 }
 
+/// Cache the depth of the immutable children, or an upper bound for a
+/// mutable container. Even error cleanup can only drop a bounded tree.
+#[derive(Clone)]
+struct BoundedValue {
+    value: Value,
+    depth: u8,
+}
+
+fn parent_depth(child_depth: u8) -> Result<u8> {
+    require(
+        child_depth < MAX_NESTING_DEPTH,
+        "pickle value nesting too deep",
+    )?;
+    Ok(child_depth + 1)
+}
+
 enum Slot {
-    Value(Value),
+    Value(BoundedValue),
     Mark,
 }
 
 enum Memo {
-    Value(Value),
+    Value(BoundedValue),
     /// A list or dict was memoised. Reading it back would need shared
     /// mutable state; the real file never does, so it is refused.
     Mutable,
@@ -199,12 +217,26 @@ impl<'a> Interpreter<'a> {
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
+        let depth = u8::from(matches!(
+            value,
+            Value::Tuple(_) | Value::List(_) | Value::Dict(_)
+        ));
+        self.push_bounded(BoundedValue { value, depth })
+    }
+
+    fn push_tuple(&mut self, items: Vec<BoundedValue>) -> Result<()> {
+        let depth = parent_depth(items.iter().map(|v| v.depth).max().unwrap_or(0))?;
+        let value = Value::Tuple(items.into_iter().map(|v| v.value).collect());
+        self.push_bounded(BoundedValue { value, depth })
+    }
+
+    fn push_bounded(&mut self, value: BoundedValue) -> Result<()> {
         require(self.stack.len() < MAX_STACK_DEPTH, "pickle stack too deep")?;
         self.stack.push(Slot::Value(value));
         Ok(())
     }
 
-    fn pop(&mut self) -> Result<Value> {
+    fn pop(&mut self) -> Result<BoundedValue> {
         match self.stack.pop() {
             Some(Slot::Value(v)) => Ok(v),
             Some(Slot::Mark) => Err(bad("unexpected MARK on the pickle stack")),
@@ -212,7 +244,7 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn pop_to_mark(&mut self) -> Result<Vec<Value>> {
+    fn pop_to_mark(&mut self) -> Result<Vec<BoundedValue>> {
         let mut items = Vec::new();
         loop {
             match self.stack.pop() {
@@ -227,7 +259,10 @@ impl<'a> Interpreter<'a> {
 
     fn remember(&mut self, index: u32) -> Result<()> {
         let entry = match self.stack.last() {
-            Some(Slot::Value(Value::List(_))) | Some(Slot::Value(Value::Dict(_))) => Memo::Mutable,
+            Some(Slot::Value(BoundedValue {
+                value: Value::List(_) | Value::Dict(_),
+                ..
+            })) => Memo::Mutable,
             Some(Slot::Value(v)) => Memo::Value(v.clone()),
             _ => return Err(bad("nothing to memoize")),
         };
@@ -247,7 +282,7 @@ impl<'a> Interpreter<'a> {
             }
             Some(Memo::Value(v)) => v.clone(),
         };
-        self.push(value)
+        self.push_bounded(value)
     }
 
     fn run(mut self) -> Result<Value> {
@@ -265,7 +300,7 @@ impl<'a> Interpreter<'a> {
                         self.stack.len() == 1 && self.pos == self.data.len(),
                         "pickle did not end with exactly one value and no trailing bytes",
                     )?;
-                    return self.pop();
+                    return self.pop().map(|v| v.value);
                 }
                 // MARK
                 0x28 => {
@@ -312,28 +347,34 @@ impl<'a> Interpreter<'a> {
                 // TUPLE, TUPLE1, TUPLE2, TUPLE3
                 0x74 => {
                     let items = self.pop_to_mark()?;
-                    self.push(Value::Tuple(Rc::from(items)))?;
+                    self.push_tuple(items)?;
                 }
                 0x85 => {
                     let a = self.pop()?;
-                    self.push(Value::Tuple(Rc::from(vec![a])))?;
+                    self.push_tuple(vec![a])?;
                 }
                 0x86 => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Value::Tuple(Rc::from(vec![a, b])))?;
+                    self.push_tuple(vec![a, b])?;
                 }
                 0x87 => {
                     let c = self.pop()?;
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Value::Tuple(Rc::from(vec![a, b, c])))?;
+                    self.push_tuple(vec![a, b, c])?;
                 }
                 // APPEND
                 0x61 => {
                     let value = self.pop()?;
                     match self.stack.last_mut() {
-                        Some(Slot::Value(Value::List(list))) => list.push(value),
+                        Some(Slot::Value(BoundedValue {
+                            value: Value::List(list),
+                            depth,
+                        })) => {
+                            *depth = (*depth).max(parent_depth(value.depth)?);
+                            list.push(value.value);
+                        }
                         _ => return Err(bad("APPEND target is not a list")),
                     }
                 }
@@ -341,7 +382,14 @@ impl<'a> Interpreter<'a> {
                 0x65 => {
                     let items = self.pop_to_mark()?;
                     match self.stack.last_mut() {
-                        Some(Slot::Value(Value::List(list))) => list.extend(items),
+                        Some(Slot::Value(BoundedValue {
+                            value: Value::List(list),
+                            depth,
+                        })) => {
+                            let child_depth = items.iter().map(|v| v.depth).max().unwrap_or(0);
+                            *depth = (*depth).max(parent_depth(child_depth)?);
+                            list.extend(items.into_iter().map(|v| v.value));
+                        }
                         _ => return Err(bad("APPENDS target is not a list")),
                     }
                 }
@@ -352,17 +400,22 @@ impl<'a> Interpreter<'a> {
                         items.len() % 2 == 0,
                         "SETITEMS with an odd number of values",
                     )?;
-                    let Some(Slot::Value(Value::Dict(dict))) = self.stack.last_mut() else {
+                    let Some(Slot::Value(BoundedValue {
+                        value: Value::Dict(dict),
+                        depth,
+                    })) = self.stack.last_mut()
+                    else {
                         return Err(bad("SETITEMS target is not a dict"));
                     };
                     let mut it = items.into_iter();
                     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-                        let key = match k {
+                        let key = match k.value {
                             Value::Str(s) => Key::Str(s),
                             Value::Int(i) => Key::Int(i),
                             _ => return Err(bad("dict key is not a string or an integer")),
                         };
-                        dict.insert(key, v);
+                        *depth = (*depth).max(parent_depth(v.depth)?);
+                        dict.insert(key, v.value);
                     }
                 }
                 // BINPUT, LONG_BINPUT
@@ -402,22 +455,33 @@ impl<'a> Interpreter<'a> {
                 0x52 => {
                     let args = self.pop()?;
                     let func = self.pop()?;
-                    let (Value::Tuple(args), Value::Global(func)) = (args, func) else {
+                    let depth = args.depth;
+                    let (Value::Tuple(args), Value::Global(func)) = (args.value, func.value) else {
                         return Err(bad("REDUCE on something that is not a global"));
                     };
                     if func == G_ORDERED_DICT && args.is_empty() {
                         // An empty ordered mapping; `Dict` keeps insertion order.
                         self.push(Value::Dict(Dict::default()))?;
                     } else {
-                        self.push(Value::Call(func, args))?;
+                        self.push_bounded(BoundedValue {
+                            value: Value::Call(func, args),
+                            depth,
+                        })?;
                     }
                 }
                 // BINPERSID
                 0x51 => {
-                    let Value::Tuple(value) = self.pop()? else {
+                    let BoundedValue {
+                        value: Value::Tuple(value),
+                        depth,
+                    } = self.pop()?
+                    else {
                         return Err(bad("persistent id is not a tuple"));
                     };
-                    self.push(Value::Persistent(value))?;
+                    self.push_bounded(BoundedValue {
+                        value: Value::Persistent(value),
+                        depth,
+                    })?;
                 }
                 other => {
                     return Err(bad(format!("pickle opcode 0x{other:02x} is not allowed")));
@@ -600,6 +664,7 @@ impl<R: Read + Seek> Checkpoint<R> {
             "unexpected number of zip members",
         )?;
         require(!archive.has_duplicate_names(), "duplicate zip member names")?;
+        archive.validate_header_consistency().map_err(zip_err)?;
 
         // Collect names first; they are data, never paths.
         let mut names: Vec<String> = Vec::with_capacity(count);
@@ -872,35 +937,70 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Converts the upstream checkpoint at `checkpoint_path` into the weights
-/// file at `out_path`, as `table` describes.
-///
-/// The checkpoint must match the table's pinned upstream size and SHA-256
-/// before it is even opened, and the result must match the pinned weights
-/// size and SHA-256 before it is renamed into place; otherwise nothing is
-/// left at `out_path`.
-///
-/// # Errors
-/// `model_download_failed` for any mismatch or malformed input,
-/// `cancelled`, `disk_full`, `out_of_memory`.
-pub fn convert_checkpoint(
-    checkpoint_path: &Path,
+/// Reads `path` once on a single open handle, verifying it is a regular file
+/// of at most `expected_size` bytes (bounded by [`MAX_FILE_BYTES`]), and
+/// returns its bytes alongside its lowercase hex SHA-256 digest.
+fn read_pinned_bytes(
+    path: &Path,
+    expected_size: u64,
+    progress: &dyn Progress,
+) -> Result<(Vec<u8>, String)> {
+    require(expected_size <= MAX_FILE_BYTES, "checkpoint file too large")?;
+    let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
+    let meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
+    require(meta.is_file(), "checkpoint path is not a regular file")?;
+    require(
+        meta.len() == expected_size,
+        "checkpoint size differs from the pinned size",
+    )?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(expected_size as usize)
+        .map_err(|_| Error::out_of_memory())?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        check_cancelled(progress)?;
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::from_read(&e, path)),
+        };
+        if n == 0 {
+            break;
+        }
+        if (data.len() as u64).saturating_add(n as u64) > expected_size {
+            return Err(bad("checkpoint size differs from the pinned size"));
+        }
+        hasher.update(&buf[..n]);
+        data.extend_from_slice(&buf[..n]);
+    }
+    require(
+        data.len() as u64 == expected_size,
+        "checkpoint size differs from the pinned size",
+    )?;
+    Ok((data, hex(&hasher.finalize())))
+}
+
+/// Converts already-read checkpoint `bytes` into the weights file at
+/// `out_path`, verifying both the pinned upstream digest and the pinned
+/// weights digest before renaming into place.
+pub(crate) fn convert_checkpoint_bytes(
+    bytes: &[u8],
     table: &TensorTable,
     out_path: &Path,
     progress: &dyn Progress,
 ) -> Result<()> {
-    let (digest, size) = sha256_file(checkpoint_path, progress)?;
+    check_cancelled(progress)?;
     require(
-        size == table.upstream.size_bytes,
+        bytes.len() as u64 == table.upstream.size_bytes,
         "checkpoint size differs from the pinned size",
     )?;
     require(
-        digest == table.upstream.sha256,
+        hex(&Sha256::digest(bytes)) == table.upstream.sha256,
         "checkpoint SHA-256 differs from the pinned value",
     )?;
 
-    let file = File::open(checkpoint_path).map_err(|e| Error::from_read(&e, checkpoint_path))?;
-    let mut checkpoint = Checkpoint::open(std::io::BufReader::new(file), size)?;
+    let mut checkpoint = Checkpoint::open(std::io::Cursor::new(bytes), bytes.len() as u64)?;
     let by_key: HashMap<String, TensorLocation> = checkpoint
         .tensors()
         .iter()
@@ -935,43 +1035,59 @@ pub fn convert_checkpoint(
         "tensor table is inconsistent",
     )?;
 
-    let tmp = crate::wav::temp_sibling(out_path);
-    let result = (|| -> Result<()> {
-        let out = File::create(&tmp).map_err(|e| Error::from_write(&e, out_path))?;
-        let mut out = BufWriter::with_capacity(1 << 20, out);
-        let mut hasher = Sha256::new();
-        let mut halves = Vec::new();
-        let mut floats = Vec::new();
-        let mut written = 0u64;
-        for tensor in &plan {
-            check_cancelled(progress)?;
-            checkpoint.read_tensor_halves(tensor, &mut halves)?;
-            halves_to_float32_bytes(&halves, &mut floats)?;
-            out.write_all(&floats)
-                .map_err(|e| Error::from_write(&e, out_path))?;
-            hasher.update(&floats);
-            written += floats.len() as u64;
-        }
-        let file = out
-            .into_inner()
-            .map_err(|e| Error::from_write(&e.into_error(), out_path))?;
-        file.sync_all()
+    let (out, tmp) =
+        crate::wav::create_temp_sibling(out_path).map_err(|e| Error::from_write(&e, out_path))?;
+    let mut out = BufWriter::with_capacity(1 << 20, out);
+    let mut hasher = Sha256::new();
+    let mut halves = Vec::new();
+    let mut floats = Vec::new();
+    let mut written = 0u64;
+    for tensor in &plan {
+        check_cancelled(progress)?;
+        checkpoint.read_tensor_halves(tensor, &mut halves)?;
+        halves_to_float32_bytes(&halves, &mut floats)?;
+        out.write_all(&floats)
             .map_err(|e| Error::from_write(&e, out_path))?;
-        require(
-            written == table.weights.size_bytes && hex(&hasher.finalize()) == table.weights.sha256,
-            "converted weights differ from the pinned digest",
-        )
-    })();
-    match result {
-        Ok(()) => std::fs::rename(&tmp, out_path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            Error::from_write(&e, out_path)
-        }),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+        hasher.update(&floats);
+        written += floats.len() as u64;
     }
+    let file = out
+        .into_inner()
+        .map_err(|e| Error::from_write(&e.into_error(), out_path))?;
+    file.sync_all()
+        .map_err(|e| Error::from_write(&e, out_path))?;
+    drop(file);
+    require(
+        written == table.weights.size_bytes && hex(&hasher.finalize()) == table.weights.sha256,
+        "converted weights differ from the pinned digest",
+    )?;
+    tmp.persist(out_path)
+        .map_err(|e| Error::from_write(&e, out_path))
+}
+
+/// Converts the upstream checkpoint at `checkpoint_path` into the weights
+/// file at `out_path`, as `table` describes.
+///
+/// The checkpoint is read once into memory and checked against the table's
+/// pinned upstream size and SHA-256 before it is parsed, and the result
+/// must match the pinned weights size and SHA-256 before it is renamed into
+/// place; otherwise nothing is left at `out_path`.
+///
+/// # Errors
+/// `model_download_failed` for any mismatch or malformed input,
+/// `cancelled`, `disk_full`, `out_of_memory`.
+pub fn convert_checkpoint(
+    checkpoint_path: &Path,
+    table: &TensorTable,
+    out_path: &Path,
+    progress: &dyn Progress,
+) -> Result<()> {
+    let (bytes, digest) = read_pinned_bytes(checkpoint_path, table.upstream.size_bytes, progress)?;
+    require(
+        digest == table.upstream.sha256,
+        "checkpoint SHA-256 differs from the pinned value",
+    )?;
+    convert_checkpoint_bytes(&bytes, table, out_path, progress)
 }
 
 #[cfg(test)]
@@ -1441,6 +1557,57 @@ mod tests {
     }
 
     #[test]
+    fn value_nesting_is_bounded_at_construction() {
+        const LIMIT: usize = 64;
+        let nested = |depth: usize| {
+            let mut pickle = vec![0x80, 2, 0x4e]; // protocol 2, None
+            pickle.extend(std::iter::repeat_n(0x85, depth)); // single-item tuples
+            pickle.push(0x2e);
+            pickle
+        };
+        assert!(symbolic_unpickle(&nested(LIMIT - 1)).is_ok());
+        assert!(symbolic_unpickle(&nested(LIMIT)).is_ok());
+        for depth in [LIMIT + 1, 199_995] {
+            let err = symbolic_unpickle(&nested(depth)).unwrap_err();
+            assert_eq!(
+                err.detail(),
+                Some("checkpoint: pickle value nesting too deep")
+            );
+        }
+    }
+
+    #[test]
+    fn pickle_container_updates_and_memo_preserve_depth_bounds() {
+        // Memoize a value at the limit and try to append the recalled value.
+        let mut pickle = vec![0x80, 2, 0x5d, 0x4e];
+        pickle.extend(std::iter::repeat_n(0x85, 64));
+        pickle.extend([0x71, 0, 0x68, 0, 0x85]);
+        let err = symbolic_unpickle(&pickle).unwrap_err();
+        assert_eq!(
+            err.detail(),
+            Some("checkpoint: pickle value nesting too deep")
+        );
+        // A list and dict also raise depth when their entries are added.
+        let tuple = vec![0x85; 64];
+        let list = P::new().op(0x5d).op(0x4e).raw(&tuple).op(0x61).done();
+        let dict = P::new()
+            .op(0x7d)
+            .op(0x28)
+            .str("key")
+            .op(0x4e)
+            .raw(&tuple)
+            .op(0x75)
+            .done();
+        for pickle in [list, dict] {
+            let err = symbolic_unpickle(&pickle).unwrap_err();
+            assert_eq!(
+                err.detail(),
+                Some("checkpoint: pickle value nesting too deep")
+            );
+        }
+    }
+
+    #[test]
     fn interpreter_limits_hold() {
         // Opcode budget: a long run of NONE.
         let mut p = vec![0x80, 2, 0x28];
@@ -1825,6 +1992,98 @@ mod tests {
             }
         }
         assert!(err > 0 && ok + err == 4000);
+    }
+
+    #[test]
+    fn deeply_nested_pickle_is_rejected_without_stack_overflow() {
+        let nested_tuple1 = |wraps: usize| -> Vec<u8> {
+            let mut p = Vec::with_capacity(wraps + 4);
+            p.extend_from_slice(&[0x80, 0x02, 0x29]); // PROTO 2, EMPTY_TUPLE (depth 1)
+            p.resize(p.len() + wraps, 0x85); // TUPLE1
+            p.push(0x2E); // STOP
+            p
+        };
+
+        // Just under the limit: EMPTY_TUPLE (depth 1) + 63 TUPLE1 wraps = depth 64.
+        let at_limit = usize::from(MAX_NESTING_DEPTH) - 1;
+        assert!(symbolic_unpickle(&nested_tuple1(at_limit)).is_ok());
+
+        // Just over the limit: depth 65 is rejected cleanly.
+        let err = symbolic_unpickle(&nested_tuple1(at_limit + 1)).unwrap_err();
+        assert!(
+            err.detail().unwrap_or("").contains("nesting too deep"),
+            "{:?}",
+            err.detail()
+        );
+
+        // Regression for the 200,000 nested TUPLE1 stack-overflow abort, both
+        // directly and through Checkpoint::open.
+        let attack = nested_tuple1(199_995);
+        assert!(symbolic_unpickle(&attack).is_err());
+        let z = build_zip(&[
+            Member::stored("archive/data.pkl", &attack),
+            Member::stored("archive/version", b"3\n"),
+        ]);
+        assert!(open_err(&z).contains("nesting too deep"));
+
+        // Memo-shared nesting (BINPUT/BINGET + TUPLE2) is also depth-tracked.
+        let memo_chain = |steps: usize| -> Vec<u8> {
+            let mut p = vec![0x80, 0x02, 0x29, 0x71, 0x00]; // EMPTY_TUPLE (depth 1), BINPUT 0
+            for i in 1..=steps {
+                // Pair top-of-stack with its memoized copy via TUPLE2 so stack stays depth 1.
+                p.extend_from_slice(&[0x68, (i - 1) as u8, 0x86, 0x71, i as u8]);
+            }
+            p.push(0x2E);
+            p
+        };
+        assert!(symbolic_unpickle(&memo_chain(at_limit)).is_ok());
+        assert!(symbolic_unpickle(&memo_chain(at_limit + 1)).is_err());
+    }
+
+    #[test]
+    fn inconsistent_and_overlapping_zip_headers_are_rejected() {
+        // Local header filename differs from central directory filename.
+        let mut mismatch = build_zip(&valid_members());
+        let pos = mismatch
+            .windows(b"archive/data.pkl".len())
+            .position(|w| w == b"archive/data.pkl")
+            .unwrap();
+        mismatch[pos] = b'X';
+        open_err(&mismatch);
+
+        // Overlapping entries: point the second central directory entry's local
+        // header offset to offset 0 (same as the first entry).
+        let mut overlap = build_zip(&valid_members());
+        let cd_positions: Vec<usize> = overlap
+            .windows(4)
+            .enumerate()
+            .filter_map(|(i, w)| (w == [0x50, 0x4B, 0x01, 0x02]).then_some(i))
+            .collect();
+        assert!(cd_positions.len() >= 2);
+        let second_cd = cd_positions[1];
+        overlap[second_cd + 42..second_cd + 46].copy_from_slice(&0u32.to_le_bytes());
+        open_err(&overlap);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_checkpoint_does_not_follow_or_remove_preexisting_symlinks() {
+        let (zip, _, table_json) = sample_checkpoint();
+        let dir = TempDir::new("ckpt-symlink");
+        let src = dir.path().join("upstream.th");
+        let out = dir.path().join("model.weights");
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&src, &zip).unwrap();
+        std::fs::write(&target, b"keep this").unwrap();
+        let old_tmp = dir
+            .path()
+            .join(format!("model.weights.{}.part", std::process::id()));
+        std::os::unix::fs::symlink(&target, &old_tmp).unwrap();
+        let table = TensorTable::from_json(&table_json).unwrap();
+        convert_checkpoint(&src, &table, &out, &NoProgress).unwrap();
+        assert!(out.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this");
+        assert_eq!(std::fs::read_link(&old_tmp).unwrap(), target);
     }
 
     /// The real thing, when it is on disk: Meta's checkpoint from the ML

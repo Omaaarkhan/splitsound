@@ -360,6 +360,19 @@ export interface AppInfo {
   libraryBytes: number;
 }
 
+/** A newer version of the app that can be installed. */
+export interface UpdateInfo {
+  version: string;
+  /** Release notes as plain text, or null. Never rendered as markup. */
+  notes: string | null;
+}
+
+export interface UpdateProgress {
+  downloadedBytes: number;
+  /** Null when the server did not say how big the download is. */
+  totalBytes: number | null;
+}
+
 /* ------------------------------------------------------------------ */
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
@@ -450,6 +463,17 @@ export interface Commands {
   update_settings: { args: { patch: Partial<Settings> }; result: Settings };
   get_app_info: { args: Record<string, never>; result: AppInfo };
   reveal_path: { args: { path: string }; result: null };
+
+  /* Updates. The interface cannot choose where updates come from: the
+     endpoint and the signing key are fixed in the app. */
+  /** Resolves with the newer version, or null when the app is up to date. */
+  check_for_update: { args: Record<string, never>; result: UpdateInfo | null };
+  /**
+   * Downloads the update found by the last `check_for_update`, verifies its
+   * signature, installs it and restarts the app. Progress arrives as
+   * `update:progress`. Rejects if there is nothing to install.
+   */
+  install_update: { args: Record<string, never>; result: null };
 }
 
 /* ------------------------------------------------------------------ */
@@ -473,6 +497,7 @@ export interface Events {
    * a file passed on the command line, or a second launch). The UI imports them.
    */
   "app:open-files": { paths: string[] };
+  "update:progress": UpdateProgress;
 }
 
 export type CommandName = keyof Commands;

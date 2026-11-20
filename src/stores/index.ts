@@ -1,6 +1,5 @@
-import type { ModelStatus, SplitOptions } from "../ipc/contract";
+import type { ModelStatus, SplitOptions, UpdateInfo, UpdateProgress } from "../ipc/contract";
 import { getTransport, invoke, isTauriRuntime, listen, type UnlistenFn } from "../ipc/client";
-import { checkForAppUpdate } from "../ipc/platform";
 import { COPY, formatIpcError, isIpcError } from "../utils/errors";
 import { getScanModels } from "../utils/format";
 import {
@@ -35,7 +34,7 @@ import {
   refreshModels,
 } from "./modelsStore";
 import { refreshAppInfo, refreshSettingsAndInfo, settingsStore } from "./settingsStore";
-import { dismissNotice, openPanel, showNotice } from "./uiStore";
+import { openPanel, showNotice } from "./uiStore";
 
 let startupUpdateCheckDone = false;
 
@@ -43,45 +42,66 @@ export function resetStartupUpdateCheckForTesting(): void {
   startupUpdateCheckDone = false;
 }
 
-export function showUpdateAvailableNotice(
-  version: string,
-  install: (onProgress?: (fraction: number) => void) => Promise<void>,
-): void {
-  showNotice(`SplitSound ${version} is available.`, {
+export function formatUpdateProgressNotice(progress: UpdateProgress): string {
+  if (progress.totalBytes !== null && progress.totalBytes > 0) {
+    const pct = Math.max(
+      0,
+      Math.min(100, Math.round((progress.downloadedBytes / progress.totalBytes) * 100)),
+    );
+    return `Downloading the update, ${pct} %`;
+  }
+  return "Downloading the update";
+}
+
+export async function startInstallUpdate(): Promise<void> {
+  showNotice("Downloading the update", {
+    autoDismissMs: null,
+    dismissLabel: null,
+  });
+  try {
+    await invoke("install_update");
+  } catch {
+    showNotice("Couldn't install the update. Try again later.", { tone: "error" });
+  }
+}
+
+export function showUpdateAvailableNotice(update: UpdateInfo): void {
+  showNotice(`SplitSound ${update.version} is available.`, {
     actionLabel: "Update and restart",
     dismissLabel: "Later",
     autoDismissMs: null,
     onAction: () => {
-      showNotice("Downloading the update, 0 %", {
-        autoDismissMs: null,
-        dismissLabel: null,
-      });
-      void install((fraction) => {
-        const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
-        showNotice(`Downloading the update, ${pct} %`, {
-          autoDismissMs: null,
-          dismissLabel: null,
-        });
-      }).catch(() => {
-        dismissNotice();
-      });
+      void startInstallUpdate();
     },
   });
 }
 
-export async function runStartupUpdateCheck(
-  checker: typeof checkForAppUpdate = checkForAppUpdate,
-): Promise<void> {
+export async function runStartupUpdateCheck(): Promise<void> {
   if (startupUpdateCheckDone) return;
   startupUpdateCheckDone = true;
   if (!settingsStore.getState().settings.checkForUpdates) return;
   try {
-    const res = await checker();
-    if (res.status === "available") {
-      showUpdateAvailableNotice(res.version, res.install);
+    const update = await invoke("check_for_update");
+    if (update) {
+      showUpdateAvailableNotice(update);
     }
   } catch {
-    // Missing or failing updater must stay silent at startup
+    // Missing or failing updater must stay silent on automatic startup check
+  }
+}
+
+export async function checkForUpdatesManually(): Promise<
+  { status: "up-to-date" } | { status: "available"; update: UpdateInfo } | { status: "error" }
+> {
+  try {
+    const update = await invoke("check_for_update");
+    if (!update) {
+      return { status: "up-to-date" };
+    }
+    return { status: "available", update };
+  } catch {
+    showNotice("Couldn't check for updates. Try again later.", { tone: "error" });
+    return { status: "error" };
   }
 }
 
@@ -286,6 +306,15 @@ export async function bootstrapApp(): Promise<UnlistenFn> {
     }),
   );
 
+  unlisteners.push(
+    await listen("update:progress", (progress) => {
+      showNotice(formatUpdateProgressNotice(progress), {
+        autoDismissMs: null,
+        dismissLabel: null,
+      });
+    }),
+  );
+
   await Promise.all([refreshSettingsAndInfo(), refreshModels(), refreshLibrary()]);
 
   // Seed deterministic scene state when running against the browser mock
@@ -344,12 +373,7 @@ export async function bootstrapApp(): Promise<UnlistenFn> {
       } else if (scene === "settings") {
         openPanel({ type: "settings" });
       } else if (scene === "update") {
-        showUpdateAvailableNotice("26.48.0", async (onProgress) => {
-          for (const frac of [0.15, 0.4, 0.72, 1]) {
-            await new Promise((r) => setTimeout(r, 250));
-            onProgress?.(frac);
-          }
-        });
+        await runStartupUpdateCheck();
       }
     }
   } else {

@@ -48,6 +48,8 @@ const COMMANDS: &[&str] = &[
     "update_settings",
     "get_app_info",
     "reveal_path",
+    "check_for_update",
+    "install_update",
 ];
 
 fn onnxruntime() {

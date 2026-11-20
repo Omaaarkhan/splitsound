@@ -8,7 +8,6 @@
 //! a cancelled or failed export never leaves a partial file under the final
 //! name.
 
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -301,57 +300,46 @@ pub fn export_audio(
         ));
     }
     check_cancelled(progress)?;
-    let tmp = crate::wav::temp_sibling(dst);
-    let mut owns_temp = false;
-    let result = (|| -> Result<()> {
-        let werr = |e: std::io::Error| Error::from_write(&e, dst);
-        let mut create_temp = || {
-            let file = File::create_new(&tmp).map_err(werr)?;
-            owns_temp = true;
-            Ok::<_, Error>(file)
-        };
-        match format {
-            ExportFormat::Wav32f => {
-                let mut w =
-                    crate::wav::WavWriter::create_with_channels(dst, sample_rate, channels)?;
-                for chunk in samples.chunks(1 << 16) {
-                    check_cancelled(progress)?;
-                    w.write_interleaved(chunk)?;
-                }
-                // WavWriter does its own temp-and-rename.
-                return w.finish();
-            }
-            ExportFormat::Wav16 | ExportFormat::Wav24 => {
-                let bits = if format == ExportFormat::Wav16 {
-                    16
-                } else {
-                    24
-                };
-                let file = create_temp()?;
-                let mut out = BufWriter::with_capacity(1 << 16, file);
-                write_wav_pcm(&mut out, samples, channels, sample_rate, bits, progress)
-                    .map_err(werr)??;
-                let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
-                file.sync_all().map_err(werr)?;
-            }
-            ExportFormat::Flac | ExportFormat::Mp3 => {
-                let bytes = if format == ExportFormat::Flac {
-                    encode_flac(samples, channels, sample_rate)?
-                } else {
-                    encode_mp3(samples, channels, sample_rate, progress)?
-                };
+    let werr = |e: std::io::Error| Error::from_write(&e, dst);
+    match format {
+        ExportFormat::Wav32f => {
+            let mut w = crate::wav::WavWriter::create_with_channels(dst, sample_rate, channels)?;
+            for chunk in samples.chunks(1 << 16) {
                 check_cancelled(progress)?;
-                let mut file = create_temp()?;
-                file.write_all(&bytes).map_err(werr)?;
-                file.sync_all().map_err(werr)?;
+                w.write_interleaved(chunk)?;
             }
+            // WavWriter does its own temp-and-rename.
+            w.finish()
         }
-        std::fs::rename(&tmp, dst).map_err(werr)
-    })();
-    if result.is_err() && owns_temp {
-        let _ = std::fs::remove_file(&tmp);
+        ExportFormat::Wav16 | ExportFormat::Wav24 => {
+            let bits = if format == ExportFormat::Wav16 {
+                16
+            } else {
+                24
+            };
+            let (file, tmp) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+            let mut out = BufWriter::with_capacity(1 << 16, file);
+            write_wav_pcm(&mut out, samples, channels, sample_rate, bits, progress)
+                .map_err(werr)??;
+            let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
+            file.sync_all().map_err(werr)?;
+            drop(file);
+            tmp.persist(dst).map_err(werr)
+        }
+        ExportFormat::Flac | ExportFormat::Mp3 => {
+            let bytes = if format == ExportFormat::Flac {
+                encode_flac(samples, channels, sample_rate)?
+            } else {
+                encode_mp3(samples, channels, sample_rate, progress)?
+            };
+            check_cancelled(progress)?;
+            let (mut file, tmp) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+            file.write_all(&bytes).map_err(werr)?;
+            file.sync_all().map_err(werr)?;
+            drop(file);
+            tmp.persist(dst).map_err(werr)
+        }
     }
-    result
 }
 
 /// Mixes several interleaved stereo sources, each with a gain in dB, into
@@ -449,12 +437,17 @@ mod tests {
         std::fs::write(&target, b"keep this").unwrap();
         for format in [ExportFormat::Wav16, ExportFormat::Wav32f] {
             let dest = dir.path().join(format!("{format:?}.wav"));
-            let tmp = crate::wav::temp_sibling(&dest);
-            std::os::unix::fs::symlink(&target, &tmp).unwrap();
-            assert!(export_audio(&[0.0, 0.0], 2, 44_100, format, &dest, &NoProgress).is_err());
-            assert!(!dest.exists());
+            // A preexisting symlink at the old predictable PID-based temp name
+            // must be neither followed nor removed; export uses an unpredictable
+            // `create_new` sibling instead.
+            let old_tmp = dir
+                .path()
+                .join(format!("{format:?}.wav.{}.part", std::process::id()));
+            std::os::unix::fs::symlink(&target, &old_tmp).unwrap();
+            export_audio(&[0.0, 0.0], 2, 44_100, format, &dest, &NoProgress).unwrap();
+            assert!(dest.exists());
             assert_eq!(std::fs::read(&target).unwrap(), b"keep this");
-            assert_eq!(std::fs::read_link(&tmp).unwrap(), target);
+            assert_eq!(std::fs::read_link(&old_tmp).unwrap(), target);
         }
     }
 

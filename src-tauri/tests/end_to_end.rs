@@ -654,3 +654,217 @@ fn crash_mid_split_is_repaired_on_the_next_start() {
             .exists()
     );
 }
+
+struct TrackingEngine {
+    inner: MockEngine,
+    in_flight_decodes: std::sync::atomic::AtomicUsize,
+    max_in_flight_decodes: std::sync::atomic::AtomicUsize,
+    in_flight_downloads: std::sync::atomic::AtomicUsize,
+    max_in_flight_downloads: std::sync::atomic::AtomicUsize,
+    download_calls: std::sync::atomic::AtomicUsize,
+    seen_download_ids: std::sync::Mutex<Vec<Vec<String>>>,
+    hold_downloads: std::sync::atomic::AtomicBool,
+}
+
+impl TrackingEngine {
+    fn new(config: EngineConfig) -> Self {
+        Self {
+            inner: MockEngine::with_time_scale(config, 0.01),
+            in_flight_decodes: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight_decodes: std::sync::atomic::AtomicUsize::new(0),
+            in_flight_downloads: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight_downloads: std::sync::atomic::AtomicUsize::new(0),
+            download_calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_download_ids: std::sync::Mutex::new(Vec::new()),
+            hold_downloads: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn bump_max(current: &std::sync::atomic::AtomicUsize, max: &std::sync::atomic::AtomicUsize) {
+        let n = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        max.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Engine for TrackingEngine {
+    fn name(&self) -> &'static str {
+        "tracking"
+    }
+    fn decode(&self, i: &Path, o: &Path, c: &CancelToken) -> EngineResult<DecodedTrack> {
+        Self::bump_max(&self.in_flight_decodes, &self.max_in_flight_decodes);
+        std::thread::sleep(Duration::from_millis(30));
+        let res = self.inner.decode(i, o, c);
+        self.in_flight_decodes
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        res
+    }
+    fn scan_instruments(&self, _w: &Path, _c: &CancelToken) -> EngineResult<ScanOutcome> {
+        Ok(ScanOutcome::Done(ScanResult {
+            detections: Vec::new(),
+            suggested_mode: SplitMode::Band,
+        }))
+    }
+    fn plan_split(&self, d: f64, o: &SplitOptions) -> EngineResult<SplitPlan> {
+        self.inner.plan_split(d, o)
+    }
+    fn split(
+        &self,
+        r: &SplitRequest,
+        p: &mut (dyn FnMut(EngineProgress) + Send),
+        c: &CancelToken,
+    ) -> EngineResult<SplitOutput> {
+        self.inner.split(r, p, c)
+    }
+    fn export(&self, j: &ExportJob, c: &CancelToken) -> EngineResult<Vec<PathBuf>> {
+        self.inner.export(j, c)
+    }
+    fn list_models(&self) -> Vec<ModelStatus> {
+        self.inner.list_models()
+    }
+    fn download_models(
+        &self,
+        ids: &[String],
+        a: bool,
+        p: &mut (dyn FnMut(ModelDownloadProgress) + Send),
+        c: &CancelToken,
+    ) -> EngineResult<()> {
+        Self::bump_max(&self.in_flight_downloads, &self.max_in_flight_downloads);
+        self.download_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen_download_ids.lock().unwrap().push(ids.to_vec());
+        if self
+            .hold_downloads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            while !c.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.in_flight_downloads
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(EngineError::cancelled());
+        }
+        let res = self.inner.download_models(ids, a, p, c);
+        self.in_flight_downloads
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        res
+    }
+    fn remove_model(&self, id: &str) -> EngineResult<()> {
+        self.inner.remove_model(id)
+    }
+    fn import_model_files(&self, p: &[PathBuf]) -> EngineResult<Vec<String>> {
+        self.inner.import_model_files(p)
+    }
+    fn hardware(&self) -> HardwareInfo {
+        self.inner.hardware()
+    }
+}
+
+#[test]
+fn imports_serialize_and_downloads_use_a_single_bounded_worker() {
+    use std::sync::atomic::Ordering;
+
+    let root = std::env::temp_dir().join(format!("ss-e2e-{}", new_session_id()));
+    let tracker: Arc<std::sync::OnceLock<Arc<TrackingEngine>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let t_init = tracker.clone();
+    let f = start_with(root, move |p| {
+        let engine = Arc::new(TrackingEngine::new(engine_config(p)));
+        t_init.set(engine.clone()).ok();
+        engine
+    });
+    let tracker = tracker.get().unwrap().clone();
+
+    // Concurrent import_track calls serialize rather than running parallel decodes.
+    let input = song(&f.root.join("music"), "burst.wav");
+    let path_str = input.to_string_lossy().into_owned();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let core = f.core.clone();
+            let p = path_str.clone();
+            std::thread::spawn(move || core.import_track(&p).unwrap())
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(tracker.max_in_flight_decodes.load(Ordering::SeqCst), 1);
+
+    // Burst of download_models calls stays on one worker, deduplicates ids,
+    // bounds the queue, and cancels both active and queued requests.
+    tracker.hold_downloads.store(true, Ordering::SeqCst);
+    f.core
+        .download_models(vec!["scnet_small".into(), "scnet_small".into()], false)
+        .unwrap();
+    wait_until(
+        "first download to enter worker",
+        Duration::from_secs(5),
+        || tracker.in_flight_downloads.load(Ordering::SeqCst) == 1,
+    );
+    for _ in 0..32 {
+        f.core
+            .download_models(vec!["scnet_small".into()], false)
+            .unwrap();
+    }
+    let overflow = f
+        .core
+        .download_models(vec!["scnet_small".into()], false)
+        .unwrap_err();
+    assert_eq!(overflow.code, ErrorCode::Busy);
+    assert_eq!(tracker.max_in_flight_downloads.load(Ordering::SeqCst), 1);
+
+    f.core.cancel_model_downloads();
+    wait_until("active download to stop", Duration::from_secs(5), || {
+        tracker.in_flight_downloads.load(Ordering::SeqCst) == 0
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    // Queued requests were drained on cancel and never started.
+    assert_eq!(tracker.download_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *tracker.seen_download_ids.lock().unwrap(),
+        vec![vec!["scnet_small".to_string()]]
+    );
+}
+
+#[test]
+fn prepare_drag_deduplicates_stems_and_ignores_temp_symlinks() {
+    let f = start();
+    let input = song(&f.root.join("music"), "song.wav");
+    let s = f.core.import_track(&input.to_string_lossy()).unwrap();
+    let opts = SplitOptions {
+        mode: SplitMode::Band,
+        quality: Quality::Fast,
+    };
+    f.core.start_split(&s.id, opts, false).unwrap();
+    wait_until("the split", Duration::from_secs(30), || {
+        f.core.get_session(&s.id).unwrap().status == SessionStatus::Ready
+    });
+
+    #[cfg(unix)]
+    let (victim, symlink) = {
+        let drag = f.core.paths.drag_dir.join(&s.id);
+        std::fs::create_dir_all(&drag).unwrap();
+        let victim = f.root.join("victim.txt");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let symlink = drag.join(".song (Vocals).wav.part");
+        std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+        (victim, symlink)
+    };
+
+    let repeated = vec![
+        StemId::Vocals,
+        StemId::Bass,
+        StemId::Vocals,
+        StemId::Vocals,
+        StemId::Bass,
+    ];
+    let drag = f.core.prepare_drag(&s.id, &repeated).unwrap();
+    assert_eq!(drag.len(), 2);
+    assert!(drag[0].ends_with("song (Vocals).wav"));
+    assert!(drag[1].ends_with("song (Bass).wav"));
+
+    #[cfg(unix)]
+    {
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(symlink.symlink_metadata().is_ok());
+    }
+}

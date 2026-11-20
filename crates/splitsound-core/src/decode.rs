@@ -205,9 +205,9 @@ impl PcmSink for StereoSink {
         let Some(rs) = self.resampler.as_mut() else {
             return Err(Error::internal("sink used before begin"));
         };
+        let reserve = rs.max_output_for(frames);
         for v in self.out.iter_mut() {
-            v.try_reserve(frames + 8192)
-                .map_err(|_| Error::out_of_memory())?;
+            v.try_reserve(reserve).map_err(|_| Error::out_of_memory())?;
         }
         rs.push(&[&self.tmp_l, &self.tmp_r], &mut self.out)
     }
@@ -728,14 +728,18 @@ fn decode_inner(
     let mut src_channels: usize = 0;
     let mut interleaved: Vec<f32> = Vec::new();
 
+    const MAX_CONSECUTIVE_BAD_PACKETS: u64 = 64;
+
     let mut src_frames: u64 = 0;
     let mut max_src_frames: u64 = u64::MAX;
+    let mut seen_packets: u64 = 0;
     let mut packets: u64 = 0;
     let mut bad_packets: u64 = 0;
+    let mut consecutive_bad_packets: u64 = 0;
     let mut hit_eof_error = false;
 
     loop {
-        if packets.is_multiple_of(256) {
+        if seen_packets.is_multiple_of(256) {
             check_cancelled(progress)?;
         }
         let packet = match format.next_packet() {
@@ -749,14 +753,17 @@ fn decode_inner(
             // A chained stream with new parameters: keep what we have.
             Err(SymError::ResetRequired) => break,
             Err(SymError::DecodeError(_)) => {
+                seen_packets += 1;
                 bad_packets += 1;
-                if bad_packets > 64 {
-                    return Err(damaged().with_detail("too many demux errors"));
+                consecutive_bad_packets += 1;
+                if consecutive_bad_packets > MAX_CONSECUTIVE_BAD_PACKETS {
+                    return Err(damaged().with_detail("too many consecutive demux errors"));
                 }
                 continue;
             }
             Err(other) => return Err(damaged().with_detail(other)),
         };
+        seen_packets += 1;
         if packet.track_id != track_id {
             continue;
         }
@@ -777,12 +784,17 @@ fn decode_inner(
                 }
                 Err(SymError::DecodeError(_)) | Err(SymError::IoError(_)) => {
                     bad_packets += 1;
+                    consecutive_bad_packets += 1;
+                    if consecutive_bad_packets > MAX_CONSECUTIVE_BAD_PACKETS {
+                        return Err(damaged().with_detail("too many consecutive decode errors"));
+                    }
                     continue;
                 }
                 Err(SymError::ResetRequired) => break,
                 Err(other) => return Err(damaged().with_detail(other)),
             },
         };
+        consecutive_bad_packets = 0;
         if interleaved.is_empty() {
             continue;
         }
@@ -996,5 +1008,193 @@ mod tests {
         assert_eq!(t.clean(" \0 "), None);
         // Truncation lands on a character boundary.
         assert_eq!(t.clean("ééééé"), Some("éééé".into()));
+    }
+
+    fn tiny_pcm16_wav(rate: u32, frames: usize) -> Vec<u8> {
+        let channels = 2u16;
+        let data_bytes = (frames * usize::from(channels) * 2) as u32;
+        let mut v = Vec::with_capacity(44 + data_bytes as usize);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        let block = channels * 2;
+        v.extend_from_slice(&(rate * u32::from(block)).to_le_bytes());
+        v.extend_from_slice(&block.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_bytes.to_le_bytes());
+        v.resize(44 + data_bytes as usize, 0);
+        v
+    }
+
+    #[test]
+    fn prime_and_absurd_sample_rates_are_bounded_or_rejected() {
+        let dir = crate::testutil::TempDir::new("decode-rates");
+        // Absurd rate outside 8..=192 kHz: rejected cleanly before allocating.
+        for bad_rate in [4_000u32, 383_987, 1_000_000] {
+            let p = dir.path().join(format!("bad-{bad_rate}.wav"));
+            std::fs::write(&p, tiny_pcm16_wav(bad_rate, 64)).unwrap();
+            let err = decode_file(
+                &p,
+                crate::audio::SAMPLE_RATE,
+                &DecodeLimits::default(),
+                &crate::progress::NoProgress,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::UnsupportedFormat, "{bad_rate} Hz");
+        }
+        // Large prime rate inside the supported range: imports quickly with
+        // bounded resampler buffers instead of planning a massive FFT.
+        let p = dir.path().join("prime-191999.wav");
+        std::fs::write(&p, tiny_pcm16_wav(191_999, 256)).unwrap();
+        let t0 = std::time::Instant::now();
+        let decoded = decode_file(
+            &p,
+            crate::audio::SAMPLE_RATE,
+            &DecodeLimits::default(),
+            &crate::progress::NoProgress,
+        )
+        .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(decoded.info.sample_rate, 191_999);
+        assert_eq!(
+            decoded.audio.len(),
+            (256u64 * u64::from(crate::audio::SAMPLE_RATE)).div_ceil(191_999) as usize
+        );
+    }
+
+    #[test]
+    fn consecutive_corrupt_mp3_frames_bail_out_early() {
+        // Build a synthetic MP3 stream whose first frame is valid MPEG-1 Layer III
+        // (so probe succeeds) followed by 200 corrupt frames whose main_data
+        // fails codec decoding (or invalid sync / bad frame headers).
+        // MPEG-1 Layer III, 128 kbps, 44.1 kHz, stereo: frame size = 417 bytes.
+        // Header: FF FB 90 00.
+        let dir = crate::testutil::TempDir::new("decode-bad-frames");
+        let p = dir.path().join("corrupt.mp3");
+        let mut bytes = Vec::new();
+        // Valid-looking header + zeroed body (valid silence frame).
+        let mut frame = vec![0u8; 417];
+        frame[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        bytes.extend_from_slice(&frame);
+        // 300 frames with MPEG-1 Layer III header and corrupted sideinfo/Huffman
+        // payload (all 0xFF bytes, which triggers invalid bitrate/sideinfo or
+        // decode errors in Symphonia).
+        let mut bad = vec![0xFFu8; 417];
+        bad[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        for _ in 0..300 {
+            bytes.extend_from_slice(&bad);
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let err = decode_file(
+            &p,
+            crate::audio::SAMPLE_RATE,
+            &DecodeLimits::default(),
+            &crate::progress::NoProgress,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::DecodeFailed);
+        assert!(
+            err.detail()
+                .is_some_and(|d| d.contains("too many consecutive")),
+            "expected consecutive-error bailout, got: {err:?}"
+        );
+    }
+
+    fn ogg_crc(data: &[u8]) -> u32 {
+        let mut crc = 0u32;
+        for &b in data {
+            crc ^= u32::from(b) << 24;
+            for _ in 0..8 {
+                crc = if (crc & 0x8000_0000) != 0 {
+                    (crc << 1) ^ 0x04C1_1DB7
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    fn ogg_page(header_type: u8, granule: u64, serial: u32, seq: u32, packet: &[u8]) -> Vec<u8> {
+        assert!(packet.len() < 255);
+        let mut page = Vec::with_capacity(28 + packet.len());
+        page.extend_from_slice(b"OggS");
+        page.push(0); // version
+        page.push(header_type);
+        page.extend_from_slice(&granule.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&seq.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+        page.push(1); // 1 segment
+        page.push(packet.len() as u8);
+        page.extend_from_slice(packet);
+        let crc = ogg_crc(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+        page
+    }
+
+    #[test]
+    fn cancellation_is_checked_while_skipping_other_tracks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelOnSecondCheck(AtomicUsize);
+        impl Progress for CancelOnSecondCheck {
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst) >= 1
+            }
+        }
+
+        let mut opus_head = Vec::with_capacity(19);
+        opus_head.extend_from_slice(b"OpusHead");
+        opus_head.push(1); // version
+        opus_head.push(2); // channels
+        opus_head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+        opus_head.extend_from_slice(&48_000u32.to_le_bytes()); // input rate
+        opus_head.extend_from_slice(&0i16.to_le_bytes()); // gain
+        opus_head.push(0); // mapping family
+
+        let mut opus_tags = Vec::with_capacity(16);
+        opus_tags.extend_from_slice(b"OpusTags");
+        opus_tags.extend_from_slice(&0u32.to_le_bytes()); // vendor len
+        opus_tags.extend_from_slice(&0u32.to_le_bytes()); // comment count
+
+        // Multiplexed Ogg with two Opus streams: stream 1 is chosen as the
+        // default audio track, followed by 300 packets belonging only to
+        // stream 2. Cancellation must still be polled while skipping them.
+        let mut ogg = Vec::new();
+        ogg.extend_from_slice(&ogg_page(0x02, 0, 1, 0, &opus_head));
+        ogg.extend_from_slice(&ogg_page(0x02, 0, 2, 0, &opus_head));
+        ogg.extend_from_slice(&ogg_page(0x00, 0, 1, 1, &opus_tags));
+        ogg.extend_from_slice(&ogg_page(0x00, 0, 2, 1, &opus_tags));
+        let dummy_packet = [0xFCu8, 0xFF, 0xFE];
+        for i in 0..300u32 {
+            ogg.extend_from_slice(&ogg_page(
+                0x00,
+                u64::from(i + 1) * 960,
+                2,
+                i + 2,
+                &dummy_packet,
+            ));
+        }
+        ogg.extend_from_slice(&ogg_page(0x04, 960, 1, 2, &dummy_packet));
+
+        let dir = crate::testutil::TempDir::new("decode-skip-cancel");
+        let p = dir.path().join("multi.opus");
+        std::fs::write(&p, &ogg).unwrap();
+        let progress = CancelOnSecondCheck(AtomicUsize::new(0));
+        let err = decode_file(
+            &p,
+            crate::audio::SAMPLE_RATE,
+            &DecodeLimits::default(),
+            &progress,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        assert!(progress.0.load(Ordering::SeqCst) >= 2);
     }
 }

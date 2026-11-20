@@ -26,6 +26,7 @@ mod picker;
 pub mod settings;
 #[cfg(debug_assertions)]
 mod smoke;
+mod updates;
 pub mod util;
 pub mod worker;
 
@@ -119,11 +120,10 @@ pub fn run() {
                 .build(),
         )
         .plugin(picker::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(drag::init())
         .setup(move |app| {
             let handle = app.handle().clone();
+            app.manage(updates::Updates::new(&handle));
             let resolver = app.path();
             let paths = AppPaths::new(
                 resolver.app_data_dir()?,

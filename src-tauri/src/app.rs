@@ -28,6 +28,8 @@ pub const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Largest model file accepted for manual import (8 GiB).
 pub const MAX_MODEL_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_TAG_CHARS: usize = 1024;
+/// Maximum number of model download requests waiting behind the active one.
+const MAX_QUEUED_DOWNLOADS: usize = 32;
 
 /// Folders the app owns.
 #[derive(Debug, Clone)]
@@ -111,6 +113,20 @@ impl Job for SplitJob {
     }
 }
 
+/// A queued background model download.
+#[derive(Debug, Clone)]
+struct DownloadJob {
+    key: String,
+    ids: Vec<String>,
+    accept_restricted: bool,
+}
+
+impl Job for DownloadJob {
+    fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// Everything [`AppCore::start`] needs.
 pub struct CoreOptions {
     pub paths: AppPaths,
@@ -127,12 +143,13 @@ pub struct AppCore {
     pub library: Library,
     pub player: Player,
     pub settings: SettingsStore,
+    imports: Mutex<()>,
     splits: Worker<SplitJob>,
     split_actions: Mutex<()>,
     scans: Worker<String>,
     exports: Mutex<()>,
     drag_copies: Mutex<()>,
-    downloads: Mutex<Vec<CancelToken>>,
+    downloads: Worker<DownloadJob>,
     download_progress: Mutex<HashMap<String, (f64, Instant)>>,
     /// Canonical paths handed to the UI (exports, drag files, export folders).
     handed_out: Mutex<HashSet<PathBuf>>,
@@ -303,7 +320,14 @@ impl AppCore {
         }
         let player = Player::new(opts.events.clone(), opts.audio.clone());
         let core = Arc::new_cyclic(|weak: &Weak<AppCore>| {
-            let (w1, w2, w3, w4) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+            let (w1, w2, w3, w4, w5, w6) = (
+                weak.clone(),
+                weak.clone(),
+                weak.clone(),
+                weak.clone(),
+                weak.clone(),
+                weak.clone(),
+            );
             let splits = Worker::start(
                 "splitsound-split",
                 move |job: SplitJob, token: &CancelToken| {
@@ -336,6 +360,21 @@ impl AppCore {
                     }
                 },
             );
+            let downloads = Worker::start(
+                "splitsound-download",
+                move |job: DownloadJob, token: &CancelToken| {
+                    if let Some(c) = w5.upgrade() {
+                        c.run_download(job, token);
+                    }
+                },
+                move |_key, msg| {
+                    log::error!("model download panicked: {msg}");
+                    if let Some(c) = w6.upgrade() {
+                        lock(&c.download_progress).clear();
+                        c.models_changed();
+                    }
+                },
+            );
             AppCore {
                 paths: opts.paths,
                 engine: opts.engine,
@@ -343,12 +382,13 @@ impl AppCore {
                 library,
                 player,
                 settings,
+                imports: Mutex::new(()),
                 splits,
                 split_actions: Mutex::new(()),
                 scans,
                 exports: Mutex::new(()),
                 drag_copies: Mutex::new(()),
-                downloads: Mutex::new(Vec::new()),
+                downloads,
                 download_progress: Mutex::new(HashMap::new()),
                 handed_out: Mutex::new(HashSet::new()),
                 version: opts.version,
@@ -362,9 +402,7 @@ impl AppCore {
 
     /// Cancels background work. Called on exit.
     pub fn shutdown(&self) {
-        for t in lock(&self.downloads).iter() {
-            t.cancel();
-        }
+        self.downloads.shutdown();
         self.splits.shutdown();
         self.scans.shutdown();
         self.player.unload();
@@ -408,6 +446,7 @@ impl AppCore {
     pub fn import_track(&self, path: &str) -> IpcResult<Session> {
         let engine = self.engine()?;
         let input = validate_input_file(path, MAX_IMPORT_BYTES)?;
+        let _import = lock(&self.imports);
         let size = fs::metadata(&input).map(|m| m.len()).unwrap_or(0);
         let id = util::new_session_id();
         let staging = self.library.staging_dir(&id)?;
@@ -1107,19 +1146,12 @@ impl AppCore {
         let _drag = lock(&self.drag_copies);
         let s = self.library.get(id)?;
         let dir = self.library.dir(id)?;
-        if s.stems.is_empty() {
-            return Err(IpcError::not_found("This song hasn't been split yet."));
-        }
-        for st in stem_ids {
-            if !s.stems.iter().any(|x| x.id == *st) {
-                return Err(IpcError::not_found("This song doesn't have that stem."));
-            }
-        }
+        let stems = Self::checked_stems(&s, stem_ids)?;
         let drag = self.paths.drag_dir.join(id);
         fs::create_dir_all(&drag).map_err(|e| IpcError::io("prepare the files", &e))?;
         let title = sanitize_file_stem(&s.track.title);
-        let mut out = Vec::with_capacity(stem_ids.len());
-        for st in stem_ids {
+        let mut out = Vec::with_capacity(stems.len());
+        for st in &stems {
             let src = stem_path(&dir, *st);
             let name = format!("{title} ({}).wav", st.display_name());
             let target = drag.join(&name);
@@ -1133,13 +1165,8 @@ impl AppCore {
                     }
             });
             if !fresh {
-                let tmp = drag.join(format!(".{name}.part"));
-                fs::copy(&src, &tmp)
-                    .and_then(|_| fs::rename(&tmp, &target))
-                    .map_err(|e| {
-                        let _ = fs::remove_file(&tmp);
-                        IpcError::io("prepare the files", &e)
-                    })?;
+                copy_file_atomic(&src, &target)
+                    .map_err(|e| IpcError::io("prepare the files", &e))?;
             }
             let c =
                 dunce_canonicalize(&target).map_err(|e| IpcError::io("prepare the files", &e))?;
@@ -1243,69 +1270,71 @@ impl AppCore {
         }
     }
 
-    /// Starts downloading models in the background. Refuses
+    fn run_download(&self, job: DownloadJob, token: &CancelToken) {
+        let res = self.engine().and_then(|engine| {
+            engine
+                .download_models(
+                    &job.ids,
+                    job.accept_restricted,
+                    &mut |p| self.note_download_progress(&p),
+                    token,
+                )
+                .map_err(IpcError::from)
+        });
+        self.clear_download_progress(&job.ids);
+        match res {
+            Ok(()) => self.rescan_unavailable(),
+            Err(e) if e.code == ErrorCode::Cancelled => {
+                log::info!("model download cancelled")
+            }
+            Err(e) => log::warn!("model download failed: {e}"),
+        }
+        self.models_changed();
+    }
+
+    /// Starts downloading models on the background download worker. Refuses
     /// (`terms_required`) restricted models unless `accept_restricted`.
-    pub fn download_models(
-        self: &Arc<Self>,
-        ids: Vec<String>,
-        accept_restricted: bool,
-    ) -> IpcResult<()> {
+    pub fn download_models(&self, ids: Vec<String>, accept_restricted: bool) -> IpcResult<()> {
         let models = self.engine()?.list_models();
+        let mut unique_ids = Vec::with_capacity(ids.len());
         let mut restricted = Vec::new();
-        for id in &ids {
+        for id in ids {
             let m = models
                 .iter()
-                .find(|m| &m.id == id)
+                .find(|m| m.id == id)
                 .ok_or_else(|| IpcError::not_found("That model doesn't exist."))?;
-            if m.restricted {
-                restricted.push(m);
+            if !unique_ids.contains(&id) {
+                if m.restricted {
+                    restricted.push(m);
+                }
+                unique_ids.push(id);
             }
         }
         if !restricted.is_empty() && !accept_restricted {
             return Err(terms_required(&restricted));
         }
-        if ids.is_empty() {
+        if unique_ids.is_empty() {
             return Ok(());
         }
-        let token = CancelToken::new();
-        lock(&self.downloads).push(token.clone());
-        let core = self.clone();
-        std::thread::Builder::new()
-            .name("splitsound-download".into())
-            .spawn(move || {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    core.engine()?
-                        .download_models(
-                            &ids,
-                            accept_restricted,
-                            &mut |p| core.note_download_progress(&p),
-                            &token,
-                        )
-                        .map_err(IpcError::from)
-                }));
-                core.clear_download_progress(&ids);
-                lock(&core.downloads).retain(|t| !t.same(&token));
-                match res {
-                    Ok(Ok(())) => core.rescan_unavailable(),
-                    Ok(Err(e)) if e.code == ErrorCode::Cancelled => {
-                        log::info!("model download cancelled")
-                    }
-                    Ok(Err(e)) => log::warn!("model download failed: {e}"),
-                    Err(p) => log::error!(
-                        "model download panicked: {}",
-                        crate::worker::panic_message(p.as_ref())
-                    ),
-                }
-                core.models_changed();
-            })
-            .map_err(|e| IpcError::internal(format!("Couldn't start the download ({e}).")))?;
+        self.downloads
+            .try_push(
+                DownloadJob {
+                    key: util::new_session_id(),
+                    ids: unique_ids,
+                    accept_restricted,
+                },
+                MAX_QUEUED_DOWNLOADS,
+            )
+            .map_err(|_| {
+                IpcError::busy(
+                    "Too many model downloads are already queued. Wait for them to finish.",
+                )
+            })?;
         Ok(())
     }
 
     pub fn cancel_model_downloads(&self) {
-        for t in lock(&self.downloads).drain(..) {
-            t.cancel();
-        }
+        self.downloads.cancel_all();
     }
 
     pub fn remove_model(&self, id: &str) -> IpcResult<()> {
@@ -1368,12 +1397,32 @@ impl AppCore {
     }
 }
 
-impl Drop for AppCore {
-    fn drop(&mut self) {
-        for t in lock(&self.downloads).iter() {
-            t.cancel();
-        }
+/// Copies `src` to `dst` through an exclusive sibling temporary file so
+/// preexisting symlinks at predictable names are never followed or removed.
+fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
+    let dir = dst
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name = dst
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        &util::new_session_id()[..8]
+    ));
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create_new(&tmp)?;
+    let result = (|| {
+        io::copy(&mut reader, &mut writer)?;
+        drop(writer);
+        fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
 }
 
 /// Keep the previous files until the new `session.json` commits the swap.

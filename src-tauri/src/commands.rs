@@ -282,6 +282,22 @@ pub async fn reveal_path(core: Core<'_>, path: String) -> IpcResult<()> {
     .await
 }
 
+#[tauri::command]
+pub(crate) async fn check_for_update(
+    app: AppHandle,
+    updater: State<'_, crate::updates::Updates>,
+) -> IpcResult<Option<UpdateInfo>> {
+    updater.check(&app).await
+}
+
+#[tauri::command]
+pub(crate) async fn install_update(
+    app: AppHandle,
+    updater: State<'_, crate::updates::Updates>,
+) -> IpcResult<()> {
+    updater.install(&app).await
+}
+
 /// Names of every command, for the build script's permission manifest and
 /// a test that keeps it in sync with `generate_handler!`.
 pub const NAMES: &[&str] = &[
@@ -315,6 +331,8 @@ pub const NAMES: &[&str] = &[
     "update_settings",
     "get_app_info",
     "reveal_path",
+    "check_for_update",
+    "install_update",
 ];
 
 /// Builds the invoke handler with every command.
@@ -352,12 +370,28 @@ macro_rules! splitsound_handler {
             $crate::commands::update_settings,
             $crate::commands::get_app_info,
             $crate::commands::reveal_path,
+            $crate::commands::check_for_update,
+            $crate::commands::install_update,
         ]
     };
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webview_updates_use_only_app_commands() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
+        let permissions = manifest["permissions"].as_array().unwrap();
+        assert!(permissions.iter().all(|p| {
+            let p = p.as_str().unwrap();
+            !p.starts_with("updater:") && !p.starts_with("process:")
+        }));
+        for command in ["allow-check-for-update", "allow-install-update"] {
+            assert!(permissions.iter().any(|p| p == command));
+        }
+    }
+
     #[test]
     fn command_list_matches_the_contract() {
         let contract = std::fs::read_to_string(concat!(

@@ -174,4 +174,35 @@ describe("mock backend state machine", () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(failedScan).not.toBeNull();
   });
+
+  it("supports check_for_update, install_update, update:progress, and update errors", async () => {
+    // Up to date by default; install_update rejects when nothing found
+    backend = createMockBackend({ timeScale: 0.01 });
+    expect(await backend.invoke("check_for_update", {})).toBeNull();
+    await expect(backend.invoke("install_update", {})).rejects.toMatchObject<Partial<IpcError>>({
+      code: "not_found",
+    });
+
+    // Update available -> emits update:progress with bytes
+    backend.dispose();
+    backend = createMockBackend({
+      timeScale: 0.01,
+      availableUpdate: { version: "26.48.0", notes: "Plain release notes." },
+    });
+    const info = await backend.invoke("check_for_update", {});
+    expect(info).toEqual({ version: "26.48.0", notes: "Plain release notes." });
+
+    const seen: { downloadedBytes: number; totalBytes: number | null }[] = [];
+    await backend.listen("update:progress", (p) => seen.push(p));
+    await backend.invoke("install_update", {});
+    expect(seen.length).toBeGreaterThanOrEqual(4);
+    expect(seen.some((p) => p.totalBytes === 40_000_000)).toBe(true);
+
+    // Failed update check
+    backend.dispose();
+    backend = createMockBackend({ timeScale: 0.01, failUpdateCheck: true });
+    await expect(backend.invoke("check_for_update", {})).rejects.toMatchObject<Partial<IpcError>>({
+      code: "offline",
+    });
+  });
 });

@@ -3,6 +3,8 @@ import { setTransportForTesting } from "../src/ipc/client";
 import { createMockBackend, type MockBackend } from "../src/ipc/mock/backend";
 import {
   bootstrapApp,
+  checkForUpdatesManually,
+  formatUpdateProgressNotice,
   importAudioPaths,
   openSongById,
   requestModelDownload,
@@ -151,32 +153,77 @@ describe("application stores", () => {
     expect(playbackStore.getState().playback.loop).toEqual({ startSec: 40, endSec: 95 });
   });
 
-  it("checks for updates at most once per launch and reports download progress", async () => {
+  it("checks for updates at most once per launch, reports progress, and handles errors", async () => {
+    // 1. Progress formatting with and without totalBytes
+    expect(
+      formatUpdateProgressNotice({ downloadedBytes: 16_000_000, totalBytes: 40_000_000 }),
+    ).toBe("Downloading the update, 40 %");
+    expect(formatUpdateProgressNotice({ downloadedBytes: 5_000_000, totalBytes: null })).toBe(
+      "Downloading the update",
+    );
+
+    // 2. Startup check finds 26.48.0 once per launch and installs via IPC + update:progress
+    unlisten?.();
+    backend.dispose();
+    uiStore.reset();
     resetStartupUpdateCheckForTesting();
-    let calls = 0;
-    const fakeChecker = async () => {
-      calls++;
-      return {
-        status: "available" as const,
-        version: "26.48.0",
-        install: async (onProgress?: (f: number) => void) => {
-          onProgress?.(0.4);
-        },
-      };
-    };
+    backend = createMockBackend({
+      timeScale: 0.01,
+      availableUpdate: { version: "26.48.0", notes: "Notes not shown" },
+    });
+    setTransportForTesting(backend);
+    unlisten = await bootstrapApp();
 
-    await runStartupUpdateCheck(fakeChecker);
-    await runStartupUpdateCheck(fakeChecker);
-    expect(calls).toBe(1);
+    await runStartupUpdateCheck();
+    const firstNotice = uiStore.getState().notice;
+    expect(firstNotice?.text).toBe("SplitSound 26.48.0 is available.");
+    expect(firstNotice?.actionLabel).toBe("Update and restart");
+    expect(firstNotice?.dismissLabel).toBe("Later");
 
-    const notice = uiStore.getState().notice;
-    expect(notice?.text).toBe("SplitSound 26.48.0 is available.");
-    expect(notice?.actionLabel).toBe("Update and restart");
-    expect(notice?.dismissLabel).toBe("Later");
+    // Calling runStartupUpdateCheck again does not re-check
+    uiStore.reset();
+    await runStartupUpdateCheck();
+    expect(uiStore.getState().notice).toBeNull();
 
-    notice?.onAction?.();
-    await new Promise((r) => setTimeout(r, 10));
-    expect(uiStore.getState().notice?.text).toBe("Downloading the update, 40 %");
+    // Triggering Update and restart streams update:progress into notice
+    const seenNotices: string[] = [];
+    const unsubUi = uiStore.subscribe(() => {
+      const txt = uiStore.getState().notice?.text;
+      if (txt) seenNotices.push(txt);
+    });
+    firstNotice?.onAction?.();
+    await new Promise((r) => setTimeout(r, 80));
+    unsubUi();
+    expect(seenNotices).toContain("Downloading the update, 40 %");
+
+    // 3. Automatic check stays silent on failure; manual check shows error notice
+    unlisten?.();
+    backend.dispose();
+    uiStore.reset();
+    resetStartupUpdateCheckForTesting();
+    backend = createMockBackend({ timeScale: 0.01, failUpdateCheck: true });
+    setTransportForTesting(backend);
+    unlisten = await bootstrapApp();
+
+    await runStartupUpdateCheck();
+    expect(uiStore.getState().notice).toBeNull();
+
+    const manual = await checkForUpdatesManually();
+    expect(manual.status).toBe("error");
+    expect(uiStore.getState().notice?.tone).toBe("error");
+    expect(uiStore.getState().notice?.text).toBe("Couldn't check for updates. Try again later.");
+
+    // 4. Manual check when up to date returns up-to-date cleanly
+    unlisten?.();
+    backend.dispose();
+    uiStore.reset();
+    backend = createMockBackend({ timeScale: 0.01, availableUpdate: null });
+    setTransportForTesting(backend);
+    unlisten = await bootstrapApp();
+
+    const upToDate = await checkForUpdatesManually();
+    expect(upToDate.status).toBe("up-to-date");
+    expect(uiStore.getState().notice).toBeNull();
   });
 
   it("shows download-failed error notice on silent failure but never on user cancel", async () => {

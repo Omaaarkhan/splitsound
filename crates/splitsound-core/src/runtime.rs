@@ -87,30 +87,21 @@ pub fn host_target_name() -> &'static str {
 /// Finds the ONNX Runtime library.
 ///
 /// Order: `explicit` (what the app passes: the copy inside its bundle),
-/// then the `ORT_DYLIB_PATH` environment variable, then
-/// `vendor/onnxruntime/<host>/` in the source tree (for tests and the CLI
-/// run from a checkout). The result is always absolute and exists.
+/// then the `ORT_DYLIB_PATH` environment variable, then (in debug and test
+/// builds only) `vendor/onnxruntime/<host>/` in the source tree. The result
+/// is always absolute and exists.
 ///
 /// # Errors
 /// `internal`, with a message that says how to get the library.
 pub fn resolve_library_path(explicit: Option<&Path>) -> Result<PathBuf> {
     let mut tried: Vec<String> = Vec::new();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(p) = explicit {
-        candidates.push(p.to_path_buf());
-    } else {
-        if let Some(env) = std::env::var_os("ORT_DYLIB_PATH").filter(|v| !v.is_empty()) {
-            candidates.push(PathBuf::from(env));
-        }
-        // crates/splitsound-core -> repository root.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-        candidates.push(
-            root.join("vendor")
-                .join("onnxruntime")
-                .join(host_target_name())
-                .join(library_file_name()),
-        );
-    }
+    let candidates = library_candidates(
+        explicit,
+        std::env::var_os("ORT_DYLIB_PATH")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        cfg!(any(debug_assertions, test)),
+    );
     for c in candidates {
         // A directory means "the library inside it".
         let c = if c.is_dir() {
@@ -131,6 +122,35 @@ pub fn resolve_library_path(explicit: Option<&Path>) -> Result<PathBuf> {
         "looked in: {}. Run `node scripts/fetch-onnxruntime.mjs` or set ORT_DYLIB_PATH",
         tried.join(", ")
     )))
+}
+
+fn library_candidates(
+    explicit: Option<&Path>,
+    env_override: Option<PathBuf>,
+    allow_source_tree: bool,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(p) = explicit {
+        candidates.push(p.to_path_buf());
+        return candidates;
+    }
+    if let Some(env) = env_override {
+        candidates.push(env);
+    }
+    #[cfg(any(debug_assertions, test))]
+    if allow_source_tree {
+        // crates/splitsound-core -> repository root.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        candidates.push(
+            root.join("vendor")
+                .join("onnxruntime")
+                .join(host_target_name())
+                .join(library_file_name()),
+        );
+    }
+    #[cfg(not(any(debug_assertions, test)))]
+    let _ = allow_source_tree;
+    candidates
 }
 
 /// Runtime settings.
@@ -491,5 +511,16 @@ mod tests {
     fn auto_threads_is_sane() {
         let n = auto_threads();
         assert!((1..=64).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn release_mode_has_no_source_tree_fallback() {
+        assert!(library_candidates(None, None, false).is_empty());
+        let env_path = PathBuf::from("/custom/ort.so");
+        assert_eq!(
+            library_candidates(None, Some(env_path.clone()), false),
+            vec![env_path]
+        );
+        assert_eq!(library_candidates(None, None, true).len(), 1);
     }
 }

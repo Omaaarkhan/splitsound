@@ -28,7 +28,7 @@
     ],
     "security": {
       "capabilities": ["main"],
-      "freezePrototype": false,
+      "freezePrototype": true,
       "assetProtocol": {
         "enable": false
       },

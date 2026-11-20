@@ -12,9 +12,12 @@
 //! * [`MappedWav`] memory-maps a working file for the playback mixer and for
 //!   peaks.
 
+use std::collections::hash_map::RandomState;
 use std::fs::File;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::audio::{SAMPLE_RATE, Stereo};
 use crate::error::{Error, Result};
@@ -112,14 +115,70 @@ fn float_header(channels: u16, sample_rate: u32, data_bytes: u64) -> [u8; 56] {
     h
 }
 
-/// Returns a sibling temp path for atomic "write then rename" output.
-pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = path
+/// A temporary sibling file created exclusively by this process.
+///
+/// Dropping it without calling [`TempFile::persist`] removes the file; a
+/// pre-existing path or symlink that was never created by us is never touched.
+pub(crate) struct TempFile {
+    path: Option<PathBuf>,
+}
+
+impl TempFile {
+    pub(crate) fn path(&self) -> &Path {
+        self.path.as_deref().expect("temp file already persisted")
+    }
+
+    /// Renames the temporary file over `dst` and disarms cleanup on drop.
+    pub(crate) fn persist(mut self, dst: &Path) -> std::io::Result<()> {
+        let Some(tmp) = self.path.as_ref() else {
+            return Ok(());
+        };
+        std::fs::rename(tmp, dst)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(tmp) = self.path.take() {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+fn create_temp_at(path: PathBuf) -> std::io::Result<(File, TempFile)> {
+    let file = File::create_new(&path)?;
+    Ok((file, TempFile { path: Some(path) }))
+}
+
+/// Creates a new sibling temp file with an unpredictable `.part` name using
+/// `create_new` semantics, so preexisting files and symlinks are never
+/// followed, overwritten or deleted.
+pub(crate) fn create_temp_sibling(path: &Path) -> std::io::Result<(File, TempFile)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(format!(".{}.part", std::process::id()));
-    path.with_file_name(name)
+    for _ in 0..32 {
+        let mut h = RandomState::new().build_hasher();
+        std::process::id().hash(&mut h);
+        COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut h);
+        let token = h.finish();
+        let mut name = base.clone();
+        name.push(format!(".{token:016x}.part"));
+        let tmp = path.with_file_name(name);
+        match create_temp_at(tmp) {
+            Ok(pair) => return Ok(pair),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique temporary file",
+    ))
 }
 
 /// Streaming writer for the working format (32-bit float, stereo).
@@ -130,7 +189,7 @@ pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
 /// `finish` removes the temporary file.
 pub struct WavWriter {
     out: Option<BufWriter<File>>,
-    tmp: Option<PathBuf>,
+    tmp: Option<TempFile>,
     dst: PathBuf,
     channels: u16,
     sample_rate: u32,
@@ -145,8 +204,7 @@ impl WavWriter {
 
     /// Creates a float writer with an explicit channel count.
     pub fn create_with_channels(path: &Path, sample_rate: u32, channels: u16) -> Result<Self> {
-        let tmp = temp_sibling(path);
-        let file = File::create_new(&tmp).map_err(|e| Error::from_write(&e, path))?;
+        let (file, tmp) = create_temp_sibling(path).map_err(|e| Error::from_write(&e, path))?;
         let mut out = BufWriter::with_capacity(1 << 16, file);
         let header = out.write_all(&float_header(channels, sample_rate, 0));
         let writer = WavWriter {
@@ -212,9 +270,8 @@ impl WavWriter {
         .map_err(werr)?;
         file.sync_all().map_err(werr)?;
         drop(file);
-        if let Some(tmp) = &self.tmp {
-            std::fs::rename(tmp, &self.dst).map_err(werr)?;
-            self.tmp = None;
+        if let Some(tmp) = self.tmp.take() {
+            tmp.persist(&self.dst).map_err(werr)?;
         }
         Ok(())
     }
@@ -223,9 +280,7 @@ impl WavWriter {
 impl Drop for WavWriter {
     fn drop(&mut self) {
         drop(self.out.take());
-        if let Some(tmp) = self.tmp.take() {
-            let _ = std::fs::remove_file(tmp);
-        }
+        drop(self.tmp.take());
     }
 }
 
@@ -319,7 +374,9 @@ pub fn read_wav_spec(file: &mut File, path: &Path) -> Result<WavSpec> {
                         "This WAV file has an unsupported number of channels",
                     ));
                 }
-                if !(1_000..=768_000).contains(&rate) {
+                if !(crate::resample::MIN_SAMPLE_RATE..=crate::resample::MAX_SAMPLE_RATE)
+                    .contains(&rate)
+                {
                     return Err(Error::unsupported(
                         "This WAV file has an unsupported sample rate",
                     ));
@@ -706,5 +763,37 @@ mod tests {
             w.write_interleaved(&[0.0; 64]).unwrap();
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_unpredictable_and_never_follows_or_removes_symlinks() {
+        let dir = TempDir::new("wav-temp-symlink");
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, b"keep this").unwrap();
+
+        // Direct collision on a preexisting symlink refuses creation and leaves
+        // both the symlink and its target intact.
+        let link = dir.path().join("colliding.part");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_temp_at(link.clone()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Sibling temp names are distinct and do not use the predictable PID name.
+        let dst = dir.path().join("out.wav");
+        let (_, a) = create_temp_sibling(&dst).unwrap();
+        let (_, b) = create_temp_sibling(&dst).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().to_string_lossy().ends_with(".part"));
+        assert_ne!(
+            a.path(),
+            dir.path()
+                .join(format!("out.wav.{}.part", std::process::id()))
+        );
+        let pa = a.path().to_path_buf();
+        drop(a);
+        assert!(!pa.exists());
+        assert!(b.path().exists());
     }
 }

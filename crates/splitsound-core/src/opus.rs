@@ -26,6 +26,11 @@ const MAX_PACKET_FRAMES: usize = 5760;
 /// over about 61 kB per stream; this allows that for 8 streams.
 const MAX_PACKET_BYTES: usize = 8 * 61_440;
 
+/// Most elementary Opus streams accepted per packet. An untrusted header may
+/// otherwise declare up to 255 streams for a 1-channel file, multiplying
+/// decoder state and per-packet CPU work on streams that are discarded.
+const MAX_STREAMS: usize = 8;
+
 /// The parsed identification header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpusHead {
@@ -146,6 +151,10 @@ impl OpusStreamDecoder {
                 "This file has more channels than SplitSound can handle",
             )
             .with_detail(format!("{} channels", head.channels)));
+        }
+        let max_streams = head.channels.min(MAX_STREAMS);
+        if head.streams > max_streams {
+            return Err(bad_header("too many Opus streams for channel count"));
         }
         let inner = if head.mapping_family == 0 {
             let layout = if head.channels == 2 {
@@ -357,6 +366,17 @@ mod tests {
         );
         // Channel cap.
         let e = OpusStreamDecoder::new(&head(6, 0, 0, 1, &[4, 2, 0, 4, 1, 2, 3, 5]), 2);
+        assert!(e.is_err());
+        // Stream-count cap: 255 streams for 1 output channel must be rejected.
+        let e = OpusStreamDecoder::new(&head(1, 0, 0, 255, &[255, 0, 255]), 8);
+        assert!(e.is_err());
+        // More streams than output channels is also rejected.
+        let e = OpusStreamDecoder::new(&head(2, 0, 0, 255, &[3, 0, 0, 1]), 8);
+        assert!(e.is_err());
+        // Even with a larger caller channel cap, streams stay bounded by MAX_STREAMS.
+        let mut mapping = vec![9u8, 0];
+        mapping.extend(0u8..9);
+        let e = OpusStreamDecoder::new(&head(9, 0, 0, 255, &mapping), 16);
         assert!(e.is_err());
     }
 

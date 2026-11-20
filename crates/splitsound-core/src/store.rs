@@ -20,20 +20,21 @@
 //! * Files imported by hand go through the same checks.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::checkpoint::{convert_checkpoint, hex};
+use crate::checkpoint::{convert_checkpoint_bytes, hex};
 use crate::error::{Error, ErrorCode, Result};
 use crate::manifest::{
     Manifest, ModelEntry, PinnedFile, UPSTREAM_HOSTS, is_safe_file_name, parse_https_url,
     tensor_table_for,
 };
 use crate::progress::Progress;
+use crate::wav::{TempFile, create_temp_sibling};
 
 /// Where project model files are downloaded from.
 pub const DEFAULT_BASE_URL: &str =
@@ -206,22 +207,6 @@ fn damaged(entry: &ModelEntry, detail: impl std::fmt::Display) -> Error {
     .with_detail(detail)
 }
 
-/// A reader that hashes what passes through it.
-struct HashingReader<R: Read> {
-    inner: R,
-    hasher: Sha256,
-    count: u64,
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        self.count += n as u64;
-        Ok(n)
-    }
-}
-
 impl ModelStore {
     /// Opens (creating if needed) the store at `dir` with the compiled-in
     /// manifest and the default download source.
@@ -347,19 +332,14 @@ impl ModelStore {
                     ),
                 ));
             };
-            let part = crate::wav::temp_sibling(&self.path_of(download));
-            let result = self
-                .fetch_project_file(
-                    download,
-                    &part,
-                    &mut |n| {
-                        observer.progress(&entry.id, done + n, total);
-                    },
-                    observer,
-                )
-                .and_then(|()| self.install_compressed(&part, &entry.file, observer));
-            let _ = std::fs::remove_file(&part);
-            result?;
+            let (file, _tmp) = self.fetch_project_file(
+                download,
+                &mut |n| {
+                    observer.progress(&entry.id, done + n, total);
+                },
+                observer,
+            )?;
+            self.install_compressed(file, &entry.file, observer)?;
             done += download.size_bytes;
         } else if let Some(d) = &entry.download {
             done += d.size_bytes;
@@ -370,33 +350,27 @@ impl ModelStore {
         {
             let table = tensor_table_for(entry)?;
             let name = upstream_file_name(&weights.upstream.url)?;
-            let part = crate::wav::temp_sibling(&self.dir.join(name));
             let pinned = PinnedFile {
                 name: name.to_string(),
                 sha256: weights.upstream.sha256.clone(),
                 size_bytes: weights.upstream.size_bytes,
             };
-            let result = self
-                .fetch_upstream(
-                    &weights.upstream.url,
-                    &pinned,
-                    &part,
-                    &mut |n| {
-                        observer.progress(&entry.id, done + n, total);
-                    },
-                    observer,
-                )
-                .and_then(|()| {
-                    convert_checkpoint(
-                        &part,
-                        &table,
-                        &self.path_of(&weights.file),
-                        &CancelOnly(observer),
-                    )
-                });
-            // The checkpoint itself is never kept.
-            let _ = std::fs::remove_file(&part);
-            result?;
+            // The checkpoint itself is never kept on disk: verify it directly
+            // in memory and convert those exact verified bytes.
+            let bytes = self.fetch_upstream_bytes(
+                &weights.upstream.url,
+                &pinned,
+                &mut |n| {
+                    observer.progress(&entry.id, done + n, total);
+                },
+                observer,
+            )?;
+            convert_checkpoint_bytes(
+                &bytes,
+                &table,
+                &self.path_of(&weights.file),
+                &CancelOnly(observer),
+            )?;
         }
         observer.progress(&entry.id, total, total);
         Ok(())
@@ -514,12 +488,13 @@ impl ModelStore {
     /// `model_download_failed` (a recognised archive that does not unpack
     /// to the pinned content).
     pub fn import_file(&self, path: &Path, accept_restricted: bool) -> Result<Option<String>> {
-        let meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+        let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
+        let meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
         if !meta.is_file() {
             return Ok(None);
         }
         let len = meta.len();
-        // Cheap pre-filter: only hash files whose size is a pinned size.
+        // Cheap pre-filter: only read files whose size is a pinned size.
         let known_size = self.manifest.models.iter().any(|m| {
             m.file.size_bytes == len
                 || m.download.as_ref().is_some_and(|d| d.size_bytes == len)
@@ -530,7 +505,19 @@ impl ModelStore {
         if !known_size {
             return Ok(None);
         }
-        let (digest, _) = crate::checkpoint::sha256_file(path, &crate::progress::NoProgress)?;
+        // Read once from the open handle (bounded by the pinned size) so the
+        // exact bytes that are hashed are the bytes installed or parsed.
+        let mut data = Vec::new();
+        data.try_reserve_exact(len as usize)
+            .map_err(|_| Error::out_of_memory())?;
+        (&mut file)
+            .take(len.saturating_add(1))
+            .read_to_end(&mut data)
+            .map_err(|e| Error::from_read(&e, path))?;
+        if data.len() as u64 != len {
+            return Err(download_failed("file changed while it was being imported"));
+        }
+        let digest = hex(&Sha256::digest(&data));
         let _guard = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         for entry in &self.manifest.models {
             let gate = || {
@@ -543,29 +530,26 @@ impl ModelStore {
             let matches = |f: &PinnedFile| f.size_bytes == len && f.sha256 == digest;
             if matches(&entry.file) {
                 gate()?;
-                self.copy_verified(path, &entry.file)?;
+                self.write_verified_bytes(&data, &entry.file)?;
                 return Ok(Some(entry.id.clone()));
             }
             if let Some(d) = entry.download.as_ref().filter(|d| matches(d)) {
+                let _ = d;
                 gate()?;
-                let part = crate::wav::temp_sibling(&self.path_of(d));
-                let result = copy_file(path, &part)
-                    .and_then(|()| self.install_compressed(&part, &entry.file, &NoObserver));
-                let _ = std::fs::remove_file(&part);
-                result?;
+                self.install_compressed(Cursor::new(&data), &entry.file, &NoObserver)?;
                 return Ok(Some(entry.id.clone()));
             }
             if let Some(w) = &entry.weights {
                 if matches(&w.file) {
                     gate()?;
-                    self.copy_verified(path, &w.file)?;
+                    self.write_verified_bytes(&data, &w.file)?;
                     return Ok(Some(entry.id.clone()));
                 }
                 if w.upstream.size_bytes == len && w.upstream.sha256 == digest {
                     gate()?;
                     let table = tensor_table_for(entry)?;
-                    convert_checkpoint(
-                        path,
+                    convert_checkpoint_bytes(
+                        &data,
                         &table,
                         &self.path_of(&w.file),
                         &crate::progress::NoProgress,
@@ -577,150 +561,125 @@ impl ModelStore {
         Ok(None)
     }
 
-    /// Copies `src` to the installed location of `file`, verifying the
-    /// digest of what was actually written before the rename.
-    fn copy_verified(&self, src: &Path, file: &PinnedFile) -> Result<()> {
-        let dst = self.path_of(file);
-        let part = crate::wav::temp_sibling(&dst);
-        let result = (|| {
-            let input = File::open(src).map_err(|e| Error::from_read(&e, src))?;
-            let mut reader = HashingReader {
-                inner: input.take(file.size_bytes + 1),
-                hasher: Sha256::new(),
-                count: 0,
-            };
-            let mut out = File::create(&part).map_err(|e| Error::from_write(&e, &dst))?;
-            std::io::copy(&mut reader, &mut out).map_err(|e| Error::from_write(&e, &dst))?;
-            out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
-            if reader.count != file.size_bytes || hex(&reader.hasher.finalize()) != file.sha256 {
-                return Err(download_failed("file changed while it was being imported"));
-            }
-            std::fs::rename(&part, &dst).map_err(|e| Error::from_write(&e, &dst))
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&part);
+    /// Writes already-verified `bytes` to the installed location of `file`
+    /// via an unpredictable `create_new` sibling temp file.
+    fn write_verified_bytes(&self, bytes: &[u8], file: &PinnedFile) -> Result<()> {
+        if bytes.len() as u64 != file.size_bytes || hex(&Sha256::digest(bytes)) != file.sha256 {
+            return Err(download_failed("file changed while it was being imported"));
         }
-        result
+        let dst = self.path_of(file);
+        let (mut out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        out.write_all(bytes)
+            .map_err(|e| Error::from_write(&e, &dst))?;
+        out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
+        drop(out);
+        tmp.persist(&dst).map_err(|e| Error::from_write(&e, &dst))
     }
 
-    /// Decompresses the verified zstd file at `compressed` into the
+    /// Decompresses the verified zstd stream from `compressed` into the
     /// installed location of `target`, bounded by and checked against the
     /// pinned size and digest.
-    fn install_compressed(
+    fn install_compressed<R: Read>(
         &self,
-        compressed: &Path,
+        compressed: R,
         target: &PinnedFile,
         observer: &dyn DownloadObserver,
     ) -> Result<()> {
         let dst = self.path_of(target);
-        let part = crate::wav::temp_sibling(&dst);
-        let result = (|| {
-            let input = File::open(compressed).map_err(|e| Error::from_read(&e, compressed))?;
-            let mut input = std::io::BufReader::with_capacity(1 << 16, input);
-            let out = File::create(&part).map_err(|e| Error::from_write(&e, &dst))?;
-            let mut out = std::io::BufWriter::with_capacity(1 << 16, out);
-            let mut hasher = Sha256::new();
-            let mut written = 0u64;
-            {
-                let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut input)
-                    .map_err(|e| download_failed(format!("zstd: {e}")))?;
-                let mut buf = vec![0u8; 1 << 16];
-                loop {
-                    if observer.is_cancelled() {
-                        return Err(Error::cancelled());
-                    }
-                    let n = decoder
-                        .read(&mut buf)
-                        .map_err(|e| download_failed(format!("zstd: {e}")))?;
-                    if n == 0 {
-                        break;
-                    }
-                    written += n as u64;
-                    // The bound: stop the moment the output is larger than
-                    // it is allowed to be. A decompression bomb gets no
-                    // further than one buffer past the pinned size.
-                    if written > target.size_bytes {
-                        return Err(download_failed("decompressed data is larger than expected"));
-                    }
-                    hasher.update(&buf[..n]);
-                    out.write_all(&buf[..n])
-                        .map_err(|e| Error::from_write(&e, &dst))?;
+        let mut input = std::io::BufReader::with_capacity(1 << 16, compressed);
+        let (out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 16, out);
+        let mut hasher = Sha256::new();
+        let mut written = 0u64;
+        {
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut input)
+                .map_err(|e| download_failed(format!("zstd: {e}")))?;
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                if observer.is_cancelled() {
+                    return Err(Error::cancelled());
                 }
+                let n = decoder
+                    .read(&mut buf)
+                    .map_err(|e| download_failed(format!("zstd: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                // The bound: stop the moment the output is larger than
+                // it is allowed to be. A decompression bomb gets no
+                // further than one buffer past the pinned size.
+                if written > target.size_bytes {
+                    return Err(download_failed("decompressed data is larger than expected"));
+                }
+                hasher.update(&buf[..n]);
+                out.write_all(&buf[..n])
+                    .map_err(|e| Error::from_write(&e, &dst))?;
             }
-            // Nothing may follow the frame.
-            let mut extra = [0u8; 1];
-            if input
-                .read(&mut extra)
-                .map_err(|e| Error::from_read(&e, compressed))?
-                != 0
-            {
-                return Err(download_failed(
-                    "unexpected data after the compressed stream",
-                ));
-            }
-            let file = out
-                .into_inner()
-                .map_err(|e| Error::from_write(&e.into_error(), &dst))?;
-            file.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
-            if written != target.size_bytes || hex(&hasher.finalize()) != target.sha256 {
-                return Err(download_failed(
-                    "decompressed file does not match its checksum",
-                ));
-            }
-            std::fs::rename(&part, &dst).map_err(|e| Error::from_write(&e, &dst))
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&part);
         }
-        result
+        // Nothing may follow the frame.
+        let mut extra = [0u8; 1];
+        if input
+            .read(&mut extra)
+            .map_err(|e| download_failed(format!("zstd: {e}")))?
+            != 0
+        {
+            return Err(download_failed(
+                "unexpected data after the compressed stream",
+            ));
+        }
+        let file = out
+            .into_inner()
+            .map_err(|e| Error::from_write(&e.into_error(), &dst))?;
+        file.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
+        drop(file);
+        if written != target.size_bytes || hex(&hasher.finalize()) != target.sha256 {
+            return Err(download_failed(
+                "decompressed file does not match its checksum",
+            ));
+        }
+        tmp.persist(&dst).map_err(|e| Error::from_write(&e, &dst))
     }
 
     fn fetch_project_file(
         &self,
         file: &PinnedFile,
-        dest: &Path,
         on_bytes: &mut dyn FnMut(u64),
         observer: &dyn DownloadObserver,
-    ) -> Result<()> {
-        match &self.source {
-            ModelSource::Directory(dir) => fetch_from_reader(
-                open_local(&dir.join(&file.name))?,
-                None,
-                file,
-                dest,
-                on_bytes,
-                observer,
-            ),
+    ) -> Result<(File, TempFile)> {
+        let (reader, length) = match &self.source {
+            ModelSource::Directory(dir) => (open_local(&dir.join(&file.name))?, None),
             ModelSource::Release { base_url } => {
                 let url = format!("{base_url}{}", file.name);
-                let (reader, length) = http_get(&url, RELEASE_HOSTS, file.size_bytes)?;
-                fetch_from_reader(reader, length, file, dest, on_bytes, observer)
+                http_get(&url, RELEASE_HOSTS, file.size_bytes)?
             }
-        }
+        };
+        let dst = self.path_of(file);
+        let (mut out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        fetch_from_reader(reader, length, file, &mut out, &dst, on_bytes, observer)?;
+        out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
+        out.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::from_read(&e, tmp.path()))?;
+        Ok((out, tmp))
     }
 
-    fn fetch_upstream(
+    fn fetch_upstream_bytes(
         &self,
         url: &str,
         file: &PinnedFile,
-        dest: &Path,
         on_bytes: &mut dyn FnMut(u64),
         observer: &dyn DownloadObserver,
-    ) -> Result<()> {
-        match &self.source {
-            ModelSource::Directory(dir) => fetch_from_reader(
-                open_local(&dir.join(&file.name))?,
-                None,
-                file,
-                dest,
-                on_bytes,
-                observer,
-            ),
-            ModelSource::Release { .. } => {
-                let (reader, length) = http_get(url, UPSTREAM_HOSTS, file.size_bytes)?;
-                fetch_from_reader(reader, length, file, dest, on_bytes, observer)
-            }
-        }
+    ) -> Result<Vec<u8>> {
+        let (reader, length) = match &self.source {
+            ModelSource::Directory(dir) => (open_local(&dir.join(&file.name))?, None),
+            ModelSource::Release { .. } => http_get(url, UPSTREAM_HOSTS, file.size_bytes)?,
+        };
+        let mut out = Vec::new();
+        out.try_reserve_exact(file.size_bytes as usize)
+            .map_err(|_| Error::out_of_memory())?;
+        let label = self.dir.join(&file.name);
+        fetch_from_reader(reader, length, file, &mut out, &label, on_bytes, observer)?;
+        Ok(out)
     }
 
     /// Removes leftover temporary files from interrupted installs. Call
@@ -753,18 +712,13 @@ fn open_local(path: &Path) -> Result<Box<dyn Read>> {
     }
 }
 
-fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::copy(src, dst)
-        .map(|_| ())
-        .map_err(|e| Error::from_write(&e, dst))
-}
-
-/// Streams `reader` into `dest`, enforcing the pinned size while the bytes
+/// Streams `reader` into `out`, enforcing the pinned size while the bytes
 /// arrive and the pinned SHA-256 at the end.
-fn fetch_from_reader(
+fn fetch_from_reader<W: Write>(
     reader: Box<dyn Read>,
     declared_length: Option<u64>,
     file: &PinnedFile,
+    out: &mut W,
     dest: &Path,
     on_bytes: &mut dyn FnMut(u64),
     observer: &dyn DownloadObserver,
@@ -778,7 +732,6 @@ fn fetch_from_reader(
         )));
     }
     let mut reader = reader;
-    let mut out = File::create(dest).map_err(|e| Error::from_write(&e, dest))?;
     let mut hasher = Sha256::new();
     let mut received = 0u64;
     let mut buf = vec![0u8; 1 << 16];
@@ -811,7 +764,6 @@ fn fetch_from_reader(
             on_bytes(received);
         }
     }
-    out.sync_all().map_err(|e| Error::from_write(&e, dest))?;
     if received != file.size_bytes {
         return Err(download_failed(format!(
             "{}: received {received} of {} bytes",
@@ -1372,26 +1324,26 @@ mod tests {
             "test-checkpoint.th"
         );
 
-        // Upstream fetch: pinned size and digest are enforced.
+        // Upstream fetch: pinned size and digest are enforced in memory (never written raw to disk).
         let pinned = PinnedFile {
             name: "test-checkpoint.th".into(),
             sha256: w.upstream.sha256.clone(),
             size_bytes: w.upstream.size_bytes,
         };
-        let dest = s.store.dir().join("ck.part");
-        s.store
-            .fetch_upstream(&w.upstream.url, &pinned, &dest, &mut |_| {}, &NoObserver)
+        let fetched = s
+            .store
+            .fetch_upstream_bytes(&w.upstream.url, &pinned, &mut |_| {}, &NoObserver)
             .unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), checkpoint);
+        assert_eq!(fetched, checkpoint);
         let mut bad = checkpoint.clone();
         bad[100] ^= 1;
         std::fs::write(s.src.join("test-checkpoint.th"), &bad).unwrap();
         let e = s
             .store
-            .fetch_upstream(&w.upstream.url, &pinned, &dest, &mut |_| {}, &NoObserver)
+            .fetch_upstream_bytes(&w.upstream.url, &pinned, &mut |_| {}, &NoObserver)
             .unwrap_err();
         assert_eq!(e.code(), ErrorCode::ModelDownloadFailed);
-        std::fs::remove_file(&dest).unwrap();
+        assert!(files_in(s.store.dir()).is_empty());
 
         // Put the two installed files in place and load them.
         std::fs::write(s.store.dir().join("r.onnx"), &graph).unwrap();
@@ -1513,5 +1465,26 @@ mod tests {
         s.store.install("m", false, &NoObserver).unwrap();
         s.store.clean_temp_files();
         assert_eq!(files_in(s.store.dir()), vec!["m.onnx"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_does_not_follow_or_remove_preexisting_symlinks() {
+        let z = zstd_raw(FAKE_ONNX);
+        let s = setup(manifest_for(FAKE_ONNX, &z, ""), &[("m.onnx.zst", &z)]);
+        let outside = TempDir::new("store-symlink-target");
+        let target = outside.path().join("keep.txt");
+        std::fs::write(&target, b"keep this").unwrap();
+        let pid = std::process::id();
+        let link_zst = s.store.dir().join(format!("m.onnx.zst.{pid}.part"));
+        let link_onnx = s.store.dir().join(format!("m.onnx.{pid}.part"));
+        std::os::unix::fs::symlink(&target, &link_zst).unwrap();
+        std::os::unix::fs::symlink(&target, &link_onnx).unwrap();
+
+        s.store.install("m", false, &NoObserver).unwrap();
+        assert_eq!(s.store.load("m").unwrap().graph, FAKE_ONNX);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this");
+        assert_eq!(std::fs::read_link(&link_zst).unwrap(), target);
+        assert_eq!(std::fs::read_link(&link_onnx).unwrap(), target);
     }
 }
