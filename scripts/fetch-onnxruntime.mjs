@@ -35,6 +35,7 @@
 //   https://api.nuget.org/v3/registration5-gz-semver2/microsoft.ml.onnxruntime/<version>.json
 // The `ort` crate must move with it (see .github/dependabot.yml).
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync, copyFileSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync,
@@ -287,6 +288,23 @@ if (haveLibrary) {
 
 if (copy) {
   mkdirSync(resourceDir, { recursive: true });
-  copyFileSync(libraryPath, join(resourceDir, pin.out));
+  const bundled = join(resourceDir, pin.out);
+  copyFileSync(libraryPath, bundled);
   console.log(`Copied to src-tauri/resources/onnxruntime/${pin.out}`);
+
+  // macOS only: replace Microsoft's signature on the copy that goes into the
+  // app with an ad-hoc one. The app bundle is re-signed as a whole anyway, and
+  // Microsoft's signature on 1.32.0 carries two timestamps that disagree
+  // ("timestamp mismatch ... 181 seconds apart"), which makes older versions
+  // of codesign refuse to replace it. The verified original stays untouched
+  // in vendor/; only the signature of the copy changes, not its code.
+  if (target.startsWith("macos-")) {
+    if (process.platform === "darwin") {
+      execFileSync("codesign", ["--remove-signature", bundled], { stdio: "inherit" });
+      execFileSync("codesign", ["--force", "--sign", "-", bundled], { stdio: "inherit" });
+      console.log("Replaced the library's signature with an ad-hoc one for bundling.");
+    } else {
+      console.log("Not on macOS: left the library's signature as published.");
+    }
+  }
 }
