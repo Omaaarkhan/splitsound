@@ -1,0 +1,97 @@
+.topbar {
+  height: var(--topbar-height);
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: var(--space-5);
+  border-bottom: 1px solid var(--well-deep);
+  box-shadow: var(--edge-seam);
+  position: relative;
+  z-index: 10;
+  background: var(--plate);
+}
+
+.topbar--macos {
+  padding: 0 14px 0 86px;
+}
+
+.topbar--standard {
+  padding: 0 14px 0 16px;
+}
+
+.topbar__left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 4px 6px 4px 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-stretch: var(--width-wide);
+  font-weight: 800;
+  font-size: var(--text-md);
+  letter-spacing: 0.01em;
+}
+
+.wordmark__cut {
+  width: 9px;
+  height: 15px;
+  flex-shrink: 0;
+  display: block;
+  color: var(--ink);
+}
+
+.topbar__song {
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 48vw;
+}
+
+.topbar__title {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.topbar__artist {
+  color: var(--ink-2);
+  margin-left: var(--space-4);
+}
+
+.topbar__nav {
+  justify-self: end;
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.topbar__link {
+  font: inherit;
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-control);
+  transition:
+    background var(--dur-press) var(--ease-out),
+    color var(--dur-press) var(--ease-out);
+}
+
+.topbar__link:hover {
+  background: var(--plate-hi);
+  color: var(--ink);
+}
+
+.topbar__link--active {
+  color: var(--ink);
+}

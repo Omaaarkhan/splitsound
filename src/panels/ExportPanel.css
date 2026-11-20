@@ -1,0 +1,66 @@
+.export-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.export-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.export-group__label {
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.export-stems {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-stem-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.export-stem-row__absent {
+  font-size: var(--text-sm);
+  color: var(--ink-2);
+}
+
+.export-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.export-folder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.export-folder__path {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--well-deep);
+  background: var(--plate-lo);
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

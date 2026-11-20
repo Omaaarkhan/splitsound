@@ -1,0 +1,30 @@
+.licenses {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.licenses__item {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.licenses__item:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.licenses__name {
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.licenses__meta {
+  font-size: var(--text-sm);
+  color: var(--ink-2);
+  max-width: 56ch;
+}
