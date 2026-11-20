@@ -1,0 +1,444 @@
+{
+  "schemaVersion": 1,
+  "comment": "Pins for every third-party file the export scripts download. weights.py refuses any file whose size or full SHA-256 differs, any URL or redirect hop that is not HTTPS on an allowed host, and any pickle whose globals differ from expectedGlobals. Globals outside the base policy (torch, numpy, collections, the model's own package) must also be listed in approvedExceptions, which only the project owner may extend.",
+  "allowedHosts": {
+    "dl.fbaipublicfiles.com": "Meta's public model host; the root URL hard-coded in demucs/pretrained.py",
+    "github.com": "upstream author's GitHub release (tagger weights)",
+    "release-assets.githubusercontent.com": "GitHub's own CDN that github.com release downloads redirect to",
+    "objects.githubusercontent.com": "GitHub's own CDN (older redirect target for release assets)",
+    "raw.githubusercontent.com": "GitHub raw file host, used only with a full commit SHA in the path"
+  },
+  "files": [
+    {
+      "name": "955717e8-8726e21a.th",
+      "usedBy": [
+        "htdemucs"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 84141911,
+      "sha256": "8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "8726e21a"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "_codecs.encode",
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "numpy.core.multiarray.scalar",
+          "numpy.dtype",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "5c90dfd2-34c22ccb.th",
+      "usedBy": [
+        "htdemucs_6s"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 54996327,
+      "sha256": "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "34c22ccb"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "f7e0c4bc-ba3fe64a.th",
+      "usedBy": [
+        "htdemucs_ft_drums"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/f7e0c4bc-ba3fe64a.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 84141271,
+      "sha256": "ba3fe64ae8ef66ac9a4857222ce48efbdc5eb3ad375cb79dd13debee5aaa4066",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "ba3fe64a"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "_codecs.encode",
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "numpy.core.multiarray.scalar",
+          "numpy.dtype",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "d12395a8-e57c48e6.th",
+      "usedBy": [
+        "htdemucs_ft_bass"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/d12395a8-e57c48e6.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 84141271,
+      "sha256": "e57c48e6b0e38af4f7118d7bd08c49f0a0c0edf7d09143bdd902ea0d237303e6",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "e57c48e6"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "_codecs.encode",
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "numpy.core.multiarray.scalar",
+          "numpy.dtype",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "92cfc3b6-ef3bcb9c.th",
+      "usedBy": [
+        "htdemucs_ft_other"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/92cfc3b6-ef3bcb9c.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 84141271,
+      "sha256": "ef3bcb9c8b40d14ae5d51b6db2587339cc12c6b77c0be151ce6d69002e087bf2",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "ef3bcb9c"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "_codecs.encode",
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "numpy.core.multiarray.scalar",
+          "numpy.dtype",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "04573f0d-f3cf25b2.th",
+      "usedBy": [
+        "htdemucs_ft_vocals"
+      ],
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/04573f0d-f3cf25b2.th",
+      "publisher": "Meta Platforms, Inc. (facebookresearch/demucs)",
+      "license": "MIT",
+      "sizeBytes": 84141271,
+      "sha256": "f3cf25b222c4eed7cd49dd8b2c9597d50c18bd154090f7b919cfa5f93cf22c49",
+      "publisherChecksum": {
+        "type": "sha256-prefix",
+        "value": "f3cf25b2"
+      },
+      "pickle": {
+        "modelPackage": "demucs",
+        "expectedGlobals": [
+          "_codecs.encode",
+          "collections.OrderedDict",
+          "demucs.htdemucs.HTDemucs",
+          "fractions.Fraction",
+          "numpy.core.multiarray.scalar",
+          "numpy.dtype",
+          "torch.HalfStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "mn10_as_mAP_471.pt",
+      "usedBy": [
+        "efficientat_mn10_as"
+      ],
+      "url": "https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/mn10_as_mAP_471.pt",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), GitHub release v0.0.1, asset uploaded by fschmid56",
+      "license": "MIT (repository licence; the release carries no separate licence for the weights)",
+      "sizeBytes": 19708753,
+      "sha256": "0bd7dc2443af498c289a2e739f02ebb515d6aa3fd3ab9db539c86123ae368a4e",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "None published: the GitHub API reports digest=null for this 2022 asset; only its size (19708753) is stated by GitHub and it matches. The SHA-256 is trust-on-first-use.",
+      "pickle": {
+        "modelPackage": null,
+        "expectedGlobals": [
+          "collections.OrderedDict",
+          "torch.FloatStorage",
+          "torch.LongStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "efficientat/models/mn/model.py",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/model.py",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/model.py",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 17580,
+      "sha256": "471b2c482248d782b93881c5e834c0edc23c1e7e6f42a437e4c096b9d8ed4c3e",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "efficientat/models/mn/utils.py",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/utils.py",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/utils.py",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 2061,
+      "sha256": "deb551bd854f90ca1473d731de1d7586af9449fc95fd2432f4cc9d0ccd38c11b",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "efficientat/models/mn/block_types.py",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/block_types.py",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/block_types.py",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 6160,
+      "sha256": "e13ae49b6885217d6936d9203567aad1b6cb2f1229979d6d1ae77b836f3d1344",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "efficientat/models/mn/attention_pooling.py",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/attention_pooling.py",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/models/mn/attention_pooling.py",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 2192,
+      "sha256": "52b6903d5d62b3639ec609166cd08c36342588bd7988fe41ac72f3cfc496ce4f",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "efficientat/models/preprocess.py",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/models/preprocess.py",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/models/preprocess.py",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 3031,
+      "sha256": "f4d5942eab7b916cb67fdda0f7ddfee152a31fa9a90f0f23ad21019d7a1081cf",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "efficientat/metadata/class_labels_indices.csv",
+      "usedBy": [
+        "efficientat_mn10_as:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/fschmid56/EfficientAT/a425fdce92572e602a1d5634799bd9f1f2efa806/metadata/class_labels_indices.csv",
+      "cachePath": "efficientat/a425fdce92572e602a1d5634799bd9f1f2efa806/metadata/class_labels_indices.csv",
+      "publisher": "Florian Schmid (fschmid56/EfficientAT), git commit a425fdce92572e602a1d5634799bd9f1f2efa806",
+      "license": "MIT",
+      "sizeBytes": 14675,
+      "sha256": "cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "MUSDB18-7-STEMS.zip",
+      "usedBy": [
+        "eval:musdb7"
+      ],
+      "kind": "eval-audio",
+      "url": "https://github.com/sigsep/sigsep-mus-db/releases/download/v0.4.0/MUSDB18-7-STEMS.zip",
+      "cachePath": "eval/MUSDB18-7-STEMS.zip",
+      "publisher": "SigSep (sigsep/sigsep-mus-db), GitHub release v0.4.0, asset uploaded by faroit (F.-R. Stoter, MUSDB18 author). The URL is `sample-url` in musdb/configs/mus.yaml at commit c0181671b9955530f7b03654a322df3f225263a6.",
+      "license": "MUSDB18 terms (mixed, largely CC BY-NC-SA; academic/research use). Local evaluation only: never committed, never redistributed.",
+      "sizeBytes": 147209385,
+      "sha256": "365f66acffc57282e474a4c24b32afec3678258c50b8d45646ac849b0a287df3",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "None published: the GitHub API reports digest=null; only the size (147209385) is stated by GitHub and it matches. The SHA-256 is trust-on-first-use."
+    },
+    {
+      "name": "scnet_small.th",
+      "usedBy": [
+        "scnet_small"
+      ],
+      "url": "https://drive.usercontent.google.com/download?id=1CdEIIqsoRfHn1SJ7rccPfyYioW3BlXcW&export=download&confirm=t",
+      "extraAllowedHosts": {
+        "drive.usercontent.google.com": "Google Drive's download host. Allowed only for this pinned file: the SCNet author publishes the checkpoints solely as Google Drive links in the README of starrytong/SCNet (commit 5d95bf96b19c3eede63248d171efeca8e3abb948)."
+      },
+      "publisher": "starrytong (Weinan Tong), author of SCNet. Linked as 'Download Model Checkpoint' (https://drive.google.com/file/d/1CdEIIqsoRfHn1SJ7rccPfyYioW3BlXcW) in README.md of starrytong/SCNet at commit 5d95bf96b19c3eede63248d171efeca8e3abb948. Drive file name: checkpoint.th",
+      "license": "MIT (author statement, starrytong/SCNet#35)",
+      "sizeBytes": 42434545,
+      "sha256": "f8aff3bc8dd816aad392800d9d69519add719a2fbd22550af6f8cb2138d25ff5",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "None published by the author. The SHA-256 is trust-on-first-use, strengthened by a cross-check: the tensors are bit-identical to the copy mirrored in ZFTurbo/Music-Source-Separation-Training (v.1.0.6/scnet_checkpoint_musdb18.ckpt, sha256 1bc0d1abb20bfdf966dcd07637bafd03e4bc13653d09ef18bc9b3e342eafe2aa). Google Drive reported x-goog-hash crc32c=Q3CNNA== for the object.",
+      "pickle": {
+        "modelPackage": null,
+        "expectedGlobals": [
+          "collections.OrderedDict",
+          "torch.FloatStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "scnet_large.th",
+      "usedBy": [
+        "scnet_large"
+      ],
+      "url": "https://drive.usercontent.google.com/download?id=1s7QvQwn8ag9oVstGDBQ6KZvacJkvyK7t&export=download&confirm=t",
+      "extraAllowedHosts": {
+        "drive.usercontent.google.com": "Google Drive's download host. Allowed only for this pinned file: the SCNet author publishes the checkpoints solely as Google Drive links in the README of starrytong/SCNet (commit 5d95bf96b19c3eede63248d171efeca8e3abb948)."
+      },
+      "publisher": "starrytong (Weinan Tong), author of SCNet. Linked as 'SCNet-large' (https://drive.google.com/file/d/1s7QvQwn8ag9oVstGDBQ6KZvacJkvyK7t) in README.md of starrytong/SCNet at commit 5d95bf96b19c3eede63248d171efeca8e3abb948. Drive file name: SCNet-large.th",
+      "license": "MIT (author statement, starrytong/SCNet#35)",
+      "sizeBytes": 168848417,
+      "sha256": "719e5abb8ed920305dad546ac3cd6fb0b1e9c3092d14ce21827bfc0423af3070",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "None published by the author. The SHA-256 is trust-on-first-use, strengthened by a cross-check: the tensors are bit-identical to the copy mirrored in ZFTurbo/Music-Source-Separation-Training (v1.0.9/SCNet-large_starrytong_fixed.ckpt, sha256 65900dfa07d6b6e5d784c0f143920200a4bd281d6e78a806c549d0b912d5885e). Google Drive reported x-goog-hash crc32c=dhF5yA== for the object.",
+      "pickle": {
+        "modelPackage": null,
+        "expectedGlobals": [
+          "collections.OrderedDict",
+          "torch.FloatStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "scnet/large_config.yaml",
+      "usedBy": [
+        "scnet_large:config"
+      ],
+      "kind": "config",
+      "url": "https://drive.usercontent.google.com/download?id=1qxK7SZx6-Gsp1s3wCrj98X7--UcI4O3K&export=download&confirm=t",
+      "extraAllowedHosts": {
+        "drive.usercontent.google.com": "Google Drive's download host. Allowed only for this pinned file: the SCNet author publishes the checkpoints solely as Google Drive links in the README of starrytong/SCNet (commit 5d95bf96b19c3eede63248d171efeca8e3abb948)."
+      },
+      "cachePath": "scnet/5d95bf96b19c3eede63248d171efeca8e3abb948/large_config.yaml",
+      "publisher": "starrytong. Linked as 'config.yaml' for SCNet-large in README.md of starrytong/SCNet at commit 5d95bf96b19c3eede63248d171efeca8e3abb948",
+      "license": "MIT",
+      "sizeBytes": 1080,
+      "sha256": "629a4901184bf1d3a75b0b13904f35974785aa042cad3c010fd576248cdce3f0",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "None published; trust-on-first-use. Read as data with yaml.safe_load only."
+    },
+    {
+      "name": "scnet-src/scnet/SCNet.py",
+      "usedBy": [
+        "scnet_small:source",
+        "scnet_large:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/starrytong/SCNet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/SCNet.py",
+      "cachePath": "scnet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/SCNet.py",
+      "publisher": "starrytong/SCNet, git commit 5d95bf96b19c3eede63248d171efeca8e3abb948",
+      "license": "MIT",
+      "sizeBytes": 14039,
+      "sha256": "85a15ea5d28285a0cf0a24d6266a28d043c5a655d47aa41684ef256d84e7bc4a",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "scnet-src/scnet/separation.py",
+      "usedBy": [
+        "scnet_small:source",
+        "scnet_large:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/starrytong/SCNet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/separation.py",
+      "cachePath": "scnet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/separation.py",
+      "publisher": "starrytong/SCNet, git commit 5d95bf96b19c3eede63248d171efeca8e3abb948",
+      "license": "MIT",
+      "sizeBytes": 3783,
+      "sha256": "43402dc6579436d3b5abb921990572684beed8fa10b377a112892b438f40713b",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "scnet-src/scnet/__init__.py",
+      "usedBy": [
+        "scnet_small:source",
+        "scnet_large:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/starrytong/SCNet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/__init__.py",
+      "cachePath": "scnet/5d95bf96b19c3eede63248d171efeca8e3abb948/scnet/__init__.py",
+      "publisher": "starrytong/SCNet, git commit 5d95bf96b19c3eede63248d171efeca8e3abb948",
+      "license": "MIT",
+      "sizeBytes": 173,
+      "sha256": "21b5f8fae849055f3b428d2353de72b477a722cc44e87c6fa0d3b22ac5f36fa2",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "scnet-src/conf/config.yaml",
+      "usedBy": [
+        "scnet_small:source",
+        "scnet_large:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/starrytong/SCNet/5d95bf96b19c3eede63248d171efeca8e3abb948/conf/config.yaml",
+      "cachePath": "scnet/5d95bf96b19c3eede63248d171efeca8e3abb948/conf/config.yaml",
+      "publisher": "starrytong/SCNet, git commit 5d95bf96b19c3eede63248d171efeca8e3abb948",
+      "license": "MIT",
+      "sizeBytes": 1038,
+      "sha256": "bc16895f69551cd8becbba384ae33e6e615a4792649b866036884f4a9a4bb4b0",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    }
+  ]
+}
