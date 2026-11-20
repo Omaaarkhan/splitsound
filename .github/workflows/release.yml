@@ -1,0 +1,169 @@
+name: Release
+
+# Publishes a release every Friday if anything changed since the last one.
+# Can also be started by hand from the Actions tab.
+#
+#   plan      decides whether there is anything to release and picks the version
+#   checks    the full CI suite
+#   models    confirms every pinned model can be downloaded and matches its digest
+#   build     installers for macOS, Linux and Windows (no secrets, read-only token)
+#   publish   signs the updater files, writes checksums and provenance, publishes
+#
+# Secrets (repository settings, Secrets and variables, Actions):
+#   TAURI_SIGNING_PRIVATE_KEY            the updater signing key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password
+# Without them the release still publishes installers, but the in-app updater
+# will not see it.
+
+on:
+  schedule:
+    - cron: "17 9 * * 5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Release even if nothing changed since the last release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - id: plan
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          last="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
+          release=true
+          if [ -n "$last" ] && [ "$FORCE" != "true" ]; then
+            # Documentation-only weeks do not need a new build.
+            if git diff --quiet "$last" HEAD -- . ':(exclude)*.md' ':(exclude)docs' ':(exclude).github/dependabot.yml'; then
+              release=false
+              echo "Nothing shipped in the app has changed since $last. Skipping." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          version="$(node scripts/next-version.mjs)"
+          {
+            echo "release=$release"
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$release" = true ]; then
+            echo "Releasing v$version (previous: ${last:-none})." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  checks:
+    name: Checks
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  models:
+    name: Models
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Every pinned model downloads and matches its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-models.mjs
+
+  build:
+    name: Build
+    needs: [plan, checks, models]
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      cache: false
+
+  publish:
+    name: Publish
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: installers-*
+          path: release
+          merge-multiple: true
+
+      - name: Install the signing tool
+        # From the lockfile (integrity-checked), with package scripts disabled,
+        # and before any secret is in the environment.
+        run: npm ci --ignore-scripts
+
+      - name: Sign the updater files and write checksums
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::No updater signing key is configured, so this release will not be offered by the in-app updater."
+          fi
+          node scripts/prepare-release.mjs --dir release --version "$VERSION" --repo "$GITHUB_REPOSITORY" --tag "$TAG"
+
+      - name: Attest build provenance
+        # Artifact attestations are free for public repositories only.
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SplitSound $VERSION" \
+            --generate-notes \
+            --latest
