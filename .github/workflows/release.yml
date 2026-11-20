@@ -9,7 +9,10 @@ name: Release
 #   build     installers for macOS, Linux and Windows (no secrets, read-only token)
 #   publish   signs the updater files, writes checksums and provenance, publishes
 #
-# Secrets (repository settings, Secrets and variables, Actions):
+# The updater signing key lives in the "release" environment (repository
+# settings, Environments), which only the main branch may use. Keep it there,
+# never as a plain repository secret: an environment limited to main is what
+# stops a workflow run from any other branch from reading the key.
 #   TAURI_SIGNING_PRIVATE_KEY            the updater signing key
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password
 # Without them the release still publishes installers, but the in-app updater
@@ -114,6 +117,8 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Holds the signing key and is limited to the main branch.
+    environment: release
     permissions:
       contents: write
       id-token: write

@@ -7,6 +7,10 @@
 // with the GitHub CLI (works for private repositories too). Pass --dir to check
 // files already on disk instead, for example ml/dist after an export.
 //
+// A model whose weights the app fetches from their own publisher (Demucs, from
+// Meta) is checked there too: if that file ever changes or disappears, the app
+// would refuse it, so the release should find out first.
+//
 // Usage:
 //   node scripts/verify-models.mjs
 //   node scripts/verify-models.mjs --dir ml/dist [--manifest ml/dist/manifest.json]
@@ -118,6 +122,44 @@ for (const model of manifest.models) {
   }
 
   if (scratch) rmSync(archivePath, { force: true });
+}
+
+// Weights the app downloads from their publisher rather than from us.
+const UPSTREAM_HOSTS = new Set(["dl.fbaipublicfiles.com"]);
+if (!args.dir) {
+  for (const model of manifest.models) {
+    const upstream = model.weights?.upstream;
+    if (!upstream) continue;
+    const fail = (reason) => {
+      failures += 1;
+      console.error(`FAIL  ${model.id} (upstream): ${reason}`);
+    };
+    const { protocol, hostname } = new URL(upstream.url);
+    if (protocol !== "https:" || !UPSTREAM_HOSTS.has(hostname)) {
+      fail(`${upstream.url} is not on an allowed host`);
+      continue;
+    }
+    try {
+      const response = await fetch(upstream.url, { redirect: "error" });
+      if (!response.ok || !response.body) {
+        fail(`${upstream.url} answered HTTP ${response.status}`);
+        continue;
+      }
+      const hash = createHash("sha256");
+      let bytes = 0;
+      for await (const chunk of response.body) {
+        bytes += chunk.length;
+        if (bytes > upstream.sizeBytes) break;
+        hash.update(chunk);
+      }
+      const sha256 = hash.digest("hex");
+      if (bytes !== upstream.sizeBytes) fail(`upstream file is not the pinned ${upstream.sizeBytes} bytes`);
+      else if (sha256 !== upstream.sha256) fail(`upstream file has SHA-256 ${sha256}, manifest says ${upstream.sha256}`);
+      else console.log(`ok    ${model.id}  publisher's file still matches its pin (${(bytes / 1_048_576).toFixed(1)} MB from ${hostname})`);
+    } catch (error) {
+      fail(`could not fetch ${upstream.url}: ${error.message}`);
+    }
+  }
 }
 
 if (scratch) rmSync(scratch, { recursive: true, force: true });

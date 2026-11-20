@@ -117,6 +117,8 @@ jobs:
         run: cargo deny --locked check
       - name: npm advisories (what ships in the app)
         run: npm audit --omit=dev --audit-level=moderate
+      - name: npm advisories (build and signing tools)
+        run: npm audit --audit-level=high
       - name: Lockfile only uses the npm registry
         run: node scripts/check-lockfile.mjs
       - name: Workflows pin every action to a commit
@@ -135,13 +137,16 @@ jobs:
     name: Release rehearsal
     # Everything the release workflow does after building, except publishing:
     # sign the updater files, write the update manifest and the checksums.
+    #
+    # This job runs code from the pull request, so it must never see the real
+    # signing key. It makes a throwaway key instead: the signatures prove the
+    # steps work, and are worthless to anyone else.
     needs: installers
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -153,12 +158,14 @@ jobs:
           merge-multiple: true
       - name: Install the signing tool
         run: npm ci --ignore-scripts
-      - name: Sign, write the update manifest and checksums
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Sign with a throwaway key, write the update manifest and checksums
         run: |
+          set -euo pipefail
+          node_modules/.bin/tauri signer generate --ci --write-keys "$RUNNER_TEMP/rehearsal.key" --password rehearsal > /dev/null
+          export TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/rehearsal.key")"
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=rehearsal
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           node scripts/prepare-release.mjs --dir release --version "$version" --repo "$GITHUB_REPOSITORY" --tag "v$version"
           ls -l release
-          if [ -f release/latest.json ]; then cat release/latest.json; fi
+          test -s release/latest.json
+          (cd release && sha256sum --check --quiet SHA256SUMS.txt)

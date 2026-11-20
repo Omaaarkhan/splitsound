@@ -104,10 +104,10 @@ and statically scanning them. The one checkpoint the app itself reads
 record types that file contains, treats every name in it as inert data,
 bounds every size before allocating, and rejects anything unexpected.
 
-**ONNX Runtime is the official build.** The shared library is downloaded from
-Microsoft's GitHub releases by `scripts/fetch-onnxruntime.mjs`, which pins the
-version and the SHA-256 of every archive, and is loaded from an absolute path
-inside the app bundle.
+**ONNX Runtime is the official build.** The shared library is taken from
+Microsoft's own NuGet package by `scripts/fetch-onnxruntime.mjs`, which pins
+the version, the package hash NuGet publishes, and the SHA-256 of each library
+inside it. The app loads it from an absolute path inside its own bundle.
 
 **Audio files are untrusted.** Decoding uses memory-safe Rust decoders
 wherever one exists. Durations, channel counts and sizes read from headers are
@@ -122,8 +122,12 @@ pattern and resolved inside the library folder, file names are sanitised, and
 `reveal_path` only accepts paths the app itself produced.
 
 **Updates are signed.** The updater only installs releases signed with the
-project's key. Releases are built by CI from `main`, with checksums and build
-provenance attached.
+project's key, and each signature is bound to its version so an old build
+cannot be offered as a new one. The interface can ask "is there an update?"
+and "install it", nothing more: where updates come from is fixed in the app.
+Releases are built by CI from `main`, with checksums and build provenance
+attached. The signing key lives in a GitHub environment that only `main` can
+use; build jobs and pull-request checks never see it.
 
 **Dependencies are locked and audited.** Lockfiles are committed and CI
 installs from them. `cargo deny` and `npm audit` run on every change. GitHub

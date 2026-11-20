@@ -56,6 +56,10 @@ updates:
         applies-to: "version-updates"
         update-types: ["minor", "patch"]
         patterns: ["*"]
+        exclude-patterns:
+          # The Tauri CLI builds the installers and signs the updates, so its
+          # updates come on their own and get a proper look.
+          - "@tauri-apps/cli"
 
   - package-ecosystem: "github-actions"
     directory: "/"

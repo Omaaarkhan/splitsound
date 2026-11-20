@@ -54,7 +54,27 @@ gh attestation verify <file> --repo Omaaarkhan/splitsound
 ## Supply chain
 
 - `Cargo.lock` and `package-lock.json` are committed, and CI builds from them.
-- `cargo deny` (advisories, licences, sources) and `npm audit` run on every change.
+- `cargo deny` (advisories, licences, sources) and `npm audit` (the app's
+  dependencies and the build tools) run on every change.
 - GitHub Actions are pinned to full commit SHAs and run with the minimum token permissions.
-- Release build jobs have a read-only token and no secrets; signing and publishing happen in a separate job.
-- Dependency updates are proposed weekly and only after a version has been public for at least a week.
+- Release build jobs have a read-only token and no secrets; signing and
+  publishing happen in a separate job.
+- The update-signing key is kept in a GitHub environment that only the `main`
+  branch can use. Pull-request checks rehearse the release steps with a
+  throwaway key.
+- Dependency updates are proposed weekly, only after a version has been public
+  for at least a week, and are merged by a person, not automatically.
+
+## Known limitations
+
+- **The installers are not signed by Apple or Microsoft.** The project has no
+  Developer ID or code-signing certificate yet, so macOS and Windows show a
+  warning on first launch. Check `SHA256SUMS.txt` to be sure a download is the
+  one that was published.
+- **macOS library validation is off.** Without a Developer ID the app is
+  signed ad hoc, and an ad-hoc app can only load the bundled ONNX Runtime
+  (signed by Microsoft) with the `disable-library-validation` entitlement.
+  The rest of the hardened runtime stays on. With a Developer ID the
+  entitlement can be removed.
+- **Windows and Linux builds are compiled and tested by CI but have had less
+  hands-on use than the macOS build.**
