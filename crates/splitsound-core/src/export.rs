@@ -301,6 +301,9 @@ pub fn export_audio(
     }
     check_cancelled(progress)?;
     let werr = |e: std::io::Error| Error::from_write(&e, dst);
+    if std::fs::metadata(dst).is_ok_and(|m| m.is_dir()) {
+        return Err(werr(std::io::Error::from(std::io::ErrorKind::IsADirectory)));
+    }
     match format {
         ExportFormat::Wav32f => {
             let mut w = crate::wav::WavWriter::create_with_channels(dst, sample_rate, channels)?;
@@ -317,7 +320,7 @@ pub fn export_audio(
             } else {
                 24
             };
-            let (file, tmp) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+            let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
             let mut out = BufWriter::with_capacity(1 << 16, file);
             write_wav_pcm(&mut out, samples, channels, sample_rate, bits, progress)
                 .map_err(werr)??;
@@ -333,7 +336,7 @@ pub fn export_audio(
                 encode_mp3(samples, channels, sample_rate, progress)?
             };
             check_cancelled(progress)?;
-            let (mut file, tmp) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+            let (tmp, mut file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
             file.write_all(&bytes).map_err(werr)?;
             file.sync_all().map_err(werr)?;
             drop(file);

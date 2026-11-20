@@ -16,7 +16,17 @@ use crate::ipc::{ErrorCode, IpcError, IpcResult};
 use crate::util::lock;
 
 #[derive(Default)]
-pub(crate) struct PickedPaths(Mutex<HashSet<PathBuf>>);
+struct StateSet {
+    granted: HashSet<PathBuf>,
+    /// Non-regular paths (such as folders) explicitly dropped onto the window
+    /// by the user. Never grants read access; only lets `check` surface
+    /// `UnsupportedFormat` ("That isn't a file SplitSound can open.") instead
+    /// of a generic "Choose the file in SplitSound..." denial.
+    dropped_non_files: HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+pub(crate) struct PickedPaths(Mutex<StateSet>);
 
 impl PickedPaths {
     pub fn grant(&self, path: &Path, directory: bool) -> Option<PathBuf> {
@@ -28,8 +38,23 @@ impl PickedPaths {
         }) {
             return None;
         }
-        lock(&self.0).insert(path.clone());
+        lock(&self.0).granted.insert(path.clone());
         Some(path)
+    }
+
+    /// Records a path delivered by a native OS drag-and-drop onto the window.
+    /// Regular files are granted; directories and other non-files are noted
+    /// only so the user gets a clear "not a file SplitSound can open" error.
+    pub fn grant_dropped(&self, path: &Path) {
+        let Ok(path) = dunce_canonicalize(path) else {
+            return;
+        };
+        let mut set = lock(&self.0);
+        if path.is_file() {
+            set.granted.insert(path);
+        } else {
+            set.dropped_non_files.insert(path);
+        }
     }
 
     pub fn check(&self, path: &str, directory: bool) -> IpcResult<PathBuf> {
@@ -46,7 +71,8 @@ impl PickedPaths {
             return Err(deny());
         }
         let path = dunce_canonicalize(path).map_err(|_| deny())?;
-        if lock(&self.0).contains(&path)
+        let set = lock(&self.0);
+        if set.granted.contains(&path)
             && (if directory {
                 path.is_dir()
             } else {
@@ -54,6 +80,11 @@ impl PickedPaths {
             })
         {
             Ok(path)
+        } else if !directory && set.dropped_non_files.contains(&path) && !path.is_file() {
+            Err(IpcError::new(
+                ErrorCode::UnsupportedFormat,
+                "That isn't a file SplitSound can open.",
+            ))
         } else {
             Err(deny())
         }
@@ -134,4 +165,55 @@ pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
         .setup(|app, _| tauri_plugin_dialog::init().initialize(app, Value::Null))
         .invoke_handler(tauri::generate_handler![open])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_folder_reports_unsupported_without_granting_children() {
+        let root = std::env::temp_dir().join(format!("ss-pick-{}", crate::util::new_session_id()));
+        let dropped = root.join("album");
+        let other = root.join("other");
+        std::fs::create_dir_all(&dropped).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let inside = dropped.join("track.wav");
+        std::fs::write(&inside, b"hi").unwrap();
+
+        let picked = PickedPaths::default();
+        // Un-dropped directory is refused as not chosen/dropped.
+        assert_eq!(
+            picked
+                .check(&other.to_string_lossy(), false)
+                .unwrap_err()
+                .code,
+            ErrorCode::FileNotFound
+        );
+        // Dropping a directory yields UnsupportedFormat ("That isn't a file...").
+        picked.grant_dropped(&dropped);
+        let err = picked.check(&dropped.to_string_lossy(), false).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedFormat);
+        // Dropping the directory never grants access to files inside it or to
+        // use it as an export directory.
+        assert_eq!(
+            picked
+                .check(&inside.to_string_lossy(), false)
+                .unwrap_err()
+                .code,
+            ErrorCode::FileNotFound
+        );
+        assert_eq!(
+            picked
+                .check(&dropped.to_string_lossy(), true)
+                .unwrap_err()
+                .code,
+            ErrorCode::FileNotFound
+        );
+        // Dropping a regular file grants it.
+        picked.grant_dropped(&inside);
+        assert!(picked.check(&inside.to_string_lossy(), false).is_ok());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

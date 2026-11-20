@@ -40,6 +40,9 @@ const BLOCK: usize = 256;
 const AHEAD_MS: usize = 50;
 const TICK_EVERY: Duration = Duration::from_millis(33);
 const MAX_METERS: usize = mixer::MAX_CHANNELS + 1;
+/// How long synchronous unload/detach waits for the mixer thread to drop its
+/// memory-mapped files before surfacing a `busy` error.
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Audio of one loaded session.
 pub struct SessionAudio {
@@ -62,6 +65,9 @@ struct MixerInit {
 enum MixerCmd {
     Load(Box<SessionAudio>, MixerInit),
     Unload(Option<Sender<()>>),
+    /// Fence: acknowledges once every earlier command (including any prior
+    /// Load/Unload replacing `self.audio`) has completed and dropped old files.
+    Sync(Sender<()>),
     Play,
     Pause,
     Seek(u64),
@@ -71,6 +77,8 @@ enum MixerCmd {
     Loop(Option<(u64, u64)>),
     Output(OutputLink),
     DeviceLost(String),
+    #[cfg(test)]
+    HoldForTest(Receiver<()>),
     Shutdown,
 }
 
@@ -285,48 +293,88 @@ impl Player {
         Ok(self.shared.snapshot(&st))
     }
 
-    /// Unloads whatever is loaded.
-    pub fn unload(&self) {
+    fn wait_ack(rx: Receiver<()>, timeout: Duration) -> IpcResult<()> {
+        match rx.recv_timeout(timeout) {
+            Ok(()) => Ok(()),
+            // If the mixer thread exited, it already dropped `self.audio`
+            // before dropping its receiver.
+            Err(RecvTimeoutError::Disconnected) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => Err(IpcError::busy(
+                "The audio player is still closing this song. Try again shortly.",
+            )),
+        }
+    }
+
+    fn unload_with_timeout(&self, timeout: Duration) -> IpcResult<()> {
         let (tx, rx) = mpsc::channel();
         {
             let mut st = lock(&self.shared.state);
-            if st.session_id.is_none() {
-                return;
+            if st.session_id.is_some() {
+                *st = empty_state(st.master_gain_db);
+                self.shared.heard.store(0, Ordering::Relaxed);
+                self.send(MixerCmd::Unload(Some(tx)));
+                self.shared.emit_state(&st);
+            } else {
+                // Fence behind any earlier Load/Unload so no mapping is still
+                // being dropped on the mixer thread when we return.
+                self.send(MixerCmd::Sync(tx));
             }
-            *st = empty_state(st.master_gain_db);
-            self.shared.heard.store(0, Ordering::Relaxed);
-            self.send(MixerCmd::Unload(Some(tx)));
-            self.shared.emit_state(&st);
         }
         // Wait (without holding the state lock) until the files are unmapped.
-        let _ = rx.recv_timeout(Duration::from_secs(2));
+        Self::wait_ack(rx, timeout)
     }
 
-    /// Unloads `session_id` if it is the loaded session.
-    pub fn unload_if(&self, session_id: &str) {
-        if self.loaded_session().as_deref() == Some(session_id) {
-            self.unload();
+    /// Unloads whatever is loaded and waits until the mixer thread has
+    /// dropped every memory-mapped file.
+    pub fn unload(&self) -> IpcResult<()> {
+        self.unload_with_timeout(UNLOAD_TIMEOUT)
+    }
+
+    /// Unloads `session_id` if it is the loaded session, and always fences
+    /// with the mixer thread so any recently replaced mappings of `session_id`
+    /// are guaranteed to be dropped before this returns.
+    pub fn unload_if(&self, session_id: &str) -> IpcResult<()> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut st = lock(&self.shared.state);
+            if st.session_id.as_deref() == Some(session_id) {
+                *st = empty_state(st.master_gain_db);
+                self.shared.heard.store(0, Ordering::Relaxed);
+                self.send(MixerCmd::Unload(Some(tx)));
+                self.shared.emit_state(&st);
+            } else {
+                // Another session may have just replaced `session_id` via
+                // `load`; wait for the mixer thread to apply that Load and
+                // drop `session_id`'s old `SessionAudio`.
+                self.send(MixerCmd::Sync(tx));
+            }
         }
+        Self::wait_ack(rx, UNLOAD_TIMEOUT)
     }
 
     /// Releases the files of `session_id` (so its stems folder can be
-    /// replaced) while keeping it loaded in the UI. Returns whether it was
-    /// loaded. Follow with [`Player::reattach`].
-    pub fn detach(&self, session_id: &str) -> bool {
+    /// replaced) while keeping it loaded in the UI. Always fences with the
+    /// mixer thread so no mapping of `session_id`'s files remains alive when
+    /// this returns. Returns whether it was loaded. Follow with
+    /// [`Player::reattach`].
+    pub fn detach(&self, session_id: &str) -> IpcResult<bool> {
         let (tx, rx) = mpsc::channel();
-        {
+        let was_loaded = {
             let mut st = lock(&self.shared.state);
-            if st.session_id.as_deref() != Some(session_id) {
-                return false;
+            if st.session_id.as_deref() == Some(session_id) {
+                self.send(MixerCmd::Unload(Some(tx)));
+                if st.playing {
+                    st.playing = false;
+                    self.shared.emit_state(&st);
+                }
+                true
+            } else {
+                self.send(MixerCmd::Sync(tx));
+                false
             }
-            self.send(MixerCmd::Unload(Some(tx)));
-            if st.playing {
-                st.playing = false;
-                self.shared.emit_state(&st);
-            }
-        }
-        let _ = rx.recv_timeout(Duration::from_secs(2));
-        true
+        };
+        Self::wait_ack(rx, UNLOAD_TIMEOUT)?;
+        Ok(was_loaded)
     }
 
     /// Refreshes the working files of the loaded session while keeping its
@@ -338,7 +386,7 @@ impl Player {
         let audio = match Self::open_audio(session, dir) {
             Ok(a) => a,
             Err(_) => {
-                self.unload_if(&session.id);
+                let _ = self.unload_if(&session.id);
                 return;
             }
         };
@@ -585,9 +633,10 @@ struct Out {
 }
 
 struct MixerThread {
+    // Declared before `rx` so mapped files always drop before `rx` disconnects.
+    audio: Option<Box<SessionAudio>>,
     rx: Receiver<MixerCmd>,
     shared: Arc<Shared>,
-    audio: Option<Box<SessionAudio>>,
     core: MixerCore,
     out: Option<Out>,
     marks: VecDeque<Mark>,
@@ -600,9 +649,9 @@ struct MixerThread {
 impl MixerThread {
     fn new(rx: Receiver<MixerCmd>, shared: Arc<Shared>) -> Self {
         MixerThread {
+            audio: None,
             rx,
             shared,
-            audio: None,
             core: MixerCore::new(0, 0),
             out: None,
             marks: VecDeque::with_capacity(RING_FRAMES / BLOCK + 8),
@@ -624,16 +673,21 @@ impl MixerThread {
             match self.rx.recv_timeout(wait) {
                 Ok(cmd) => {
                     if !self.handle(cmd) {
+                        drop(self.audio.take());
                         return;
                     }
                     while let Ok(cmd) = self.rx.try_recv() {
                         if !self.handle(cmd) {
+                            drop(self.audio.take());
                             return;
                         }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    drop(self.audio.take());
+                    return;
+                }
             }
             self.render_ahead();
             self.follow_device();
@@ -644,6 +698,8 @@ impl MixerThread {
     fn handle(&mut self, cmd: MixerCmd) -> bool {
         match cmd {
             MixerCmd::Load(audio, init) => {
+                // Drop any previous session's mappings before installing the new one.
+                drop(self.audio.take());
                 self.core = MixerCore::new(audio.stems.len(), audio.mix.frames());
                 for (i, p) in init.channels.iter().enumerate() {
                     self.core.set_channel(i, *p);
@@ -662,13 +718,16 @@ impl MixerThread {
                 self.tick_peaks = [0.0; MAX_METERS];
             }
             MixerCmd::Unload(ack) => {
-                self.audio = None;
+                drop(self.audio.take());
                 self.core = MixerCore::new(0, 0);
                 self.ids.clear();
                 self.marks.clear();
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
+            }
+            MixerCmd::Sync(ack) => {
+                let _ = ack.send(());
             }
             MixerCmd::Play => self.core.play(),
             MixerCmd::Pause => self.core.pause(),
@@ -704,7 +763,14 @@ impl MixerThread {
                     self.shared.emit_state(&st);
                 }
             }
-            MixerCmd::Shutdown => return false,
+            #[cfg(test)]
+            MixerCmd::HoldForTest(release) => {
+                let _ = release.recv();
+            }
+            MixerCmd::Shutdown => {
+                drop(self.audio.take());
+                return false;
+            }
         }
         true
     }
@@ -954,6 +1020,8 @@ mod tests {
                 .code,
             ErrorCode::NotFound
         );
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1013,8 +1081,9 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(player.state().position_sec < 0.45);
         player.pause();
-        player.unload();
+        player.unload().unwrap();
         assert_eq!(player.state().session_id, None);
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1051,6 +1120,7 @@ mod tests {
                 assert_eq!(e.code, ErrorCode::AudioDevice);
             }
         }
+        player.unload().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1093,6 +1163,8 @@ mod tests {
         // Master survives a reload.
         player.load(&s, &dir).unwrap();
         assert_eq!(player.state().master_gain_db, mixer::MIN_GAIN_DB);
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1115,6 +1187,65 @@ mod tests {
         assert_eq!(g[2], (StemId::Other, 0.0));
         assert_eq!(master, 1.0);
         assert!(player.mixdown_gains("someone-else").is_none());
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unload_if_and_detach_synchronously_release_all_mappings() {
+        let sink = Arc::new(RecordingSink::default());
+        let player = Player::new(sink, fake_factory(1.0));
+        let (dir_a, a) = fixture(&[StemId::Vocals, StemId::Instrumental]);
+        let (dir_b, b) = fixture(&[StemId::Vocals, StemId::Instrumental]);
+
+        player.load(&a, &dir_a).unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir_a), 3);
+
+        // Unloading the loaded session drops every mapping before returning.
+        player.unload_if(&a.id).unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir_a), 0);
+
+        // Switching from A to B and immediately calling unload_if(A) still
+        // fences with the mixer thread so A's old mappings are dropped before
+        // unload_if(A) returns (even though `state.session_id` is already B).
+        player.load(&a, &dir_a).unwrap();
+        player.load(&b, &dir_b).unwrap();
+        player.unload_if(&a.id).unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir_a), 0);
+        assert_eq!(MappedWav::live_mappings_under(&dir_b), 3);
+
+        // `detach` releases B's mappings synchronously while keeping B selected.
+        assert!(player.detach(&b.id).unwrap());
+        assert_eq!(MappedWav::live_mappings_under(&dir_b), 0);
+        assert_eq!(player.loaded_session().as_deref(), Some(b.id.as_str()));
+
+        // `reattach` maps them again; `unload` clears everything.
+        player.reattach(&b, &dir_b);
+        assert_eq!(MappedWav::live_mappings_under(&dir_b), 3);
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir_b), 0);
+
+        std::fs::remove_dir_all(dir_a).unwrap();
+        std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    #[test]
+    fn unload_surfaces_busy_error_when_mixer_does_not_ack_in_time() {
+        let sink = Arc::new(RecordingSink::default());
+        let player = Player::new(sink, fake_factory(1.0));
+        let (dir, s) = fixture(&[StemId::Vocals, StemId::Instrumental]);
+        player.load(&s, &dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        player.send(MixerCmd::HoldForTest(rx));
+        let err = player
+            .unload_with_timeout(Duration::from_millis(40))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Busy);
+        // Release the mixer thread; a subsequent unload finishes cleanly.
+        drop(tx);
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

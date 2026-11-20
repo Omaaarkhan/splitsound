@@ -281,7 +281,7 @@ impl AtomicWav {
         if let Some(w) = self.w.take() {
             w.finish()?;
         }
-        fs::rename(&self.tmp, &self.dest)?;
+        crate::util::rename_retry(&self.tmp, &self.dest)?;
         Ok(std::mem::take(&mut self.dest))
     }
 }

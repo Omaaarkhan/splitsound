@@ -908,6 +908,8 @@ fn describe_tensor(
 /// SHA-256 of a file, lowercase hex, plus its length. Polls `progress` for
 /// cancellation.
 pub fn sha256_file(path: &Path, progress: &dyn Progress) -> Result<(String, u64)> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+    require(meta.is_file(), "checkpoint path is not a regular file")?;
     let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -946,6 +948,8 @@ fn read_pinned_bytes(
     progress: &dyn Progress,
 ) -> Result<(Vec<u8>, String)> {
     require(expected_size <= MAX_FILE_BYTES, "checkpoint file too large")?;
+    let path_meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+    require(path_meta.is_file(), "checkpoint path is not a regular file")?;
     let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
     let meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
     require(meta.is_file(), "checkpoint path is not a regular file")?;
@@ -1035,7 +1039,7 @@ pub(crate) fn convert_checkpoint_bytes(
         "tensor table is inconsistent",
     )?;
 
-    let (out, tmp) =
+    let (tmp, out) =
         crate::wav::create_temp_sibling(out_path).map_err(|e| Error::from_write(&e, out_path))?;
     let mut out = BufWriter::with_capacity(1 << 20, out);
     let mut hasher = Sha256::new();
@@ -1727,6 +1731,19 @@ mod tests {
         assert!(
             TensorTable::from_json(&table_json.replace("\"byteLength\":24", "\"byteLength\":28"))
                 .is_err()
+        );
+
+        // Directories are rejected before opening (on Windows File::open on a
+        // directory fails with ERROR_ACCESS_DENIED instead of EISDIR).
+        assert_eq!(
+            convert_checkpoint(dir.path(), &table, &out, &NoProgress)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ModelDownloadFailed
+        );
+        assert_eq!(
+            sha256_file(dir.path(), &NoProgress).unwrap_err().code(),
+            ErrorCode::ModelDownloadFailed
         );
     }
 

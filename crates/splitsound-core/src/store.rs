@@ -34,7 +34,7 @@ use crate::manifest::{
     tensor_table_for,
 };
 use crate::progress::Progress;
-use crate::wav::{TempFile, create_temp_sibling};
+use crate::wav::{TempFile, create_temp_sibling, remove_file_retry};
 
 /// Where project model files are downloaded from.
 pub const DEFAULT_BASE_URL: &str =
@@ -332,7 +332,7 @@ impl ModelStore {
                     ),
                 ));
             };
-            let (file, _tmp) = self.fetch_project_file(
+            let (_tmp, file) = self.fetch_project_file(
                 download,
                 &mut |n| {
                     observer.progress(&entry.id, done + n, total);
@@ -405,7 +405,7 @@ impl ModelStore {
         files.extend(entry.weights.as_ref().map(|w| &w.file));
         for f in files {
             let path = self.path_of(f);
-            match std::fs::remove_file(&path) {
+            match remove_file_retry(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::from_write(&e, &path)),
@@ -430,6 +430,7 @@ impl ModelStore {
     /// self-contained model, to reference no external file at all.
     pub fn load(&self, id: &str) -> Result<VerifiedModel> {
         let entry = self.manifest.get(id)?;
+        let _guard = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         let graph = self.read_verified(entry, &entry.file)?;
         let external = match &entry.weights {
             None => {
@@ -448,12 +449,24 @@ impl ModelStore {
 
     fn read_verified(&self, entry: &ModelEntry, file: &PinnedFile) -> Result<Vec<u8>> {
         let path = self.path_of(file);
+        let path_meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(missing(entry)),
+            Err(e) => return Err(Error::from_read(&e, &path)),
+        };
+        if !path_meta.is_file() {
+            return Err(damaged(entry, format!("{}: not a regular file", file.name)));
+        }
         let mut f = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(missing(entry)),
             Err(e) => return Err(Error::from_read(&e, &path)),
         };
-        let len = f.metadata().map_err(|e| Error::from_read(&e, &path))?.len();
+        let meta = f.metadata().map_err(|e| Error::from_read(&e, &path))?;
+        if !meta.is_file() {
+            return Err(damaged(entry, format!("{}: not a regular file", file.name)));
+        }
+        let len = meta.len();
         if len != file.size_bytes {
             return Err(damaged(
                 entry,
@@ -488,6 +501,12 @@ impl ModelStore {
     /// `model_download_failed` (a recognised archive that does not unpack
     /// to the pinned content).
     pub fn import_file(&self, path: &Path, accept_restricted: bool) -> Result<Option<String>> {
+        // Check file type before opening: on Windows `File::open` on a
+        // directory fails with ERROR_ACCESS_DENIED (os error 5).
+        let path_meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+        if !path_meta.is_file() {
+            return Ok(None);
+        }
         let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
         let meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
         if !meta.is_file() {
@@ -568,7 +587,7 @@ impl ModelStore {
             return Err(download_failed("file changed while it was being imported"));
         }
         let dst = self.path_of(file);
-        let (mut out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        let (tmp, mut out) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
         out.write_all(bytes)
             .map_err(|e| Error::from_write(&e, &dst))?;
         out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
@@ -587,7 +606,7 @@ impl ModelStore {
     ) -> Result<()> {
         let dst = self.path_of(target);
         let mut input = std::io::BufReader::with_capacity(1 << 16, compressed);
-        let (out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        let (tmp, out) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
         let mut out = std::io::BufWriter::with_capacity(1 << 16, out);
         let mut hasher = Sha256::new();
         let mut written = 0u64;
@@ -646,7 +665,7 @@ impl ModelStore {
         file: &PinnedFile,
         on_bytes: &mut dyn FnMut(u64),
         observer: &dyn DownloadObserver,
-    ) -> Result<(File, TempFile)> {
+    ) -> Result<(TempFile, File)> {
         let (reader, length) = match &self.source {
             ModelSource::Directory(dir) => (open_local(&dir.join(&file.name))?, None),
             ModelSource::Release { base_url } => {
@@ -655,12 +674,12 @@ impl ModelStore {
             }
         };
         let dst = self.path_of(file);
-        let (mut out, tmp) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
+        let (tmp, mut out) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
         fetch_from_reader(reader, length, file, &mut out, &dst, on_bytes, observer)?;
         out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
         out.seek(SeekFrom::Start(0))
             .map_err(|e| Error::from_read(&e, tmp.path()))?;
-        Ok((out, tmp))
+        Ok((tmp, out))
     }
 
     fn fetch_upstream_bytes(
@@ -706,6 +725,16 @@ fn upstream_file_name(url: &str) -> Result<&str> {
 }
 
 fn open_local(path: &Path) -> Result<Box<dyn Read>> {
+    match std::fs::metadata(path) {
+        Ok(m) if !m.is_file() => {
+            return Err(download_failed(format!(
+                "{}: not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(download_failed(format!("{}: {e}", path.display()))),
+    }
     match File::open(path) {
         Ok(f) => Ok(Box::new(f)),
         Err(e) => Err(download_failed(format!("{}: {e}", path.display()))),

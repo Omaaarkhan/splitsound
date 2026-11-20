@@ -229,7 +229,20 @@ pub struct WavReader {
 
 impl WavReader {
     pub fn open(path: &Path) -> io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
         let mut f = File::open(path)?;
+        if !f.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
         let info = read_info(&mut f)?;
         f.seek(SeekFrom::Start(info.data_offset))?;
         Ok(WavReader {

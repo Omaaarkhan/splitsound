@@ -18,6 +18,8 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(windows, test))]
+use std::time::Duration;
 
 use crate::audio::{SAMPLE_RATE, Stereo};
 use crate::error::{Error, Result};
@@ -115,6 +117,83 @@ fn float_header(channels: u16, sample_rate: u32, data_bytes: u64) -> [u8; 56] {
     h
 }
 
+#[cfg(windows)]
+const WINDOWS_RETRY_DELAYS_MS: &[u64] = &[20, 40, 80, 120, 180, 250, 310];
+
+#[cfg(any(windows, test))]
+fn is_transient_windows_lock(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(any(windows, test))]
+fn retry_transient<T>(
+    delays_ms: &[u64],
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < delays_ms.len() && is_transient_windows_lock(&e) => {
+                std::thread::sleep(Duration::from_millis(delays_ms[attempt]));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Retries a file rename or removal briefly on Windows when antivirus or the
+/// search indexer holds a transient sharing lock (`ERROR_ACCESS_DENIED`,
+/// `ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION`). Runs once on Unix.
+pub(crate) fn retry_on_windows<T>(op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(windows)]
+    {
+        retry_transient(WINDOWS_RETRY_DELAYS_MS, op)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut op = op;
+        op()
+    }
+}
+
+pub(crate) fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_on_windows(|| std::fs::rename(from, to))
+}
+
+pub(crate) fn remove_file_retry(path: &Path) -> std::io::Result<()> {
+    retry_on_windows(|| std::fs::remove_file(path))
+}
+
+/// Opens `path` only if it is a regular file. Checking `metadata` before
+/// `File::open` ensures directories on Windows return `UnsupportedFormat`
+/// instead of OS error 5 (`ERROR_ACCESS_DENIED` -> `FileNotFound`), while
+/// re-checking the open handle prevents a TOCTOU swap.
+fn open_regular_file(path: &Path) -> Result<File> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+    if !meta.is_file() {
+        let detail = if meta.is_dir() {
+            "path is a directory"
+        } else {
+            "path is not a regular file"
+        };
+        return Err(
+            Error::unsupported("SplitSound cannot read this kind of file").with_detail(detail),
+        );
+    }
+    let file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
+    let opened_meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
+    if !opened_meta.is_file() {
+        return Err(
+            Error::unsupported("SplitSound cannot read this kind of file")
+                .with_detail("path is not a regular file"),
+        );
+    }
+    Ok(file)
+}
+
 /// A temporary sibling file created exclusively by this process.
 ///
 /// Dropping it without calling [`TempFile::persist`] removes the file; a
@@ -133,7 +212,7 @@ impl TempFile {
         let Some(tmp) = self.path.as_ref() else {
             return Ok(());
         };
-        std::fs::rename(tmp, dst)?;
+        rename_retry(tmp, dst)?;
         self.path = None;
         Ok(())
     }
@@ -142,20 +221,23 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         if let Some(tmp) = self.path.take() {
-            let _ = std::fs::remove_file(tmp);
+            let _ = remove_file_retry(&tmp);
         }
     }
 }
 
-fn create_temp_at(path: PathBuf) -> std::io::Result<(File, TempFile)> {
+fn create_temp_at(path: PathBuf) -> std::io::Result<(TempFile, File)> {
     let file = File::create_new(&path)?;
-    Ok((file, TempFile { path: Some(path) }))
+    Ok((TempFile { path: Some(path) }, file))
 }
 
 /// Creates a new sibling temp file with an unpredictable `.part` name using
 /// `create_new` semantics, so preexisting files and symlinks are never
 /// followed, overwritten or deleted.
-pub(crate) fn create_temp_sibling(path: &Path) -> std::io::Result<(File, TempFile)> {
+///
+/// Returns `(TempFile, File)` in that order so `File` is always dropped and
+/// closed before `TempFile`'s cleanup removes the path (required on Windows).
+pub(crate) fn create_temp_sibling(path: &Path) -> std::io::Result<(TempFile, File)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let base = path
         .file_name()
@@ -204,7 +286,13 @@ impl WavWriter {
 
     /// Creates a float writer with an explicit channel count.
     pub fn create_with_channels(path: &Path, sample_rate: u32, channels: u16) -> Result<Self> {
-        let (file, tmp) = create_temp_sibling(path).map_err(|e| Error::from_write(&e, path))?;
+        if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            return Err(Error::from_write(
+                &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+                path,
+            ));
+        }
+        let (tmp, file) = create_temp_sibling(path).map_err(|e| Error::from_write(&e, path))?;
         let mut out = BufWriter::with_capacity(1 << 16, file);
         let header = out.write_all(&float_header(channels, sample_rate, 0));
         let writer = WavWriter {
@@ -414,7 +502,7 @@ pub fn read_wav_spec(file: &mut File, path: &Path) -> Result<WavSpec> {
 /// `max_frames` bounds the allocation; a longer file is an error rather
 /// than a truncated read.
 pub fn read_wav(path: &Path, max_frames: u64) -> Result<WavData> {
-    let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
+    let mut file = open_regular_file(path)?;
     let spec = read_wav_spec(&mut file, path)?;
     if spec.frames > max_frames {
         return Err(Error::decode("This audio file is too long"));
@@ -522,7 +610,7 @@ pub struct MappedWav {
 impl MappedWav {
     /// Opens `path`.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
+        let mut file = open_regular_file(path)?;
         let spec = read_wav_spec(&mut file, path)?;
         let samples = spec.frames as usize * usize::from(spec.channels);
         let mappable = cfg!(target_endian = "little")
@@ -782,8 +870,8 @@ mod tests {
 
         // Sibling temp names are distinct and do not use the predictable PID name.
         let dst = dir.path().join("out.wav");
-        let (_, a) = create_temp_sibling(&dst).unwrap();
-        let (_, b) = create_temp_sibling(&dst).unwrap();
+        let (a, _fa) = create_temp_sibling(&dst).unwrap();
+        let (b, _fb) = create_temp_sibling(&dst).unwrap();
         assert_ne!(a.path(), b.path());
         assert!(a.path().to_string_lossy().ends_with(".part"));
         assert_ne!(
@@ -792,8 +880,54 @@ mod tests {
                 .join(format!("out.wav.{}.part", std::process::id()))
         );
         let pa = a.path().to_path_buf();
+        drop(_fa);
         drop(a);
         assert!(!pa.exists());
         assert!(b.path().exists());
+    }
+
+    #[test]
+    fn directories_are_rejected_as_unsupported_before_open() {
+        let dir = TempDir::new("wav-dir");
+        assert_eq!(
+            read_wav(dir.path(), u64::MAX).unwrap_err().code().as_str(),
+            "unsupported_format"
+        );
+        assert_eq!(
+            MappedWav::open(dir.path()).err().unwrap().code().as_str(),
+            "unsupported_format"
+        );
+        assert_eq!(
+            WavWriter::create(dir.path(), SAMPLE_RATE)
+                .err()
+                .unwrap()
+                .code()
+                .as_str(),
+            "internal"
+        );
+    }
+
+    #[test]
+    fn transient_lock_retry_recovers_and_stops_on_non_transient() {
+        let mut attempts = 0;
+        let ok = retry_transient(&[0, 0, 0], || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(ok.unwrap(), 42);
+        assert_eq!(attempts, 3);
+
+        let mut not_found_attempts = 0;
+        let err = retry_transient(&[0, 0, 0], || -> std::io::Result<()> {
+            not_found_attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(not_found_attempts, 1);
     }
 }

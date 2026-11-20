@@ -608,10 +608,27 @@ fn decode_inner(
     progress: &dyn Progress,
     sink: &mut dyn PcmSink,
 ) -> Result<(SourceInfo, Option<Artwork>)> {
+    // Check file type before opening: on Windows `File::open` on a directory
+    // fails with ERROR_ACCESS_DENIED (PermissionDenied -> FileNotFound) rather
+    // than opening a directory handle.
+    let path_meta = std::fs::metadata(path).map_err(|e| Error::from_read(&e, path))?;
+    if !path_meta.is_file() {
+        let detail = if path_meta.is_dir() {
+            "path is a directory"
+        } else {
+            "path is not a regular file"
+        };
+        return Err(not_audio().with_detail(detail));
+    }
     let mut file = File::open(path).map_err(|e| Error::from_read(&e, path))?;
     let meta = file.metadata().map_err(|e| Error::from_read(&e, path))?;
-    if meta.is_dir() {
-        return Err(not_audio().with_detail("path is a directory"));
+    if !meta.is_file() {
+        let detail = if meta.is_dir() {
+            "path is a directory"
+        } else {
+            "path is not a regular file"
+        };
+        return Err(not_audio().with_detail(detail));
     }
     let file_size_bytes = meta.len();
     if file_size_bytes == 0 {

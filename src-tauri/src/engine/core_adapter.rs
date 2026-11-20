@@ -471,8 +471,7 @@ impl Engine for CoreEngine {
     }
 
     fn remove_model(&self, id: &str) -> EngineResult<()> {
-        self.engine.models().remove(id)?;
-        self.engine.unload();
+        self.engine.remove_model(id)?;
         Ok(())
     }
 

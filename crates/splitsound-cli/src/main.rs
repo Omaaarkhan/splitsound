@@ -565,7 +565,7 @@ fn cmd_models(args: &Args) -> Result<(), String> {
         }
         "remove" => {
             for id in rest {
-                store.remove(id).map_err(|e| describe(&e))?;
+                engine.remove_model(id).map_err(|e| describe(&e))?;
                 println!("{id}: removed");
             }
             Ok(())

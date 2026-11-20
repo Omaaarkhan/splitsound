@@ -248,6 +248,6 @@ pub fn run() {
 
 fn grant_drop(picked: &PickedPaths, paths: &[std::path::PathBuf]) {
     for path in paths {
-        picked.grant(path, false);
+        picked.grant_dropped(path);
     }
 }

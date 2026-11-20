@@ -2,10 +2,12 @@
 //! writes, file-name sanitising and mutex poisoning.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(any(windows, test))]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Locks a mutex, recovering the data if a panicking thread poisoned it.
@@ -13,6 +15,64 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// rest of the app down with it.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn read_lock<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn write_lock<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+const WINDOWS_RETRY_DELAYS_MS: &[u64] = &[20, 40, 80, 120, 180, 250, 310];
+
+#[cfg(any(windows, test))]
+fn is_transient_windows_lock(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(any(windows, test))]
+fn retry_transient<T>(delays_ms: &[u64], mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < delays_ms.len() && is_transient_windows_lock(&e) => {
+                std::thread::sleep(Duration::from_millis(delays_ms[attempt]));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Retries a filesystem mutation over ~1 s on Windows when antivirus or the
+/// search indexer transiently holds a sharing lock on a new file or folder.
+/// Executes once on Unix.
+pub fn retry_on_windows<T>(op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        retry_transient(WINDOWS_RETRY_DELAYS_MS, op)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut op = op;
+        op()
+    }
+}
+
+pub fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_on_windows(|| fs::rename(from, to))
+}
+
+pub fn remove_file_retry(path: &Path) -> io::Result<()> {
+    retry_on_windows(|| fs::remove_file(path))
+}
+
+pub fn remove_dir_all_retry(path: &Path) -> io::Result<()> {
+    retry_on_windows(|| fs::remove_dir_all(path))
 }
 
 /* ------------------------------------------------------------------ */
@@ -123,7 +183,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)?;
+        rename_retry(&tmp, path)?;
         // Make the rename itself durable where the platform allows it.
         #[cfg(unix)]
         if let Ok(d) = fs::File::open(dir) {
@@ -132,7 +192,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_file_retry(&tmp);
     }
     result
 }
@@ -160,8 +220,10 @@ pub fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// Reads a file only if it is no larger than `max` bytes.
+/// Reads a file only if it is a regular file no larger than `max` bytes.
 pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    // Check type before opening so directories on Windows return InvalidInput
+    // rather than PermissionDenied (os error 5).
     let meta = fs::metadata(path)?;
     if !meta.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
@@ -169,7 +231,22 @@ pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     if meta.len() > max {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
     }
-    fs::read(path)
+    let file = fs::File::open(path)?;
+    let opened_meta = file.metadata()?;
+    if !opened_meta.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    if opened_meta.len() > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(opened_meta.len() as usize)
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "out of memory"))?;
+    file.take(max.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
+    Ok(data)
 }
 
 /* ------------------------------------------------------------------ */
@@ -358,5 +435,48 @@ mod tests {
         let names: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(names.len(), 1, "no temp files left behind");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_bounded_rejects_directories_and_oversized_files() {
+        let dir = std::env::temp_dir().join(format!("ss-test-{}", new_session_id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            read_bounded(&dir, 1024).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let p = dir.join("big.bin");
+        fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(
+            read_bounded(&p, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(read_bounded(&p, 10).unwrap(), b"0123456789");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn transient_retry_retries_permission_denied_only() {
+        let mut calls = 0;
+        let v = retry_transient(&[0, 0, 0], || {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok("ok")
+            }
+        })
+        .unwrap();
+        assert_eq!(v, "ok");
+        assert_eq!(calls, 3);
+
+        let mut nf_calls = 0;
+        let err = retry_transient(&[0, 0, 0], || -> io::Result<()> {
+            nf_calls += 1;
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(nf_calls, 1);
     }
 }

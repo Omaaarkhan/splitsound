@@ -216,18 +216,22 @@ fn import_scan_split_export_drag_delete() {
             .any(|e| matches!(e, AppEvent::SessionUpdated(x) if x.status == SessionStatus::Ready))
     );
 
-    // Stems sum back to the mix.
+    // Stems sum back to the mix. Drop the test's own mappings when done so
+    // Windows allows deleting the session folder later in this test.
     let dir = f.core.library.dir(&s.id).unwrap();
-    let mix = MappedWav::open(&dir.join("mix.wav")).unwrap();
-    let stems: Vec<MappedWav> = ready
-        .stems
-        .iter()
-        .map(|x| MappedWav::open(Path::new(&x.path)).unwrap())
-        .collect();
-    for i in (0..mix.samples().len()).step_by(997) {
-        let sum: f32 = stems.iter().map(|m| m.samples()[i]).sum();
-        assert!((sum - mix.samples()[i]).abs() < 1e-4);
+    {
+        let mix = MappedWav::open(&dir.join("mix.wav")).unwrap();
+        let stems: Vec<MappedWav> = ready
+            .stems
+            .iter()
+            .map(|x| MappedWav::open(Path::new(&x.path)).unwrap())
+            .collect();
+        for i in (0..mix.samples().len()).step_by(997) {
+            let sum: f32 = stems.iter().map(|m| m.samples()[i]).sum();
+            assert!((sum - mix.samples()[i]).abs() < 1e-4);
+        }
     }
+    assert_eq!(MappedWav::live_mappings_under(&dir), 0);
 
     // Playback loads the stems; without a device, play is `audio_device`.
     let st = f.core.playback_load(&s.id).unwrap();
@@ -351,7 +355,9 @@ fn import_scan_split_export_drag_delete() {
     assert_eq!(info.version, "0.0.0-test");
 
     // Delete unloads playback and removes everything.
+    assert!(MappedWav::live_mappings_under(&dir) > 0);
     f.core.delete_session(&s.id).unwrap();
+    assert_eq!(MappedWav::live_mappings_under(&dir), 0);
     assert!(f.core.player.state().session_id.is_none());
     assert!(!dir.exists());
     assert!(!Path::new(&drag[0]).exists());
@@ -867,4 +873,191 @@ fn prepare_drag_deduplicates_stems_and_ignores_temp_symlinks() {
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         assert!(symlink.symlink_metadata().is_ok());
     }
+}
+
+#[test]
+fn delete_and_resplit_wait_for_in_flight_readers_and_release_mappings() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    struct ExportGateEngine {
+        inner: MockEngine,
+        hold_export: Arc<AtomicBool>,
+        export_entered: mpsc::Sender<()>,
+        export_release: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl Engine for ExportGateEngine {
+        fn name(&self) -> &'static str {
+            "export-gate"
+        }
+        fn decode(&self, i: &Path, o: &Path, c: &CancelToken) -> EngineResult<DecodedTrack> {
+            self.inner.decode(i, o, c)
+        }
+        fn scan_instruments(&self, _w: &Path, _c: &CancelToken) -> EngineResult<ScanOutcome> {
+            Ok(ScanOutcome::Done(ScanResult {
+                detections: Vec::new(),
+                suggested_mode: SplitMode::Band,
+            }))
+        }
+        fn plan_split(&self, d: f64, o: &SplitOptions) -> EngineResult<SplitPlan> {
+            self.inner.plan_split(d, o)
+        }
+        fn split(
+            &self,
+            r: &SplitRequest,
+            p: &mut (dyn FnMut(EngineProgress) + Send),
+            c: &CancelToken,
+        ) -> EngineResult<SplitOutput> {
+            self.inner.split(r, p, c)
+        }
+        fn export(&self, j: &ExportJob, c: &CancelToken) -> EngineResult<Vec<PathBuf>> {
+            let _held = MappedWav::open(&j.items[0].sources[0].0).unwrap();
+            if self.hold_export.load(Ordering::SeqCst) {
+                let _ = self.export_entered.send(());
+                if let Some(rx) = self.export_release.lock().unwrap().take() {
+                    let _ = rx.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            drop(_held);
+            self.inner.export(j, c)
+        }
+        fn list_models(&self) -> Vec<ModelStatus> {
+            self.inner.list_models()
+        }
+        fn download_models(
+            &self,
+            ids: &[String],
+            a: bool,
+            p: &mut (dyn FnMut(ModelDownloadProgress) + Send),
+            c: &CancelToken,
+        ) -> EngineResult<()> {
+            self.inner.download_models(ids, a, p, c)
+        }
+        fn remove_model(&self, id: &str) -> EngineResult<()> {
+            self.inner.remove_model(id)
+        }
+        fn import_model_files(&self, p: &[PathBuf]) -> EngineResult<Vec<String>> {
+            self.inner.import_model_files(p)
+        }
+        fn hardware(&self) -> HardwareInfo {
+            self.inner.hardware()
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("ss-e2e-{}", new_session_id()));
+    let hold_export = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let hold_clone = hold_export.clone();
+    let f = start_with(root, move |p| {
+        Arc::new(ExportGateEngine {
+            inner: MockEngine::with_time_scale(engine_config(p), 0.01),
+            hold_export: hold_clone,
+            export_entered: entered_tx,
+            export_release: std::sync::Mutex::new(Some(release_rx)),
+        })
+    });
+
+    let input = song(&f.root.join("music"), "loaded.wav");
+    let s = f.core.import_track(&input.to_string_lossy()).unwrap();
+    let band = SplitOptions {
+        mode: SplitMode::Band,
+        quality: Quality::Fast,
+    };
+    f.core.start_split(&s.id, band, false).unwrap();
+    wait_until("first split", Duration::from_secs(30), || {
+        f.core.get_session(&s.id).unwrap().status == SessionStatus::Ready
+    });
+    let dir = f.core.library.dir(&s.id).unwrap();
+
+    // Load the session in playback, then re-split it into 2-stem Vocals mode
+    // while loaded: detach must drop old stem mappings before swapping stems.
+    f.core.playback_load(&s.id).unwrap();
+    assert_eq!(MappedWav::live_mappings_under(&dir), 5);
+    let vocals = SplitOptions {
+        mode: SplitMode::Vocals,
+        quality: Quality::Fast,
+    };
+    f.core.start_split(&s.id, vocals, false).unwrap();
+    wait_until(
+        "re-split and player reattach",
+        Duration::from_secs(30),
+        || {
+            let cur = f.core.get_session(&s.id).unwrap();
+            cur.status == SessionStatus::Ready
+                && cur.stems.len() == 2
+                && f.core.player.state().channels.len() == 2
+        },
+    );
+    // Player reattached to mix + 2 new stems.
+    assert_eq!(MappedWav::live_mappings_under(&dir), 3);
+
+    // Start an in-flight export holding a mapping on a stem, then call
+    // delete_session concurrently: deletion must wait until the export drops
+    // its mapping, unload the player synchronously, and remove the session.
+    let out = f.root.join("exports");
+    std::fs::create_dir_all(&out).unwrap();
+    hold_export.store(true, Ordering::SeqCst);
+    let core_for_export = f.core.clone();
+    let id_for_export = s.id.clone();
+    let out_str = out.to_string_lossy().into_owned();
+    let export_thread = std::thread::spawn(move || {
+        core_for_export.export_stems(
+            &id_for_export,
+            ExportOptions {
+                stem_ids: vec![StemId::Vocals],
+                format: ExportFormat::Wav16,
+                destination_dir: out_str,
+                include_mixdown: false,
+            },
+        )
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let core_for_delete = f.core.clone();
+    let id_for_delete = s.id.clone();
+    let deleted = Arc::new(AtomicBool::new(false));
+    let deleted_flag = deleted.clone();
+    let delete_thread = std::thread::spawn(move || {
+        let r = core_for_delete.delete_session(&id_for_delete);
+        deleted_flag.store(true, Ordering::SeqCst);
+        r
+    });
+
+    // While the export still holds the stem mapped, delete must not finish.
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        !deleted.load(Ordering::SeqCst),
+        "delete_session completed while an export still mapped the stem"
+    );
+    assert!(MappedWav::live_mappings_under(&dir) > 0);
+
+    // Release the export; both export and delete complete cleanly with zero
+    // live mappings remaining.
+    let _ = release_tx.send(());
+    export_thread.join().unwrap().unwrap();
+    delete_thread.join().unwrap().unwrap();
+    assert_eq!(MappedWav::live_mappings_under(&dir), 0);
+    assert!(!dir.exists());
+
+    // clear_library also synchronously unloads an active session before
+    // removing its folder.
+    let s2 = f.core.import_track(&input.to_string_lossy()).unwrap();
+    let dir2 = f.core.library.dir(&s2.id).unwrap();
+    f.core.playback_load(&s2.id).unwrap();
+    assert_eq!(MappedWav::live_mappings_under(&dir2), 1);
+    f.core.clear_library().unwrap();
+    assert_eq!(MappedWav::live_mappings_under(&dir2), 0);
+    assert!(!dir2.exists());
+    assert!(f.core.list_sessions().is_empty());
+
+    // Directory inputs to import_model_files also report UnsupportedFormat.
+    assert_eq!(
+        f.core
+            .import_model_files(&[f.root.to_string_lossy().into_owned()])
+            .unwrap_err()
+            .code,
+        ErrorCode::UnsupportedFormat
+    );
 }

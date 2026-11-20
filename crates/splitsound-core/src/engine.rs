@@ -449,6 +449,34 @@ impl Engine {
         }
     }
 
+    /// Unloads cached model sessions and deletes model `id` from disk.
+    ///
+    /// Releases loaded sessions *before* deleting the files so no runtime
+    /// handle or mapping can block removal on Windows, and refuses (`busy`)
+    /// while a split or instrument scan holds the model locks.
+    pub fn remove_model(&self, id: &str) -> Result<()> {
+        self.store.manifest().get(id)?;
+        let busy = || {
+            Error::new(
+                ErrorCode::Busy,
+                "A split or instrument scan is running; wait for it to finish before removing models",
+            )
+        };
+        let mut sep = match self.separator.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(busy()),
+        };
+        let mut tag = match self.tagger.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(busy()),
+        };
+        *sep = None;
+        *tag = None;
+        self.store.remove(id)
+    }
+
     /// The GPU path on this machine. Loads ONNX Runtime to find out; if
     /// that fails the answer is "none".
     pub fn gpu_info(&self) -> GpuInfo {
@@ -1351,5 +1379,26 @@ mod tests {
         assert!(
             export_mixdown(&[], ExportFormat::Wav16, &out, &crate::progress::NoProgress).is_err()
         );
+    }
+
+    #[test]
+    fn remove_model_refuses_while_busy_and_unloads_before_deleting() {
+        let dir = TempDir::new("engine-remove");
+        let e = engine(&dir);
+        let entry = e.models().manifest().get(PREVIEW_MODEL).unwrap().clone();
+        let file_path = e.models().dir().join(&entry.file.name);
+        std::fs::write(&file_path, b"placeholder").unwrap();
+
+        // While inference holds the separator lock, remove_model refuses with
+        // `busy` and leaves the file untouched.
+        let guard = e.separator.lock().unwrap();
+        let err = e.remove_model(PREVIEW_MODEL).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Busy);
+        assert!(file_path.exists());
+        drop(guard);
+
+        // Once idle, remove_model deletes the file cleanly.
+        e.remove_model(PREVIEW_MODEL).unwrap();
+        assert!(!file_path.exists());
     }
 }

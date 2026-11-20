@@ -84,13 +84,13 @@ pub(crate) fn rollback_stems(dir: &Path, had_stems: bool) -> io::Result<()> {
     let old = dir.join("stems.old");
     let current = dir.join("stems");
     if old.is_dir() || !had_stems {
-        match fs::remove_dir_all(&current) {
+        match util::remove_dir_all_retry(&current) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
         if old.is_dir() {
-            fs::rename(old, current)?;
+            util::rename_retry(&old, &current)?;
         }
     }
     Ok(())
@@ -293,7 +293,7 @@ impl Library {
             previous_split: None,
         };
         write_stored(staging, &stored).map_err(|e| IpcError::io("save the song", &e))?;
-        fs::rename(staging, &dir).map_err(|e| IpcError::io("save the song", &e))?;
+        util::rename_retry(staging, &dir).map_err(|e| IpcError::io("save the song", &e))?;
         let size = util::dir_size(&dir);
         lock(&self.entries).insert(
             session.id.clone(),
@@ -347,15 +347,19 @@ impl Library {
         if !entries.contains_key(id) {
             return Err(invalid_id());
         }
-        let trash = self.root.join(format!(".trash-{id}"));
-        match fs::rename(&dir, &trash) {
+        // Use a unique trash name so a leftover `.trash-*` directory from an
+        // earlier cleanup never collides on Windows `MoveFileExW`.
+        let trash = self
+            .root
+            .join(format!(".trash-{id}-{}", &util::new_session_id()[..8]));
+        match util::rename_retry(&dir, &trash) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(IpcError::io("delete the song", &e)),
         }
         entries.remove(id);
         drop(entries);
-        if let Err(e) = fs::remove_dir_all(&trash)
+        if let Err(e) = util::remove_dir_all_retry(&trash)
             && e.kind() != io::ErrorKind::NotFound
         {
             log::warn!(

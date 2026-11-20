@@ -124,11 +124,7 @@ pub async fn playback_load(core: Core<'_>, session_id: String) -> IpcResult<Play
 
 #[tauri::command]
 pub async fn playback_unload(core: Core<'_>) -> IpcResult<()> {
-    blocking(&core, |c| {
-        c.player.unload();
-        Ok(())
-    })
-    .await
+    blocking(&core, |c| c.player.unload()).await
 }
 
 #[tauri::command]

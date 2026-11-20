@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::artwork;
@@ -20,7 +20,9 @@ use crate::engine::{
 use crate::ipc::*;
 use crate::library::{Library, stem_path};
 use crate::settings::SettingsStore;
-use crate::util::{self, lock, now_iso8601, sanitize_file_stem, unique_path};
+use crate::util::{
+    self, lock, now_iso8601, read_lock, sanitize_file_stem, unique_path, write_lock,
+};
 use crate::worker::{Cancelled, Job, Worker};
 
 /// Largest audio file accepted for import (4 GiB).
@@ -83,7 +85,7 @@ impl AppPaths {
     /// Creates the folders and empties the drag folder.
     pub fn prepare(&self) -> io::Result<()> {
         if self.drag_dir.exists() {
-            fs::remove_dir_all(&self.drag_dir)?;
+            util::remove_dir_all_retry(&self.drag_dir)?;
         }
         for d in [
             &self.data_dir,
@@ -136,6 +138,37 @@ pub struct CoreOptions {
     pub version: String,
 }
 
+/// Per-session read/write locks so session deletion and stem swaps wait for
+/// in-flight file readers (`get_peaks`, `get_artwork`, `playback_load`,
+/// `prepare_drag`, `export_stems`) to drop their handles and memory mappings
+/// before touching the folder on disk.
+#[derive(Default)]
+struct SessionLocks(Mutex<HashMap<String, Arc<RwLock<()>>>>);
+
+impl SessionLocks {
+    fn get(&self, id: &str) -> Arc<RwLock<()>> {
+        lock(&self.0)
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    fn forget(&self, id: &str) {
+        lock(&self.0).remove(id);
+    }
+}
+
+struct RemovingGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl Drop for RemovingGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.set).remove(&self.id);
+    }
+}
+
 pub struct AppCore {
     pub paths: AppPaths,
     engine: EngineResult<Arc<dyn Engine>>,
@@ -149,6 +182,8 @@ pub struct AppCore {
     scans: Worker<String>,
     exports: Mutex<()>,
     drag_copies: Mutex<()>,
+    session_locks: SessionLocks,
+    removing: Mutex<HashSet<String>>,
     downloads: Worker<DownloadJob>,
     download_progress: Mutex<HashMap<String, (f64, Instant)>>,
     /// Canonical paths handed to the UI (exports, drag files, export folders).
@@ -205,15 +240,17 @@ fn validate_input_file(path: &str, max: u64) -> IpcResult<PathBuf> {
     Ok(c)
 }
 
-/// Canonicalises without the `\\?\` prefix Windows adds, so paths handed
-/// to the UI look normal.
+/// Canonicalises without the `\\?\` prefix Windows adds when the path fits
+/// cleanly below Windows' legacy MAX_PATH limit and is valid UTF-8, so normal
+/// paths handed to the UI look familiar while long or UNC paths stay valid.
 pub fn dunce_canonicalize(p: &Path) -> io::Result<PathBuf> {
     let c = fs::canonicalize(p)?;
     #[cfg(windows)]
     {
-        let s = c.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\")
+        if let Some(s) = c.to_str()
+            && let Some(rest) = s.strip_prefix(r"\\?\")
             && !rest.starts_with("UNC\\")
+            && rest.encode_utf16().count() < 248
         {
             return Ok(PathBuf::from(rest));
         }
@@ -388,6 +425,8 @@ impl AppCore {
                 scans,
                 exports: Mutex::new(()),
                 drag_copies: Mutex::new(()),
+                session_locks: SessionLocks::default(),
+                removing: Mutex::new(HashSet::new()),
                 downloads,
                 download_progress: Mutex::new(HashMap::new()),
                 handed_out: Mutex::new(HashSet::new()),
@@ -405,7 +444,7 @@ impl AppCore {
         self.downloads.shutdown();
         self.splits.shutdown();
         self.scans.shutdown();
-        self.player.unload();
+        let _ = self.player.unload();
     }
 
     fn engine(&self) -> IpcResult<&dyn Engine> {
@@ -526,8 +565,17 @@ impl AppCore {
         Ok(())
     }
 
+    fn mark_removing(&self, id: &str) -> RemovingGuard<'_> {
+        lock(&self.removing).insert(id.to_string());
+        RemovingGuard {
+            set: &self.removing,
+            id: id.to_string(),
+        }
+    }
+
     fn remove_session(&self, id: &str) -> IpcResult<()> {
         let _action = lock(&self.split_actions);
+        let _removing = self.mark_removing(id);
         self.scans.cancel(id);
         if let Cancelled::Queued(_) = self.splits.cancel(id) {
             self.restore_after_cancel(id);
@@ -539,12 +587,19 @@ impl AppCore {
                 "This song is still being processed. Try again shortly.",
             ));
         }
-        let _drag = lock(&self.drag_copies);
-        self.player.unload_if(id);
+        // Wait for any in-flight readers (`get_peaks`, `get_artwork`,
+        // `playback_load`, `prepare_drag`, `export_stems`) to drop all file
+        // handles and memory mappings for this session, and prevent new ones
+        // from opening while we unload and remove the folder.
+        let session_lock = self.session_locks.get(id);
+        let _write = write_lock(&session_lock);
+        self.player.unload_if(id)?;
         self.library.remove(id)?;
         let drag = self.paths.drag_dir.join(id);
-        let _ = fs::remove_dir_all(&drag);
+        let _ = util::remove_dir_all_retry(&drag);
         lock(&self.handed_out).retain(|p| !p.starts_with(&drag));
+        drop(_write);
+        self.session_locks.forget(id);
         Ok(())
     }
 
@@ -560,6 +615,8 @@ impl AppCore {
     }
 
     pub fn get_artwork(&self, id: &str) -> IpcResult<Option<String>> {
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         if !s.track.has_artwork {
             return Ok(None);
@@ -582,6 +639,8 @@ impl AppCore {
                 "The waveform needs between 1 and {MAX_BUCKETS} buckets."
             )));
         }
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         let dir = self.library.dir(id)?;
         let path = match source.stem() {
@@ -689,12 +748,21 @@ impl AppCore {
     /// After models were installed, retry scans that had no tagger.
     fn rescan_unavailable(&self) {
         for id in self.library.ids() {
+            if lock(&self.removing).contains(&id) {
+                continue;
+            }
             if let Ok(s) = self.library.get(&id)
                 && s.analysis == AnalysisStatus::Unavailable
                 && !self.scans.contains(&id)
             {
                 self.set_analysis(&id, AnalysisStatus::Pending, None);
-                self.scans.push(id);
+                let removing = lock(&self.removing);
+                if !removing.contains(&id)
+                    && self.library.contains(&id)
+                    && !self.scans.contains(&id)
+                {
+                    self.scans.push(id);
+                }
             }
         }
     }
@@ -961,64 +1029,78 @@ impl AppCore {
             total_steps,
             true,
         );
-        // A first split has no existing stem mappings to release. Keep the
-        // original playing while the new files and metadata are installed.
-        let detached = !session.stems.is_empty() && self.player.detach(id);
-        let swapped = swap_stems(&dir);
-        if let Err(e) = swapped {
-            if detached {
-                self.player.reattach(&session, &dir);
-            }
-            return Err(IpcError::io("save the stems", &e));
-        }
-        let infos: Vec<StemInfo> = output
-            .stems
-            .into_iter()
-            .map(|(st, a)| StemInfo {
-                id: st,
-                path: path_string(&stem_path(&dir, st)),
-                present: a.present,
-                active_fraction: a.active_fraction,
-                peak_db: a.peak_db,
-                rms_db: a.rms_db,
-                activity: a.activity,
-                contains: a.contains,
-            })
-            .collect();
-        let elapsed = started.elapsed().as_secs_f64();
-        let committed = self.library.update(id, |s, prev| {
-            s.status = SessionStatus::Ready;
-            s.stems = infos;
-            s.split = Some(SplitSummary {
-                mode: job.options.mode,
-                quality: job.options.quality,
-                finished_at: now_iso8601(),
-                elapsed_sec: (elapsed * 10.0).round() / 10.0,
-                model_ids: output.model_ids.clone(),
-            });
-            *prev = None;
-            s.error = None;
-        });
-        let (session, _) = match committed {
-            Ok(committed) => committed,
-            Err(e) => {
-                let restored = crate::library::rollback_stems(&dir, !session.stems.is_empty());
-                if let Err(rollback) = restored {
-                    log::error!("couldn't restore stems for {id}: {rollback}");
-                }
+        // Serialize against in-flight stem readers (`get_peaks`, `prepare_drag`,
+        // `export_stems`, `playback_load`) and synchronously drop any existing
+        // stem mappings from the player before renaming `stems/`.
+        let session = {
+            let session_lock = self.session_locks.get(id);
+            let _write = write_lock(&session_lock);
+            // A first split has no existing stem mappings to release. Keep the
+            // original playing while the new files and metadata are installed.
+            let needs_detach = !session.stems.is_empty() || dir.join("stems").exists();
+            let detached = if needs_detach {
+                self.player.detach(id)?
+            } else {
+                false
+            };
+            let swapped = swap_stems(&dir);
+            if let Err(e) = swapped {
                 if detached {
                     self.player.reattach(&session, &dir);
                 }
-                return Err(e);
+                return Err(IpcError::io("save the stems", &e));
             }
+            let infos: Vec<StemInfo> = output
+                .stems
+                .into_iter()
+                .map(|(st, a)| StemInfo {
+                    id: st,
+                    path: path_string(&stem_path(&dir, st)),
+                    present: a.present,
+                    active_fraction: a.active_fraction,
+                    peak_db: a.peak_db,
+                    rms_db: a.rms_db,
+                    activity: a.activity,
+                    contains: a.contains,
+                })
+                .collect();
+            let elapsed = started.elapsed().as_secs_f64();
+            let committed = self.library.update(id, |s, prev| {
+                s.status = SessionStatus::Ready;
+                s.stems = infos;
+                s.split = Some(SplitSummary {
+                    mode: job.options.mode,
+                    quality: job.options.quality,
+                    finished_at: now_iso8601(),
+                    elapsed_sec: (elapsed * 10.0).round() / 10.0,
+                    model_ids: output.model_ids.clone(),
+                });
+                *prev = None;
+                s.error = None;
+            });
+            let (session, _) = match committed {
+                Ok(committed) => committed,
+                Err(e) => {
+                    let restored = crate::library::rollback_stems(&dir, !session.stems.is_empty());
+                    if let Err(rollback) = restored {
+                        log::error!("couldn't restore stems for {id}: {rollback}");
+                    }
+                    if detached {
+                        self.player.reattach(&session, &dir);
+                    }
+                    return Err(e);
+                }
+            };
+            let old = dir.join("stems.old");
+            if let Err(e) = util::remove_dir_all_retry(&old)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                log::warn!("couldn't remove old stems in {}: {e}", dir.display());
+            }
+            self.library.refresh_size(id);
+            self.player.reattach(&session, &dir);
+            session
         };
-        let old = dir.join("stems.old");
-        if let Err(e) = fs::remove_dir_all(old)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            log::warn!("couldn't remove old stems in {}: {e}", dir.display());
-        }
-        self.library.refresh_size(id);
         rep.report(
             SplitStage::Writing,
             1.0,
@@ -1029,7 +1111,6 @@ impl AppCore {
         );
         self.session_changed(&session);
         self.library_changed();
-        self.player.reattach(&session, &dir);
         Ok(())
     }
 
@@ -1038,6 +1119,8 @@ impl AppCore {
     /* -------------------------------------------------------------- */
 
     pub fn playback_load(&self, id: &str) -> IpcResult<PlaybackState> {
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         let dir = self.library.dir(id)?;
         self.player.load(&s, &dir)
@@ -1066,6 +1149,8 @@ impl AppCore {
     pub fn export_stems(&self, id: &str, options: ExportOptions) -> IpcResult<ExportResult> {
         let engine = self.engine()?;
         let _export = lock(&self.exports);
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         let stems = Self::checked_stems(&s, &options.stem_ids)?;
         if stems.is_empty() {
@@ -1144,6 +1229,8 @@ impl AppCore {
     /// Makes "Song title (Vocals).wav" copies in the drag folder.
     pub fn prepare_drag(&self, id: &str, stem_ids: &[StemId]) -> IpcResult<Vec<String>> {
         let _drag = lock(&self.drag_copies);
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         let dir = self.library.dir(id)?;
         let stems = Self::checked_stems(&s, stem_ids)?;
@@ -1416,11 +1503,11 @@ fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     let result = (|| {
         io::copy(&mut reader, &mut writer)?;
         drop(writer);
-        fs::rename(&tmp, dst)?;
+        util::rename_retry(&tmp, dst)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = util::remove_file_retry(&tmp);
     }
     result
 }
@@ -1431,15 +1518,15 @@ fn swap_stems(dir: &Path) -> io::Result<()> {
     let partial = dir.join("stems.partial");
     let old = dir.join("stems.old");
     if old.exists() {
-        fs::remove_dir_all(&old)?;
+        util::remove_dir_all_retry(&old)?;
     }
     let had_old = stems.exists();
     if had_old {
-        fs::rename(&stems, &old)?;
+        util::rename_retry(&stems, &old)?;
     }
-    if let Err(e) = fs::rename(&partial, &stems) {
+    if let Err(e) = util::rename_retry(&partial, &stems) {
         if had_old {
-            let _ = fs::rename(&old, &stems);
+            let _ = util::rename_retry(&old, &stems);
         }
         return Err(e);
     }
