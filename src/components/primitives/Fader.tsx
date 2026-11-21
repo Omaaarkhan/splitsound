@@ -8,6 +8,7 @@ import {
   snapDb,
 } from "../../utils/fader";
 import { formatDb } from "../../utils/format";
+import type { TooltipAttrs } from "./Tooltip";
 import "./Fader.css";
 
 interface FaderProps {
@@ -15,9 +16,10 @@ interface FaderProps {
   label: string;
   onChange: (db: number) => void;
   className?: string;
+  tooltip?: TooltipAttrs;
 }
 
-export function Fader({ valueDb, label, onChange, className }: FaderProps) {
+export function Fader({ valueDb, label, onChange, className, tooltip }: FaderProps) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
 
@@ -121,6 +123,7 @@ export function Fader({ valueDb, label, onChange, className }: FaderProps) {
       onPointerCancel={handlePointerUp}
       onDoubleClick={handleDoubleClick}
       onKeyDown={handleKeyDown}
+      {...tooltip}
     >
       <span className="fader__cap" aria-hidden="true" />
     </div>

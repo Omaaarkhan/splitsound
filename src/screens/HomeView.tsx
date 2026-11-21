@@ -3,6 +3,7 @@ import type { SessionSummary, SplitProgress, StemId } from "../ipc/contract";
 import { useStore } from "../stores/createStore";
 import { libraryStore, loadSessionArtwork } from "../stores/libraryStore";
 import { modelsStore } from "../stores/modelsStore";
+import { settingsStore } from "../stores/settingsStore";
 import { getNowMs } from "../utils/clock";
 import {
   computeFirstRunDownloadBytes,
@@ -13,6 +14,7 @@ import {
 import { STEM_CSS_VAR } from "../utils/stems";
 import { drawWaveform, resolveCssColor, type DecodedPeaks } from "../utils/waveform";
 import { TapeSlivers } from "../components/primitives/TapeSlivers";
+import { formatModShortcut, tip } from "../components/primitives/Tooltip";
 import "./HomeView.css";
 
 interface HomeViewProps {
@@ -315,6 +317,11 @@ function LibraryRow({ session, artworkUrl, progress, onOpen, onRequestRemove }: 
           className="console-key console-key--compact library-row__remove"
           aria-label={`Remove ${session.title}`}
           onClick={onRequestRemove}
+          {...tip("Remove from library", {
+            detail:
+              "Deletes this song's separated stems from SplitSound. Your original file is not touched.",
+            placement: "left",
+          })}
         >
           Remove
         </button>
@@ -331,6 +338,7 @@ export function HomeView({
 }: HomeViewProps) {
   const { sessions, artworkById, progressById, loaded } = useStore(libraryStore);
   const { models, loaded: modelsLoaded } = useStore(modelsStore);
+  const { appInfo } = useStore(settingsStore);
 
   const firstRunBytes = modelsLoaded ? computeFirstRunDownloadBytes(models) : 0;
 
@@ -354,7 +362,16 @@ export function HomeView({
             </p>
           ) : null}
           <div className="home-drop__actions">
-            <button type="button" className="primary-btn" onClick={onChooseFile}>
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={onChooseFile}
+              {...tip("Open an audio file", {
+                detail: "Or drag and drop a song anywhere on this window.",
+                shortcut: formatModShortcut(appInfo.platform, "O"),
+                placement: "bottom",
+              })}
+            >
               Choose a file
             </button>
             <span className="home-drop__formats">MP3, WAV, FLAC, Opus, OGG, M4A, AIFF</span>

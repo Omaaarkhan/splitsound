@@ -513,11 +513,30 @@ impl Player {
         if let Some(g) = gain_db {
             ch.gain_db = mixer::clamp_db(g);
         }
-        if let Some(m) = muted {
-            ch.muted = m;
-        }
-        if let Some(s) = solo {
-            ch.solo = s;
+        match (muted, solo) {
+            (Some(true), Some(true)) => {
+                ch.solo = true;
+                ch.muted = false;
+            }
+            (Some(m), Some(s)) => {
+                ch.muted = m;
+                ch.solo = s;
+            }
+            (Some(true), None) => {
+                ch.muted = true;
+                ch.solo = false;
+            }
+            (Some(false), None) => {
+                ch.muted = false;
+            }
+            (None, Some(true)) => {
+                ch.solo = true;
+                ch.muted = false;
+            }
+            (None, Some(false)) => {
+                ch.solo = false;
+            }
+            (None, None) => {}
         }
         let p = params_of(ch);
         self.send(MixerCmd::Channel(index, p));
@@ -1187,6 +1206,93 @@ mod tests {
         assert_eq!(g[2], (StemId::Other, 0.0));
         assert_eq!(master, 1.0);
         assert!(player.mixdown_gains("someone-else").is_none());
+        player.unload().unwrap();
+        assert_eq!(MappedWav::live_mappings_under(&dir), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn solo_and_mute_are_mutually_exclusive() {
+        let sink = Arc::new(RecordingSink::default());
+        let player = Player::new(sink, fake_factory(1.0));
+        let (dir, s) = fixture(&[StemId::Vocals, StemId::Drums, StemId::Other]);
+        player.load(&s, &dir).unwrap();
+
+        // 1. Solo a channel, then mute it: solo clears, other stems become audible.
+        player
+            .set_channel(SourceId::Vocals, None, None, Some(true))
+            .unwrap();
+        player
+            .set_channel(SourceId::Vocals, None, Some(true), None)
+            .unwrap();
+        let vocals = player
+            .state()
+            .channels
+            .into_iter()
+            .find(|c| c.id == SourceId::Vocals)
+            .unwrap();
+        assert!(vocals.muted);
+        assert!(!vocals.solo);
+        let (g, _) = player.mixdown_gains(&s.id).unwrap();
+        assert_eq!(g[0], (StemId::Vocals, 0.0));
+        assert!(g[1].1 > 0.0);
+        assert!(g[2].1 > 0.0);
+
+        // 2. Solo that muted channel: mute clears, solo turns on.
+        player
+            .set_channel(SourceId::Vocals, None, None, Some(true))
+            .unwrap();
+        let vocals = player
+            .state()
+            .channels
+            .into_iter()
+            .find(|c| c.id == SourceId::Vocals)
+            .unwrap();
+        assert!(!vocals.muted);
+        assert!(vocals.solo);
+        let (g, _) = player.mixdown_gains(&s.id).unwrap();
+        assert!(g[0].1 > 0.0);
+        assert_eq!(g[1], (StemId::Drums, 0.0));
+        assert_eq!(g[2], (StemId::Other, 0.0));
+
+        // 3. With two channels soloed, muting one clears its solo while keeping the other soloed.
+        player
+            .set_channel(SourceId::Drums, None, None, Some(true))
+            .unwrap();
+        player
+            .set_channel(SourceId::Vocals, None, Some(true), None)
+            .unwrap();
+        let st = player.state();
+        let vocals = st
+            .channels
+            .iter()
+            .find(|c| c.id == SourceId::Vocals)
+            .unwrap();
+        let drums = st
+            .channels
+            .iter()
+            .find(|c| c.id == SourceId::Drums)
+            .unwrap();
+        assert!(vocals.muted && !vocals.solo);
+        assert!(!drums.muted && drums.solo);
+        let (g, _) = player.mixdown_gains(&s.id).unwrap();
+        assert_eq!(g[0], (StemId::Vocals, 0.0));
+        assert!(g[1].1 > 0.0);
+        assert_eq!(g[2], (StemId::Other, 0.0));
+
+        // 4. Passing (Some(true), Some(true)) leaves solo=true, muted=false (never both true).
+        player
+            .set_channel(SourceId::Other, None, Some(true), Some(true))
+            .unwrap();
+        let other = player
+            .state()
+            .channels
+            .into_iter()
+            .find(|c| c.id == SourceId::Other)
+            .unwrap();
+        assert!(other.solo);
+        assert!(!other.muted);
+
         player.unload().unwrap();
         assert_eq!(MappedWav::live_mappings_under(&dir), 0);
         std::fs::remove_dir_all(dir).unwrap();

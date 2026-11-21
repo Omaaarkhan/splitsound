@@ -27,6 +27,7 @@ import { sortStemsForDisplay } from "./utils/stems";
 import { TopBar } from "./components/TopBar";
 import { TransportBar } from "./components/TransportBar";
 import { NoticeBar } from "./components/NoticeBar";
+import { TooltipLayer } from "./components/primitives/Tooltip";
 import { HomeView } from "./screens/HomeView";
 import { PreSplitView } from "./screens/PreSplitView";
 import { SplittingView } from "./screens/SplittingView";
@@ -309,6 +310,8 @@ export default function App() {
       {panel.type === "licenses" ? (
         <LicensesPanel onClose={() => openPanel({ type: "settings" })} />
       ) : null}
+
+      <TooltipLayer resetKey={`${session?.id ?? ""}:${session?.status ?? ""}:${panel.type}`} />
     </div>
   );
 }

@@ -417,7 +417,7 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
 
     for (const stem of session.stems) {
       const ch = playback.channels.find((c) => c.id === stem.id);
-      const audible = stem.present && !!ch && !ch.muted && (!anySolo || ch.solo);
+      const audible = stem.present && !!ch && (anySolo ? ch.solo : !ch.muted);
       if (!audible || !ch) {
         levels.push({ id: stem.id, peak: 0 });
         continue;
@@ -1051,8 +1051,19 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
         const ch = playback.channels.find((c) => c.id === patch.id);
         if (ch) {
           if (patch.gainDb !== undefined) ch.gainDb = patch.gainDb;
-          if (patch.muted !== undefined) ch.muted = patch.muted;
-          if (patch.solo !== undefined) ch.solo = patch.solo;
+          if (patch.muted === true && patch.solo === true) {
+            ch.solo = true;
+            ch.muted = false;
+          } else {
+            if (patch.muted !== undefined) {
+              ch.muted = patch.muted;
+              if (patch.muted) ch.solo = false;
+            }
+            if (patch.solo !== undefined) {
+              ch.solo = patch.solo;
+              if (patch.solo) ch.muted = false;
+            }
+          }
           emit("playback:state", playback);
         }
         return null as Commands[K]["result"];

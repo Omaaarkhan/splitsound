@@ -12,6 +12,7 @@ import { formatBytes, formatImportedModelsNotice, formatModelMeta } from "../uti
 import { Checkbox } from "../components/primitives/Checkbox";
 import { DialogPanel } from "../components/primitives/DialogPanel";
 import { SelectMenu, type SelectOption } from "../components/primitives/SelectMenu";
+import { tip } from "../components/primitives/Tooltip";
 import "./SettingsPanel.css";
 
 interface SettingsPanelProps {
@@ -114,6 +115,13 @@ export function SettingsPanel({
                         : "console-key console-key--compact"
                     }
                     onClick={() => void updateSettings({ defaultQuality: q })}
+                    {...tip(q === "fast" ? "Fast quality" : "Best quality", {
+                      detail:
+                        q === "fast"
+                          ? "Uses the smaller model for quicker splits."
+                          : "Uses the larger model for cleaner separation.",
+                      placement: "top",
+                    })}
                   >
                     {q === "fast" ? "Fast" : "Best"}
                   </button>
@@ -124,7 +132,14 @@ export function SettingsPanel({
 
           {appInfo.gpu.available ? (
             <div className="settings-row">
-              <div className="settings-row__label">
+              <div
+                className="settings-row__label"
+                {...tip("Hardware acceleration", {
+                  detail:
+                    "Automatic picks the fastest backend for your computer. Choose Never to force CPU.",
+                  placement: "top",
+                })}
+              >
                 <span className="settings-row__name">Use the graphics processor</span>
                 {appInfo.gpu.name ? (
                   <span className="settings-row__sub">{appInfo.gpu.name}</span>
@@ -159,7 +174,14 @@ export function SettingsPanel({
           ) : null}
 
           <div className="settings-row">
-            <div className="settings-row__label">
+            <div
+              className="settings-row__label"
+              {...tip("CPU threads", {
+                detail:
+                  "How many processor cores splitting can use. Lower this if your computer feels sluggish while splitting.",
+                placement: "top",
+              })}
+            >
               <span className="settings-row__name">Processor threads</span>
             </div>
             <SelectMenu
@@ -232,6 +254,11 @@ export function SettingsPanel({
               type="button"
               className="console-key console-key--compact"
               onClick={() => void handleAddModelFiles()}
+              {...tip("Import models offline", {
+                detail:
+                  "Install verified model files you downloaded manually. Every file is checked by SHA-256.",
+                placement: "top",
+              })}
             >
               Add model files
             </button>
@@ -249,6 +276,11 @@ export function SettingsPanel({
               type="button"
               className="console-key console-key--compact"
               onClick={onRequestClearLibrary}
+              {...tip("Clear all saved songs", {
+                detail:
+                  "Removes all separated stems stored in SplitSound. Your original audio files are untouched.",
+                placement: "left",
+              })}
             >
               Clear library
             </button>

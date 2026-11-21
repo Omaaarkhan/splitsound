@@ -1,4 +1,5 @@
 import type { AppInfo, Session } from "../ipc/contract";
+import { formatModShortcut, tip } from "./primitives/Tooltip";
 import "./TopBar.css";
 
 interface TopBarProps {
@@ -20,6 +21,7 @@ export function TopBar({ platform, session, onGoHome, onOpenSettings }: TopBarPr
           className="wordmark"
           onClick={onGoHome}
           aria-label="SplitSound, return to library"
+          {...(session ? tip("Back to library", { placement: "bottom" }) : {})}
         >
           <span>Split</span>
           <svg
@@ -51,10 +53,23 @@ export function TopBar({ platform, session, onGoHome, onOpenSettings }: TopBarPr
           type="button"
           className={session ? "topbar__link" : "topbar__link topbar__link--active"}
           onClick={onGoHome}
+          {...tip("Library", {
+            detail: "View saved songs or drop a new audio file.",
+            placement: "bottom",
+          })}
         >
           Library
         </button>
-        <button type="button" className="topbar__link" onClick={onOpenSettings}>
+        <button
+          type="button"
+          className="topbar__link"
+          onClick={onOpenSettings}
+          {...tip("Settings", {
+            detail: "Quality defaults, models, library storage, and updates.",
+            shortcut: formatModShortcut(platform, ","),
+            placement: "bottom",
+          })}
+        >
           Settings
         </button>
       </nav>

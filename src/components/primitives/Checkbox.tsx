@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { TooltipAttrs } from "./Tooltip";
 import "./Checkbox.css";
 
 interface CheckboxProps {
@@ -6,11 +7,12 @@ interface CheckboxProps {
   onChange: (checked: boolean) => void;
   children: ReactNode;
   className?: string;
+  tooltip?: TooltipAttrs;
 }
 
-export function Checkbox({ checked, onChange, children, className }: CheckboxProps) {
+export function Checkbox({ checked, onChange, children, className, tooltip }: CheckboxProps) {
   return (
-    <label className={className ? `checkbox ${className}` : "checkbox"}>
+    <label className={className ? `checkbox ${className}` : "checkbox"} {...tooltip}>
       <input
         type="checkbox"
         className="checkbox__input"

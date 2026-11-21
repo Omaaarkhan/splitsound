@@ -1,6 +1,7 @@
 import type { DragEvent } from "react";
 import type { StemId } from "../../ipc/contract";
 import { stemName } from "../../utils/stems";
+import { tip } from "./Tooltip";
 import "./TapeLabel.css";
 
 interface TapeLabelProps {
@@ -48,12 +49,13 @@ export function TapeLabel({
         role="button"
         aria-label={`${name}. Drag into your DAW or a folder`}
         onDragStart={handleDragStart}
+        {...tip("Drag into a DAW or folder", {
+          detail: "Copies this stem as a WAV file.",
+          placement: "right",
+        })}
       >
         {name}
       </div>
-      <span className="tape__tip" role="tooltip">
-        Drag into your DAW or a folder
-      </span>
     </div>
   );
 }

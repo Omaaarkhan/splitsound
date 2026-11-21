@@ -104,13 +104,15 @@ describe("application stores", () => {
     expect(sessionStore.getState().current?.track.title).toBe("Late Take");
   });
 
-  it("updates solo and mute audibility accurately", async () => {
+  it("updates solo and mute audibility accurately and keeps them mutually exclusive", async () => {
     await openSongById("golden-hour");
     const before = playbackStore.getState().playback.channels;
     expect(before.every((c) => isChannelAudible(c, before))).toBe(true);
 
+    // Soloing drums silences vocals
     await toggleChannelSolo("drums");
     const soloed = playbackStore.getState().playback.channels;
+    expect(soloed.find((c) => c.id === "drums")).toMatchObject({ solo: true, muted: false });
     expect(
       isChannelAudible(
         soloed.find((c) => c.id === "drums"),
@@ -124,12 +126,56 @@ describe("application stores", () => {
       ),
     ).toBe(false);
 
+    // Muting drums clears solo on drums and makes vocals audible again
     await toggleChannelMute("drums");
-    const mutedSolo = playbackStore.getState().playback.channels;
+    const muted = playbackStore.getState().playback.channels;
+    expect(muted.find((c) => c.id === "drums")).toMatchObject({ solo: false, muted: true });
     expect(
       isChannelAudible(
-        mutedSolo.find((c) => c.id === "drums"),
-        mutedSolo,
+        muted.find((c) => c.id === "drums"),
+        muted,
+      ),
+    ).toBe(false);
+    expect(
+      isChannelAudible(
+        muted.find((c) => c.id === "vocals"),
+        muted,
+      ),
+    ).toBe(true);
+
+    // Soloing drums again clears mute on drums
+    await toggleChannelSolo("drums");
+    const resoled = playbackStore.getState().playback.channels;
+    expect(resoled.find((c) => c.id === "drums")).toMatchObject({ solo: true, muted: false });
+
+    // With drums and vocals both soloed, muting drums keeps vocals soloed
+    await toggleChannelSolo("vocals");
+    await toggleChannelMute("drums");
+    const twoSoloThenMute = playbackStore.getState().playback.channels;
+    expect(twoSoloThenMute.find((c) => c.id === "drums")).toMatchObject({
+      solo: false,
+      muted: true,
+    });
+    expect(twoSoloThenMute.find((c) => c.id === "vocals")).toMatchObject({
+      solo: true,
+      muted: false,
+    });
+    expect(
+      isChannelAudible(
+        twoSoloThenMute.find((c) => c.id === "drums"),
+        twoSoloThenMute,
+      ),
+    ).toBe(false);
+    expect(
+      isChannelAudible(
+        twoSoloThenMute.find((c) => c.id === "vocals"),
+        twoSoloThenMute,
+      ),
+    ).toBe(true);
+    expect(
+      isChannelAudible(
+        twoSoloThenMute.find((c) => c.id === "bass"),
+        twoSoloThenMute,
       ),
     ).toBe(false);
   });

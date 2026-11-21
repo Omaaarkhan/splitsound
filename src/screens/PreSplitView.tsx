@@ -14,6 +14,7 @@ import {
 } from "../utils/format";
 import { SPLIT_MODE_LABELS, SPLIT_MODES_ORDER, stemName } from "../utils/stems";
 import { TapeSlivers } from "../components/primitives/TapeSlivers";
+import { tip } from "../components/primitives/Tooltip";
 import {
   LoopWash,
   PlayheadLine,
@@ -22,6 +23,32 @@ import {
   WaveformCanvas,
 } from "../components/WaveformWell";
 import "./PreSplitView.css";
+
+const MODE_TIPS: Record<SplitMode, { title: string; detail: string }> = {
+  vocals: {
+    title: "2 stems",
+    detail: "Separates vocals from the backing track.",
+  },
+  band: {
+    title: "4 stems",
+    detail: "Separates vocals, drums, bass, and everything else.",
+  },
+  all: {
+    title: "6 stems",
+    detail: "Adds separate guitar and piano stems alongside vocals, drums, bass, and other.",
+  },
+};
+
+const QUALITY_TIPS: Record<Quality, { title: string; detail: string }> = {
+  fast: {
+    title: "Fast quality",
+    detail: "Quicker split using the lighter model. Good for previews.",
+  },
+  best: {
+    title: "Best quality",
+    detail: "Takes longer using the larger model for cleaner separation and less bleed.",
+  },
+};
 
 interface PreSplitViewProps {
   session: Session;
@@ -133,6 +160,10 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
                     <li
                       key={`${det.family}-${det.label}`}
                       className={`detection stem-${det.family}`}
+                      {...tip(det.label, {
+                        detail: `Lands in ${stemName(det.family)} · detection strength ${segments} of 5.`,
+                        placement: "right",
+                      })}
                     >
                       <span className="detection__swatch" aria-hidden="true" />
                       <span className="detection__name">{det.label}</span>
@@ -171,6 +202,10 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
                     aria-checked={selected}
                     className={selected ? "mode-row mode-row--selected" : "mode-row"}
                     onClick={() => setSplitMode(mode)}
+                    {...tip(MODE_TIPS[mode].title, {
+                      detail: MODE_TIPS[mode].detail,
+                      placement: "right",
+                    })}
                   >
                     <span className="mode-row__lamp" aria-hidden="true" />
                     <span className="mode-row__content">
@@ -204,6 +239,10 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
                     aria-checked={active}
                     className={active ? "console-key console-key--selected" : "console-key"}
                     onClick={() => setSplitQuality(q)}
+                    {...tip(QUALITY_TIPS[q].title, {
+                      detail: QUALITY_TIPS[q].detail,
+                      placement: "right",
+                    })}
                   >
                     {q === "fast" ? "Fast" : "Best"}
                   </button>

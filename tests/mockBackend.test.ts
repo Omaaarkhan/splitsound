@@ -205,4 +205,30 @@ describe("mock backend state machine", () => {
       code: "offline",
     });
   });
+
+  it("keeps solo and mute mutually exclusive in playback_set_channel", async () => {
+    backend = createMockBackend({ timeScale: 0.01 });
+    let latestState = await backend.invoke("playback_load", { sessionId: "golden-hour" });
+    await backend.listen("playback:state", (st) => {
+      latestState = st;
+    });
+
+    await backend.invoke("playback_set_channel", { id: "vocals", solo: true });
+    expect(latestState.channels.find((c) => c.id === "vocals")).toMatchObject({
+      solo: true,
+      muted: false,
+    });
+
+    await backend.invoke("playback_set_channel", { id: "vocals", muted: true });
+    expect(latestState.channels.find((c) => c.id === "vocals")).toMatchObject({
+      solo: false,
+      muted: true,
+    });
+
+    await backend.invoke("playback_set_channel", { id: "vocals", solo: true });
+    expect(latestState.channels.find((c) => c.id === "vocals")).toMatchObject({
+      solo: true,
+      muted: false,
+    });
+  });
 });

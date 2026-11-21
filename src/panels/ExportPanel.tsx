@@ -11,6 +11,7 @@ import { Checkbox } from "../components/primitives/Checkbox";
 import { DialogPanel } from "../components/primitives/DialogPanel";
 import { SelectMenu } from "../components/primitives/SelectMenu";
 import { TapeLabel } from "../components/primitives/TapeLabel";
+import { tip } from "../components/primitives/Tooltip";
 import "./ExportPanel.css";
 
 interface ExportPanelProps {
@@ -120,7 +121,15 @@ export function ExportPanel({ session, onClose }: ExportPanelProps) {
         </div>
 
         <div className="export-row">
-          <span className="export-group__label">Format</span>
+          <span
+            className="export-group__label"
+            {...tip("Audio format", {
+              detail: "WAV and FLAC are lossless. MP3 is smaller and easier to share.",
+              placement: "top",
+            })}
+          >
+            Format
+          </span>
           <SelectMenu
             label="Export format"
             value={format}
@@ -129,14 +138,25 @@ export function ExportPanel({ session, onClose }: ExportPanelProps) {
           />
         </div>
 
-        <Checkbox checked={includeMixdown} onChange={setIncludeMixdown}>
+        <Checkbox
+          checked={includeMixdown}
+          onChange={setIncludeMixdown}
+          tooltip={tip("Custom mixdown", {
+            detail:
+              "Saves one extra combined file using your current solo, mute, and volume faders.",
+            placement: "top",
+          })}
+        >
           Also export one file with these stems mixed at the current levels
         </Checkbox>
 
         <div className="export-group">
           <span className="export-group__label">Destination folder</span>
           <div className="export-folder">
-            <div className="export-folder__path" title={destinationDir}>
+            <div
+              className="export-folder__path"
+              {...tip("Export folder", { detail: destinationDir, placement: "top" })}
+            >
               {destinationDir}
             </div>
             <button type="button" className="console-key" onClick={() => void handleChangeDir()}>

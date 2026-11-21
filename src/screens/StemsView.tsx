@@ -18,6 +18,7 @@ import { formatDb, formatElapsed } from "../utils/format";
 import { sortStemsForDisplay, stemName, stemNameLower } from "../utils/stems";
 import { Fader } from "../components/primitives/Fader";
 import { TapeLabel } from "../components/primitives/TapeLabel";
+import { tip } from "../components/primitives/Tooltip";
 import { MeterBar } from "../components/MeterBar";
 import {
   LoopWash,
@@ -100,13 +101,14 @@ export function StemsView({ session }: StemsViewProps) {
       <aside className="stems-strip" aria-label="Stem mixer">
         <div className="stems-strip__head">{stripHeader}</div>
 
-        {presentStems.map((stem) => {
+        {presentStems.map((stem, idx) => {
           const ch = playback.channels.find((c) => c.id === stem.id);
           const solo = ch?.solo ?? false;
           const muted = ch?.muted ?? false;
           const gainDb = ch?.gainDb ?? 0;
           const lower = stemNameLower(stem.id);
           const heardText = stem.contains.map((d) => d.label).join(", ");
+          const shortcutNum = idx < 6 ? String(idx + 1) : undefined;
 
           return (
             <div
@@ -119,7 +121,12 @@ export function StemsView({ session }: StemsViewProps) {
                 onStartDragOut={() => void handleDragOut(stem.id)}
               />
 
-              <div className="ch__heard" title={heardText || undefined}>
+              <div
+                className="ch__heard"
+                {...(heardText
+                  ? tip("Heard in this stem", { detail: heardText, placement: "right" })
+                  : {})}
+              >
                 {heardText}
               </div>
 
@@ -130,6 +137,13 @@ export function StemsView({ session }: StemsViewProps) {
                   aria-label={`Solo ${lower}`}
                   aria-pressed={solo}
                   onClick={() => void toggleChannelSolo(stem.id)}
+                  {...tip(solo ? `Stop soloing ${lower}` : `Solo ${lower}`, {
+                    detail: solo
+                      ? "Return to hearing all unmuted stems."
+                      : "Listen to only this stem. You can solo more than one at once.",
+                    shortcut: shortcutNum,
+                    placement: "top",
+                  })}
                 >
                   S
                 </button>
@@ -139,6 +153,13 @@ export function StemsView({ session }: StemsViewProps) {
                   aria-label={`Mute ${lower}`}
                   aria-pressed={muted}
                   onClick={() => void toggleChannelMute(stem.id)}
+                  {...tip(muted ? `Unmute ${lower}` : `Mute ${lower}`, {
+                    detail: muted
+                      ? "Bring this stem back into the mix."
+                      : "Silence this stem while the others keep playing.",
+                    shortcut: shortcutNum ? `Shift+${shortcutNum}` : undefined,
+                    placement: "top",
+                  })}
                 >
                   M
                 </button>
@@ -147,8 +168,21 @@ export function StemsView({ session }: StemsViewProps) {
                   valueDb={gainDb}
                   label={`${stemName(stem.id)} level`}
                   onChange={(db) => void setChannelGain(stem.id, db)}
+                  tooltip={tip(`${stemName(stem.id)} volume`, {
+                    detail:
+                      "Adjust loudness for listening and mixdown export. Double-click to reset to 0 dB.",
+                    placement: "top",
+                  })}
                 />
-                <span className="ch__db">{formatDb(gainDb)}</span>
+                <span
+                  className="ch__db"
+                  {...tip(`Level: ${formatDb(gainDb)} dB`, {
+                    detail: "0.0 dB is the original volume. Double-click the slider to reset.",
+                    placement: "top",
+                  })}
+                >
+                  {formatDb(gainDb)}
+                </span>
               </div>
 
               <MeterBar stemId={stem.id} />
@@ -157,7 +191,14 @@ export function StemsView({ session }: StemsViewProps) {
         })}
 
         {absentStems.map((stem) => (
-          <div key={stem.id} className={`ch ch--absent stem-${stem.id}`}>
+          <div
+            key={stem.id}
+            className={`ch ch--absent stem-${stem.id}`}
+            {...tip(`Nothing heard in ${stemNameLower(stem.id)}`, {
+              detail: "This stem is essentially silent in this song.",
+              placement: "right",
+            })}
+          >
             <TapeLabel stemId={stem.id} size="absent" />
             <div className="ch__heard">None heard in this song</div>
           </div>

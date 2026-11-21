@@ -10,8 +10,10 @@ import {
   toggleLoop,
   togglePlayback,
 } from "../stores/playbackStore";
-import { formatTime, formatTimeTenths } from "../utils/format";
+import { settingsStore } from "../stores/settingsStore";
+import { formatDb, formatTime, formatTimeTenths } from "../utils/format";
 import { Fader } from "./primitives/Fader";
+import { formatModShortcut, tip } from "./primitives/Tooltip";
 import "./TransportBar.css";
 
 interface TransportBarProps {
@@ -21,10 +23,16 @@ interface TransportBarProps {
 
 export function TransportBar({ session, onOpenExport }: TransportBarProps) {
   const { playback } = useStore(playbackStore);
+  const { appInfo } = useStore(settingsStore);
   const posRef = useRef<HTMLSpanElement | null>(null);
 
   const isReady = session.status === "ready";
   const durationSec = playback.durationSec || session.track.durationSec;
+  const masterTip = tip(`Master volume (${formatDb(playback.masterGainDb)} dB)`, {
+    detail:
+      "Overall volume for listening and mixdown export. Double-click to reset to 0 dB. Individual stem exports keep their original level.",
+    placement: "top",
+  });
 
   useEffect(() => {
     const syncText = () => {
@@ -59,6 +67,11 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
         className="transport__play"
         aria-label={playback.playing ? "Pause" : "Play"}
         onClick={() => void togglePlayback()}
+        {...tip(playback.playing ? "Pause" : "Play", {
+          detail: "Left and Right arrows jump 5 seconds. Home jumps to the start.",
+          shortcut: "Space",
+          placement: "top",
+        })}
       >
         {playback.playing ? (
           <svg
@@ -94,6 +107,12 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
         className={playback.loop ? "console-key console-key--selected" : "console-key"}
         aria-pressed={playback.loop !== null}
         onClick={() => void toggleLoop()}
+        {...tip(playback.loop ? "Turn off loop" : "Loop playback", {
+          detail: playback.loop
+            ? `Looping ${formatTime(playback.loop.startSec)} to ${formatTime(playback.loop.endSec)}. Drag handles on the timeline to resize.`
+            : "Repeats the whole song, or drag across the timeline above to loop a section.",
+          placement: "top",
+        })}
       >
         Loop
       </button>
@@ -106,6 +125,13 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
           }
           aria-pressed={playback.source === "original"}
           onClick={() => void toggleHearOriginal()}
+          {...tip(playback.source === "original" ? "Return to stems" : "Hear original", {
+            detail:
+              playback.source === "original"
+                ? "Switch back from the original song to your separated stems."
+                : "Temporarily switch to the untouched song to compare against your stems.",
+            placement: "top",
+          })}
         >
           Hear original
         </button>
@@ -113,17 +139,27 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
 
       <div className="transport__spacer" />
 
-      <div className="transport__master">
+      <div className="transport__master" {...masterTip}>
         <span>Master</span>
         <Fader
           valueDb={playback.masterGainDb}
           label="Master level"
           onChange={(db) => void setMasterGain(db)}
+          tooltip={masterTip}
         />
       </div>
 
       {isReady ? (
-        <button type="button" className="primary-btn" onClick={onOpenExport}>
+        <button
+          type="button"
+          className="primary-btn"
+          onClick={onOpenExport}
+          {...tip("Export stems", {
+            detail: "Save individual stems or a custom mixdown as WAV, FLAC, or MP3.",
+            shortcut: formatModShortcut(appInfo.platform, "E"),
+            placement: "top",
+          })}
+        >
           Export stems
         </button>
       ) : null}

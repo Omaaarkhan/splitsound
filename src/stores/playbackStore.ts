@@ -122,9 +122,8 @@ export function isChannelAudible(
   channels: readonly ChannelState[],
 ): boolean {
   if (!channel) return true;
-  if (channel.muted) return false;
   const anySolo = channels.some((c) => c.solo);
-  return !anySolo || channel.solo;
+  return anySolo ? channel.solo : !channel.muted;
 }
 
 export async function loadPlaybackSession(sessionId: string): Promise<PlaybackState> {
@@ -191,28 +190,36 @@ export async function toggleChannelSolo(id: SourceId): Promise<void> {
   const ch = playbackStore.getState().playback.channels.find((c) => c.id === id);
   if (!ch) return;
   const solo = !ch.solo;
+  const muted = solo ? false : ch.muted;
   playbackStore.setState((prev) => ({
     ...prev,
     playback: {
       ...prev.playback,
-      channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, solo } : c)),
+      channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, solo, muted } : c)),
     },
   }));
-  await invoke("playback_set_channel", { id, solo });
+  await invoke(
+    "playback_set_channel",
+    solo ? { id, solo: true, muted: false } : { id, solo: false },
+  );
 }
 
 export async function toggleChannelMute(id: SourceId): Promise<void> {
   const ch = playbackStore.getState().playback.channels.find((c) => c.id === id);
   if (!ch) return;
   const muted = !ch.muted;
+  const solo = muted ? false : ch.solo;
   playbackStore.setState((prev) => ({
     ...prev,
     playback: {
       ...prev.playback,
-      channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, muted } : c)),
+      channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, muted, solo } : c)),
     },
   }));
-  await invoke("playback_set_channel", { id, muted });
+  await invoke(
+    "playback_set_channel",
+    muted ? { id, muted: true, solo: false } : { id, muted: false },
+  );
 }
 
 export async function setMasterGain(gainDb: number): Promise<void> {

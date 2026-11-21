@@ -4,6 +4,7 @@ import { getInterpolatedPositionSec, subscribePlaybackTicks } from "../stores/pl
 import { formatTime, rulerTickInterval } from "../utils/format";
 import { STEM_CSS_VAR } from "../utils/stems";
 import { decodePeaks, drawWaveform, drawWaveformRibbons, resolveCssColor } from "../utils/waveform";
+import { tip } from "./primitives/Tooltip";
 import "./WaveformWell.css";
 
 interface LoopRange {
@@ -211,6 +212,10 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      {...tip("Timeline", {
+        detail: "Click to jump, or drag across to loop a section.",
+        placement: "bottom",
+      })}
     >
       {ticks.map((t) => (
         <span key={t.sec} className="ruler__tick" aria-hidden="true">
@@ -235,6 +240,10 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
             onPointerUp={handlePointerUp}
             onPointerCancel={handlePointerUp}
             onKeyDown={handleEdgeKeyDown("start")}
+            {...tip(`Loop start (${formatTime(loop.startSec)})`, {
+              detail: "Drag or use arrow keys to adjust.",
+              placement: "bottom",
+            })}
           />
           <div
             ref={endHandleRef}
@@ -254,6 +263,10 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
             onPointerUp={handlePointerUp}
             onPointerCancel={handlePointerUp}
             onKeyDown={handleEdgeKeyDown("end")}
+            {...tip(`Loop end (${formatTime(loop.endSec)})`, {
+              detail: "Drag or use arrow keys to adjust.",
+              placement: "bottom",
+            })}
           />
         </>
       ) : null}
