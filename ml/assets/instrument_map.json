@@ -1,0 +1,446 @@
+{
+  "schemaVersion": 1,
+  "description": "Curated map from AudioSet class index (position in the tagger's 527 outputs) to an instrument label and the stem family it belongs to. Classes not listed are not instruments and must be ignored. 'audioset' repeats the AudioSet display name for review. 'generic': true marks umbrella classes (e.g. Guitar) that have more specific classes in this map; a UI may hide a generic class when one of its specific classes is also detected. 'threshold' applies to the max-over-windows probability when the tagger is run on a SEPARATED STEM (the recommended use; only consider classes whose family can live in that stem). 'mixThreshold' applies when it is run on the full mix, where instrument probabilities are much lower and recall is poor; see CONTRACT.md section 3. 'parent' is the index of the umbrella class a class belongs to; an umbrella is hidden when something under it is detected. Parts of a drum kit and playing techniques are deliberately not listed.",
+  "families": [
+    "vocals",
+    "drums",
+    "bass",
+    "guitar",
+    "piano",
+    "other"
+  ],
+  "threshold": 0.1,
+  "mixThreshold": 0.05,
+  "classes": {
+    "27": {
+      "label": "Singing",
+      "family": "vocals",
+      "audioset": "Singing",
+      "generic": true
+    },
+    "28": {
+      "label": "Choir",
+      "family": "vocals",
+      "audioset": "Choir"
+    },
+    "32": {
+      "label": "Male vocals",
+      "family": "vocals",
+      "audioset": "Male singing"
+    },
+    "33": {
+      "label": "Female vocals",
+      "family": "vocals",
+      "audioset": "Female singing"
+    },
+    "34": {
+      "label": "Child vocals",
+      "family": "vocals",
+      "audioset": "Child singing"
+    },
+    "35": {
+      "label": "Synthetic vocals",
+      "family": "vocals",
+      "audioset": "Synthetic singing"
+    },
+    "36": {
+      "label": "Rap",
+      "family": "vocals",
+      "audioset": "Rapping"
+    },
+    "37": {
+      "label": "Humming",
+      "family": "vocals",
+      "audioset": "Humming"
+    },
+    "40": {
+      "label": "Whistling",
+      "family": "other",
+      "audioset": "Whistling"
+    },
+    "62": {
+      "label": "Finger snaps",
+      "family": "drums",
+      "audioset": "Finger snapping"
+    },
+    "63": {
+      "label": "Hand claps",
+      "family": "drums",
+      "audioset": "Clapping"
+    },
+    "92": {
+      "label": "Cowbell",
+      "family": "drums",
+      "audioset": "Cowbell"
+    },
+    "139": {
+      "label": "Plucked strings",
+      "family": "guitar",
+      "audioset": "Plucked string instrument",
+      "generic": true
+    },
+    "140": {
+      "label": "Guitar",
+      "family": "guitar",
+      "audioset": "Guitar",
+      "generic": true
+    },
+    "141": {
+      "label": "Electric guitar",
+      "family": "guitar",
+      "audioset": "Electric guitar"
+    },
+    "142": {
+      "label": "Bass guitar",
+      "family": "bass",
+      "audioset": "Bass guitar"
+    },
+    "143": {
+      "label": "Acoustic guitar",
+      "family": "guitar",
+      "audioset": "Acoustic guitar"
+    },
+    "144": {
+      "label": "Slide guitar",
+      "family": "guitar",
+      "audioset": "Steel guitar, slide guitar"
+    },
+    "147": {
+      "label": "Banjo",
+      "family": "guitar",
+      "audioset": "Banjo"
+    },
+    "148": {
+      "label": "Sitar",
+      "family": "other",
+      "audioset": "Sitar"
+    },
+    "149": {
+      "label": "Mandolin",
+      "family": "guitar",
+      "audioset": "Mandolin"
+    },
+    "150": {
+      "label": "Zither",
+      "family": "other",
+      "audioset": "Zither"
+    },
+    "151": {
+      "label": "Ukulele",
+      "family": "guitar",
+      "audioset": "Ukulele"
+    },
+    "152": {
+      "label": "Keyboard",
+      "family": "piano",
+      "audioset": "Keyboard (musical)",
+      "generic": true
+    },
+    "153": {
+      "label": "Piano",
+      "family": "piano",
+      "audioset": "Piano"
+    },
+    "154": {
+      "label": "Electric piano",
+      "family": "piano",
+      "audioset": "Electric piano"
+    },
+    "155": {
+      "label": "Organ",
+      "family": "other",
+      "audioset": "Organ",
+      "generic": true
+    },
+    "156": {
+      "label": "Electronic organ",
+      "family": "other",
+      "audioset": "Electronic organ",
+      "parent": 155
+    },
+    "157": {
+      "label": "Hammond organ",
+      "family": "other",
+      "audioset": "Hammond organ",
+      "parent": 155
+    },
+    "158": {
+      "label": "Synthesizer",
+      "family": "other",
+      "audioset": "Synthesizer"
+    },
+    "159": {
+      "label": "Sampler",
+      "family": "other",
+      "audioset": "Sampler"
+    },
+    "160": {
+      "label": "Harpsichord",
+      "family": "other",
+      "audioset": "Harpsichord"
+    },
+    "161": {
+      "label": "Percussion",
+      "family": "drums",
+      "audioset": "Percussion",
+      "generic": true
+    },
+    "162": {
+      "label": "Drum kit",
+      "family": "drums",
+      "audioset": "Drum kit"
+    },
+    "163": {
+      "label": "Drum machine",
+      "family": "drums",
+      "audioset": "Drum machine"
+    },
+    "164": {
+      "label": "Drum",
+      "family": "drums",
+      "audioset": "Drum",
+      "generic": true
+    },
+    "169": {
+      "label": "Timpani",
+      "family": "drums",
+      "audioset": "Timpani"
+    },
+    "170": {
+      "label": "Tabla",
+      "family": "drums",
+      "audioset": "Tabla"
+    },
+    "173": {
+      "label": "Wood block",
+      "family": "drums",
+      "audioset": "Wood block"
+    },
+    "174": {
+      "label": "Tambourine",
+      "family": "drums",
+      "audioset": "Tambourine"
+    },
+    "175": {
+      "label": "Shaker",
+      "family": "drums",
+      "audioset": "Rattle (instrument)"
+    },
+    "176": {
+      "label": "Maracas",
+      "family": "drums",
+      "audioset": "Maraca"
+    },
+    "177": {
+      "label": "Gong",
+      "family": "drums",
+      "audioset": "Gong"
+    },
+    "178": {
+      "label": "Tubular bells",
+      "family": "other",
+      "audioset": "Tubular bells"
+    },
+    "179": {
+      "label": "Mallet percussion",
+      "family": "other",
+      "audioset": "Mallet percussion",
+      "generic": true
+    },
+    "180": {
+      "label": "Marimba / xylophone",
+      "family": "other",
+      "audioset": "Marimba, xylophone",
+      "parent": 179
+    },
+    "181": {
+      "label": "Glockenspiel",
+      "family": "other",
+      "audioset": "Glockenspiel",
+      "parent": 179
+    },
+    "182": {
+      "label": "Vibraphone",
+      "family": "other",
+      "audioset": "Vibraphone",
+      "parent": 179
+    },
+    "183": {
+      "label": "Steelpan",
+      "family": "other",
+      "audioset": "Steelpan",
+      "parent": 179
+    },
+    "184": {
+      "label": "Orchestra",
+      "family": "other",
+      "audioset": "Orchestra",
+      "generic": true
+    },
+    "185": {
+      "label": "Brass",
+      "family": "other",
+      "audioset": "Brass instrument",
+      "generic": true,
+      "parent": 184
+    },
+    "186": {
+      "label": "French horn",
+      "family": "other",
+      "audioset": "French horn",
+      "parent": 185
+    },
+    "187": {
+      "label": "Trumpet",
+      "family": "other",
+      "audioset": "Trumpet",
+      "parent": 185
+    },
+    "188": {
+      "label": "Trombone",
+      "family": "other",
+      "audioset": "Trombone",
+      "parent": 185
+    },
+    "189": {
+      "label": "Bowed strings",
+      "family": "other",
+      "audioset": "Bowed string instrument",
+      "generic": true,
+      "parent": 184
+    },
+    "190": {
+      "label": "String section",
+      "family": "other",
+      "audioset": "String section",
+      "parent": 189
+    },
+    "191": {
+      "label": "Violin",
+      "family": "other",
+      "audioset": "Violin, fiddle",
+      "parent": 189
+    },
+    "192": {
+      "label": "Pizzicato strings",
+      "family": "other",
+      "audioset": "Pizzicato",
+      "parent": 189
+    },
+    "193": {
+      "label": "Cello",
+      "family": "other",
+      "audioset": "Cello",
+      "parent": 189
+    },
+    "194": {
+      "label": "Double bass",
+      "family": "bass",
+      "audioset": "Double bass"
+    },
+    "195": {
+      "label": "Woodwind",
+      "family": "other",
+      "audioset": "Wind instrument, woodwind instrument",
+      "generic": true,
+      "parent": 184
+    },
+    "196": {
+      "label": "Flute",
+      "family": "other",
+      "audioset": "Flute",
+      "parent": 195
+    },
+    "197": {
+      "label": "Saxophone",
+      "family": "other",
+      "audioset": "Saxophone",
+      "parent": 195
+    },
+    "198": {
+      "label": "Clarinet",
+      "family": "other",
+      "audioset": "Clarinet",
+      "parent": 195
+    },
+    "199": {
+      "label": "Harp",
+      "family": "other",
+      "audioset": "Harp"
+    },
+    "200": {
+      "label": "Bell",
+      "family": "other",
+      "audioset": "Bell",
+      "generic": true
+    },
+    "201": {
+      "label": "Church bell",
+      "family": "other",
+      "audioset": "Church bell",
+      "parent": 200
+    },
+    "202": {
+      "label": "Sleigh bells",
+      "family": "drums",
+      "audioset": "Jingle bell"
+    },
+    "205": {
+      "label": "Chimes",
+      "family": "other",
+      "audioset": "Chime",
+      "parent": 200
+    },
+    "206": {
+      "label": "Wind chimes",
+      "family": "other",
+      "audioset": "Wind chime",
+      "parent": 200
+    },
+    "208": {
+      "label": "Harmonica",
+      "family": "other",
+      "audioset": "Harmonica"
+    },
+    "209": {
+      "label": "Accordion",
+      "family": "other",
+      "audioset": "Accordion"
+    },
+    "210": {
+      "label": "Bagpipes",
+      "family": "other",
+      "audioset": "Bagpipes"
+    },
+    "211": {
+      "label": "Didgeridoo",
+      "family": "other",
+      "audioset": "Didgeridoo"
+    },
+    "212": {
+      "label": "Shofar",
+      "family": "other",
+      "audioset": "Shofar"
+    },
+    "213": {
+      "label": "Theremin",
+      "family": "other",
+      "audioset": "Theremin"
+    },
+    "214": {
+      "label": "Singing bowl",
+      "family": "other",
+      "audioset": "Singing bowl"
+    },
+    "215": {
+      "label": "Turntable scratching",
+      "family": "other",
+      "audioset": "Scratching (performance technique)"
+    },
+    "218": {
+      "label": "Beatboxing",
+      "family": "vocals",
+      "audioset": "Beatboxing"
+    }
+  }
+}

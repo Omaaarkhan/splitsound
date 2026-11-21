@@ -1,0 +1,171 @@
+name: CI
+
+# Checks every change. Also called by the release workflow before it builds.
+#
+# The three-platform installer build is expensive (macOS minutes cost ten times
+# Linux ones on a private repository), so on pull requests it only runs when
+# the pull request carries the "full-build" label.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      installers:
+        description: Also build the installers for every platform
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      installers:
+        description: Also build the installers for every platform
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  web:
+    name: Interface
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  rust:
+    name: Engine and shell
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libasound2-dev patchelf
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Fetch ONNX Runtime (pinned, checksummed)
+        run: node scripts/fetch-onnxruntime.mjs
+      - name: Stand in for the built interface
+        # The shell embeds the interface at compile time; an empty page is enough to compile and test.
+        run: mkdir -p dist && echo '<!doctype html><title>SplitSound</title>' > dist/index.html
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --no-fail-fast
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_DENY_VERSION: "0.22.0"
+      CARGO_DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install cargo-deny (pinned, checksummed)
+        run: |
+          set -euo pipefail
+          archive="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${archive}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/cargo-deny.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/${archive}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+      - name: Rust advisories, licences and sources
+        run: cargo deny --locked check
+      - name: npm advisories (what ships in the app)
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: npm advisories (build and signing tools)
+        run: npm audit --audit-level=high
+      - name: Lockfile only uses the npm registry
+        run: node scripts/check-lockfile.mjs
+      - name: Workflows pin every action to a commit
+        run: node scripts/check-workflows.mjs
+
+  installers:
+    name: Installers
+    if: >-
+      inputs.installers == true ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-build'))
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  rehearsal:
+    name: Release rehearsal
+    # Everything the release workflow does after building, except publishing:
+    # sign the updater files, write the update manifest and the checksums.
+    #
+    # This job runs code from the pull request, so it must never see the real
+    # signing key. It makes a throwaway key instead: the signatures prove the
+    # steps work, and are worthless to anyone else.
+    needs: installers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: installers-*
+          path: release
+          merge-multiple: true
+      - name: Install the signing tool
+        run: npm ci --ignore-scripts
+      - name: Sign with a throwaway key, write the update manifest and checksums
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tauri signer generate --ci --write-keys "$RUNNER_TEMP/rehearsal.key" --password rehearsal > /dev/null
+          export TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/rehearsal.key")"
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=rehearsal
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          node scripts/prepare-release.mjs --dir release --version "$version" --repo "$GITHUB_REPOSITORY" --tag "v$version"
+          ls -l release
+          test -s release/latest.json
+          (cd release && sha256sum --check --quiet SHA256SUMS.txt)

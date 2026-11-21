@@ -1,0 +1,131 @@
+name: Build installers
+
+# Builds and tests the app on every platform and hands the installers back as
+# workflow artifacts. Called by CI (to prove a change still builds) and by the
+# release workflow.
+#
+# Deliberately has no secrets and a read-only token: this job runs the build
+# scripts of every dependency, so it is given nothing worth stealing. Signing
+# and publishing happen afterwards in the release workflow.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to stamp into the app. Empty keeps the development version.
+        type: string
+        default: ""
+      cache:
+        description: Reuse cached build output. Releases build from scratch.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple silicon only: Microsoft no longer publishes ONNX Runtime for Intel Macs.
+          - id: macos-arm64
+            name: macOS (Apple silicon)
+            os: macos-15
+            onnxruntime: macos-arm64
+            rust-targets: ""
+            tauri-args: --bundles app,dmg
+            bundle-dir: target/release/bundle
+          - id: linux-x64
+            name: Linux (x64)
+            os: ubuntu-22.04
+            onnxruntime: linux-x64
+            rust-targets: ""
+            tauri-args: --bundles appimage,deb,rpm
+            bundle-dir: target/release/bundle
+          - id: windows-x64
+            name: Windows (x64)
+            os: windows-2025
+            onnxruntime: windows-x64
+            rust-targets: ""
+            tauri-args: --bundles nsis
+            bundle-dir: target/release/bundle
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libasound2-dev patchelf libfuse2 file
+
+      - name: Add Rust targets
+        if: matrix.rust-targets != ''
+        run: rustup target add ${{ matrix.rust-targets }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.cache
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: bundle-${{ matrix.id }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            bundle-${{ matrix.id }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - run: npm ci
+
+      - name: Fetch ONNX Runtime (pinned, checksummed)
+        run: node scripts/fetch-onnxruntime.mjs --target ${{ matrix.onnxruntime }}
+
+      - name: Stamp the version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: node scripts/set-version.mjs "$VERSION"
+
+      - name: Build the interface
+        run: npm run build
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Build installers
+        run: |
+          npm run tauri build -- ${{ matrix.tauri-args }} && exit 0
+          # Bundling downloads its own tools and can fail on a network blip.
+          # The compiled app is kept, so a second attempt only repeats bundling.
+          echo "::warning::Bundling failed; trying once more."
+          npm run tauri build -- ${{ matrix.tauri-args }}
+
+      - name: Collect installers
+        run: node scripts/collect-artifacts.mjs --bundle-dir "${{ matrix.bundle-dir }}" --platform "${{ matrix.id }}" --out release-artifacts
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installers-${{ matrix.id }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

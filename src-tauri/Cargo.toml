@@ -1,0 +1,47 @@
+[package]
+name = "splitsound-desktop"
+publish = false
+description = "SplitSound desktop shell: commands, split queue, session library, playback mixer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# The bundled app executable. `splitsound` is taken by the CLI crate in the
+# same workspace (same target dir), so the shell binary gets its own name.
+default-run = "splitsound-desktop"
+
+[lib]
+# Distinct from the binary name to avoid PDB name collisions on Windows.
+name = "splitsound_desktop_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "splitsound-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+splitsound-core = { path = "../crates/splitsound-core" }
+libloading = "0.9"
+ort-sys = { version = "=2.0.0-rc.15", default-features = false }
+tauri = { version = "2.12", features = [] }
+tauri-plugin-dialog = "2.8"
+tauri-plugin-opener = "2.7"
+tauri-plugin-updater = "2.14"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-window-state = "2.5"
+tauri-plugin-log = "2.10"
+# Native drag-out (CrabNebula). Wrapped by our own validating `drag` plugin
+# instead of tauri-plugin-drag, which accepts arbitrary paths from the webview.
+drag = { version = "2.1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+cpal = "0.18"
+rtrb = "0.4"
+memmap2 = "0.9"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }

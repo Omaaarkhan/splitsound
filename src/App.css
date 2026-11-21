@@ -1,0 +1,13 @@
+.app-shell {
+  width: 100%;
+  height: 100%;
+  background: var(--plate);
+  display: grid;
+  grid-template-rows: var(--topbar-height) 1fr;
+  overflow: hidden;
+  position: relative;
+}
+
+.app-shell--with-transport {
+  grid-template-rows: var(--topbar-height) 1fr var(--transport-height);
+}

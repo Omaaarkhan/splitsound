@@ -1,4 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#0891b2"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">S</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#40555F"/>
+      <stop offset="1" stop-color="#31434F"/>
+    </linearGradient>
+    <clipPath id="body"><rect x="100" y="100" width="824" height="824" rx="184"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#plate)"/>
+  <g clip-path="url(#body)">
+    <rect x="100" y="302" width="824" height="420" fill="#142028"/>
+    <rect x="100" y="302" width="824" height="10" fill="#0D151B"/>
+    <rect x="100" y="722" width="824" height="6" fill="#5A6F7C" opacity="0.55"/>
+  </g>
+  <rect x="103" y="103" width="818" height="818" rx="181" fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="6"/>
+  <polygon fill="#F3F0E6" points="178.0,362.0 630.0,362.0 330.0,662.0 178.0,662.0"/>
+  <polygon fill="#FE9CB8" points="670.0,362.0 846.0,362.0 846.0,410.8 621.2,410.8"/>
+  <polygon fill="#F9914D" points="607.2,424.8 846.0,424.8 846.0,473.6 558.4,473.6"/>
+  <polygon fill="#F4DA57" points="544.4,487.6 846.0,487.6 846.0,536.4 495.6,536.4"/>
+  <polygon fill="#6BDDB5" points="481.6,550.4 846.0,550.4 846.0,599.2 432.8,599.2"/>
+  <polygon fill="#67A1EB" points="418.8,613.2 846.0,613.2 846.0,662.0 370.0,662.0"/>
 </svg>

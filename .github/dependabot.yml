@@ -1,0 +1,105 @@
+# Weekly dependency updates.
+#
+# Every ecosystem waits out a cooldown: a new version is only proposed once it
+# has been public for a week (two for major versions). Most malicious or broken
+# releases are caught and pulled within days, so this keeps them out of the
+# app without slowing security fixes, which ignore the cooldown.
+#
+# Minor and patch updates arrive as one grouped pull request per ecosystem.
+# Major updates, and the few packages that need a human to look at them,
+# arrive on their own.
+
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: "deps(rust)"
+    groups:
+      rust:
+        applies-to: "version-updates"
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+        exclude-patterns:
+          # Must move together with the ONNX Runtime version pinned in
+          # scripts/fetch-onnxruntime.mjs.
+          - "ort"
+          - "ort-sys"
+          # Young crate, pinned exactly; an upgrade needs a source review.
+          - "opuscule"
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 6
+    commit-message:
+      prefix: "deps(web)"
+    groups:
+      web:
+        applies-to: "version-updates"
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+        exclude-patterns:
+          # The Tauri CLI builds the installers and signs the updates, so its
+          # updates come on their own and get a proper look.
+          - "@tauri-apps/cli"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(ci)"
+    groups:
+      actions:
+        applies-to: "version-updates"
+        patterns: ["*"]
+
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(rust)"
+
+  # The model export environment. Only maintainers run it, so monthly is enough.
+  - package-ecosystem: "uv"
+    directory: "/ml"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "deps(ml)"
+    groups:
+      ml:
+        applies-to: "version-updates"
+        patterns: ["*"]

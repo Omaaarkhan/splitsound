@@ -1,0 +1,23 @@
+# Check text out with LF line endings on every platform. Some files are pinned
+# by SHA-256 (the model manifest's tensor table and label files), so they must
+# be byte-identical on Windows too.
+* text=auto eol=lf
+
+# Never touch these.
+crates/splitsound-core/tests/fixtures/audio/** binary
+crates/splitsound-core/tests/fixtures/corrupt/** binary
+crates/splitsound-core/tests/fixtures/opus/** binary
+*.png binary
+*.icns binary
+*.ico binary
+*.wav binary
+*.flac binary
+*.mp3 binary
+*.opus binary
+*.ogg binary
+*.m4a binary
+*.aiff binary
+*.npy binary
+*.onnx binary
+*.zst binary
+*.woff2 binary

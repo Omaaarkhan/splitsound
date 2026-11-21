@@ -1,0 +1,74 @@
+[package]
+name = "splitsound-core"
+publish = false
+description = "SplitSound engine: decoding, stem separation, instrument detection, export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["mp3"]
+# MP3 export through LAME (LGPL), compiled from the source vendored inside
+# `mp3lame-sys` with `cc` alone. Turn the feature off to build without any
+# LGPL code; MP3 export then returns `unsupported_format`.
+mp3 = ["dep:mp3lame-encoder"]
+
+[dependencies]
+# Decoding. Pure Rust; MPL-2.0 (file-level copyleft, used unmodified).
+symphonia = { version = "0.6.1", default-features = false, features = [
+    "aac",
+    "aiff",
+    "alac",
+    "caf",
+    "flac",
+    "id3v1",
+    "id3v2",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "opt-simd",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+# Opus decoder: safe Rust (`#![forbid(unsafe_code)]`), no build script, no
+# runtime dependencies. Pinned exactly because the crate is young (first
+# published 2026-06) and little used, and by its own README was machine
+# translated from the C reference without line-by-line human review. Do not
+# bump it without reviewing the source diff and re-running
+# `tests/opus_parity.rs`, which compares it against libopus on real files.
+opuscule = "=0.2.2"
+
+# DSP
+rubato = "5.1"
+realfft = "3.5"
+
+# Inference. `load-dynamic`: the ONNX Runtime shared library is loaded at run
+# time from a path the caller supplies; nothing is downloaded at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "load-dynamic",
+    "api-22",
+    "coreml",
+] }
+
+# Model store
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+ruzstd = "0.9"
+# Reads the upstream PyTorch checkpoint (a zip of stored members). No
+# compression features: a compressed member is an error, which also rules
+# out decompression bombs. Pinned to a release that has been public for a
+# few weeks; this crate publishes almost daily.
+zip = { version = "=9.1.3", default-features = false }
+sha2 = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Files
+memmap2 = "0.9"
+flacenc = { version = "0.5", default-features = false }
+mp3lame-encoder = { version = "0.3", optional = true }
+
+thiserror = "2"

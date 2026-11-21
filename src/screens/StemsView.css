@@ -1,0 +1,184 @@
+.stems-desk {
+  display: grid;
+  grid-template-columns: var(--strip-width) 1fr;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.stems-strip {
+  display: grid;
+  grid-template-rows: var(--desk-rows);
+  border-right: 1px solid var(--well-deep);
+  background: var(--plate);
+  min-height: 0;
+}
+
+.stems-strip__head {
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-6);
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ch {
+  position: relative;
+  padding: 12px 22px 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+}
+
+.ch:last-child {
+  border-bottom: 0;
+}
+
+.ch__heard {
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+  padding-top: var(--space-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ch__ctl {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.ch__key {
+  width: 28px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-key);
+  border: 0;
+  background: var(--plate-hi);
+  color: var(--ink-2);
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: var(--text-xs);
+  line-height: 1;
+  box-shadow: var(--edge-raised);
+  transition:
+    background var(--dur-press) var(--ease-out),
+    color var(--dur-press) var(--ease-out),
+    transform var(--dur-press) var(--ease-out);
+}
+
+.ch__key:hover {
+  background: var(--plate-top);
+  color: var(--ink);
+}
+
+.ch__key:active {
+  background: var(--plate-lo);
+  box-shadow: inset 0 1px 0 var(--well-deep);
+  transform: translateY(1px);
+}
+
+.ch__key:focus-visible {
+  box-shadow: var(--edge-raised), var(--focus-ring);
+}
+
+.ch__key--solo-on {
+  background: var(--lamp);
+  color: var(--marker);
+}
+
+.ch__key--solo-on:hover {
+  background: var(--lamp);
+  color: var(--marker);
+}
+
+.ch__key--mute-on {
+  background: var(--mute);
+  color: var(--marker);
+}
+
+.ch__key--mute-on:hover {
+  background: var(--mute);
+  color: var(--marker);
+}
+
+.ch__fader {
+  margin-left: var(--space-3);
+}
+
+.ch__db {
+  width: 40px;
+  flex-shrink: 0;
+  text-align: right;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  font-stretch: var(--width-figures);
+  font-weight: 500;
+}
+
+.ch--absent {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  padding: 0 16px;
+}
+
+.ch--absent .ch__heard {
+  padding-top: 0;
+  color: var(--ink-3);
+}
+
+/* Well grid synchronized to exact strip row template */
+.stems-well {
+  grid-template-rows: var(--desk-rows);
+}
+
+/* Split reveal: tape wipes in from the left as each lane lands */
+.ch--reveal .tape-wrap {
+  animation: tape-wipe var(--dur-reveal) var(--ease-out) both;
+  animation-delay: var(--reveal-delay, 0ms);
+}
+
+@keyframes tape-wipe {
+  from {
+    opacity: 0;
+    transform: translateX(-18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@media (max-height: 700px) {
+  .ch {
+    padding: 7px 22px 6px 16px;
+  }
+
+  .ch__heard {
+    padding-top: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ch--reveal .tape-wrap {
+    animation: tape-wipe-reduced var(--dur-move) var(--ease-out) both;
+    animation-delay: 0ms;
+  }
+
+  @keyframes tape-wipe-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}

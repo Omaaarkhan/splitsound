@@ -1,0 +1,19 @@
+.meter {
+  position: absolute;
+  right: 7px;
+  top: 10px;
+  bottom: 10px;
+  width: 5px;
+  background: var(--well-deep);
+  border-radius: 1px;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+}
+
+.meter__fill {
+  width: 100%;
+  height: calc(var(--level, 0) * 100%);
+  background: var(--stem-color);
+  display: block;
+}

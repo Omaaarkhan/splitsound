@@ -1,0 +1,98 @@
+/*
+ * SplitSound design tokens. See docs/design.md for how they are meant to be used.
+ *
+ * The look is a recording console: a slate-blue faceplate, recessed dark
+ * displays, off-white silk-screened legends, and strips of coloured artist
+ * tape with marker writing for the stems.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Recessed displays (waveforms live here) */
+  --well-deep: #0d151b;
+  --well: #142028;
+  --well-line: #24323c;
+
+  /* Faceplate */
+  --plate-lo: #2d3e4a; /* pressed, inset fields */
+  --plate: #384c58; /* the faceplate itself */
+  --plate-hi: #485d69; /* raised keys */
+  --plate-top: #5a6f7c; /* raised keys, hovered */
+
+  /* Silk-screened legends */
+  --ink: #f3f0e6; /* primary text, 7.9:1 on plate */
+  --ink-2: #c0cfd7; /* secondary text, 5.6:1 on plate */
+  --ink-3: #95a8b3; /* tertiary; large text or on wells only (3.6:1 on plate, 6.7:1 on well) */
+  --rule: rgb(243 240 230 / 0.16); /* hairlines printed on the plate */
+
+  /* Artist tape and marker */
+  --tape: #f2eddd; /* white tape: primary buttons, neutral labels */
+  --marker: #131822; /* writing on tape and on lit keys */
+
+  /* Lamps */
+  --lamp: #fbc044; /* solo, focus, progress, drop target */
+  --mute: #f45249; /* mute, destructive */
+
+  /* Stems. Each is a tape colour (with --marker text on it) and a waveform colour (on --well). */
+  --stem-vocals: #fe9cb8;
+  --stem-drums: #f4da57;
+  --stem-bass: #67a1eb;
+  --stem-guitar: #f9914d;
+  --stem-piano: #6bddb5;
+  --stem-other: #c0a1e4;
+  --stem-instrumental: #abcde0;
+  --stem-mix: var(--ink);
+
+  /* Type */
+  --font-ui: "Archivo Variable", "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-hand: "Just Another Hand", "Bradley Hand", cursive;
+  --width-wide: 125%; /* wordmark, headlines, primary buttons */
+  --width-normal: 100%;
+  --width-figures: 88%; /* time, decibels, ruler */
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 19px;
+  --text-2xl: 27px;
+  --text-3xl: 46px;
+
+  /* Space: multiples of 4, plus 2 and 6 for tight control groups */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 24px;
+  --space-8: 32px;
+  --space-9: 48px;
+
+  /* Shape. Hardware has small radii; nothing is pill-shaped. */
+  --radius-key: 2px;
+  --radius-control: 3px;
+  --radius-panel: 4px;
+  --tape-cut: 15px; /* horizontal run of the 45-degree cut on a 30px strip */
+
+  /* Depth is drawn with hard 1px edges, never soft blurred shadows. */
+  --edge-raised: inset 0 1px 0 rgb(255 255 255 / 0.12), 0 1px 0 var(--well-deep);
+  --edge-raised-tall: inset 0 1px 0 rgb(255 255 255 / 0.14), 0 2px 0 var(--well-deep);
+  --edge-well: inset 0 2px 5px rgb(0 0 0 / 0.45);
+  --edge-seam: 0 1px 0 rgb(255 255 255 / 0.06);
+
+  /* Layout */
+  --topbar-height: 44px;
+  --transport-height: 76px;
+  --strip-width: 276px;
+  --ruler-height: 28px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-press: 90ms;
+  --dur-move: 180ms;
+  --dur-reveal: 520ms;
+
+  --focus-ring: 0 0 0 2px var(--plate), 0 0 0 4px var(--lamp);
+}

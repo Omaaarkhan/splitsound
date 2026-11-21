@@ -1,0 +1,25 @@
+.consent-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.consent-body p {
+  font-size: var(--text-md);
+  color: var(--ink);
+  line-height: 1.5;
+  max-width: 56ch;
+}
+
+.consent-body__size {
+  color: var(--ink-2);
+}
+
+.consent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  width: 100%;
+}
