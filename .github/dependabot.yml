@@ -60,6 +60,11 @@ updates:
           # The Tauri CLI builds the installers and signs the updates, so its
           # updates come on their own and get a proper look.
           - "@tauri-apps/cli"
+    ignore:
+      # The Node types must match the Node major in .node-version; move them
+      # together, by hand.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
