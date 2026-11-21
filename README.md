@@ -2,141 +2,109 @@
 
 # SplitSound
 
-Split any song into vocals, drums, bass, guitar, piano and everything else,
-on your own computer. Nothing is uploaded.
+Desktop app for separating songs into vocals, drums, bass, guitar, piano, and other stems locally on your machine.
 
-![The stems screen: one lane per instrument, each named on a strip of coloured tape](docs/images/ready.png)
+![Stems mixer view with per-instrument tracks and controls](docs/images/ready.png)
 
-## What it does
+## Features
 
-- **Opens what you have.** MP3, WAV, FLAC, Opus, OGG, M4A/AAC, ALAC and AIFF.
-- **Hears what is in the song.** After you open a song it listens for a few
-  seconds and tells you which instruments it found, then suggests how to
-  split it.
-- **Splits three ways.** Vocals and backing track (2 stems), band (vocals,
-  drums, bass, other), or every instrument (adds guitar and piano).
-- **Lets you listen before you keep anything.** Solo, mute and balance each
-  stem, loop a section, and flip back to the original to compare.
-- **Gets stems out easily.** Export as WAV (16, 24 or 32-bit float), FLAC or
-  MP3, or drag a stem's label straight into your DAW.
-- **Keeps a library.** Songs you split stay available until you remove them.
+- Opens MP3, WAV, FLAC, Opus, OGG, M4A/AAC, ALAC, and AIFF files.
+- Scans imported tracks to detect which instruments are present and suggests a split mode.
+- Splits into 2 stems (vocals and instrumental), 4 stems (vocals, drums, bass, other), or 6 stems (adds guitar and piano).
+- Three quality levels: **Fast** (SCNet small), **Best** (SCNet large), and **Studio** (isolates vocals with Mel-Band RoFormer first to cut vocal bleed, then splits the remaining instruments).
+- Built-in playback mixer with per-stem gain, mute, solo, section looping, and quick comparison against the original track.
+- Exports individual stems or a custom mixdown to WAV (16-bit, 24-bit, or 32-bit float), FLAC, or MP3, or lets you drag stems straight into a DAW.
+- Keeps split songs in a local library until you remove them.
 
-![Splitting: the waveform turns into coloured strips as the cut passes](docs/images/splitting.png)
+![Track separation progress screen](docs/images/splitting.png)
 
 ## Download
 
-Get the installer for your system from the
-[latest release](https://github.com/Omaaarkhan/splitsound/releases/latest).
+Grab the installer for your platform from the [latest release](https://github.com/Omaaarkhan/splitsound/releases/latest).
 
-| System | File |
+| Platform | Installer |
 | --- | --- |
-| macOS 14 or newer (Apple silicon) | `SplitSound_<version>_macos-arm64.dmg` |
-| Windows 10 and 11 (64-bit) | `SplitSound_<version>_windows-x64-setup.exe` |
-| Linux (64-bit) | `.AppImage`, `.deb` or `.rpm` |
+| macOS 14+ (Apple silicon) | `SplitSound_<version>_macos-arm64.dmg` |
+| Windows 10 / 11 (64-bit) | `SplitSound_<version>_windows-x64-setup.exe` |
+| Linux (64-bit) | `.AppImage`, `.deb`, or `.rpm` |
 
-The app is not yet signed with an Apple or Microsoft certificate, so the
-first launch needs one extra step:
+Installers are not signed with an Apple or Microsoft developer certificate yet, so the first launch takes one extra step:
 
-- **macOS:** open the app once, then go to System Settings, Privacy &
-  Security, and choose "Open Anyway".
-- **Windows:** on the SmartScreen prompt choose "More info", then "Run anyway".
+- **macOS:** open the app once, then go to System Settings > Privacy & Security and click "Open Anyway".
+- **Windows:** on the SmartScreen prompt, click "More info" and then "Run anyway".
 
-You can check a download against `SHA256SUMS.txt` from the same release; see
-[SECURITY.md](SECURITY.md#verifying-a-download).
+Release downloads can be verified against `SHA256SUMS.txt` on the release page (see [SECURITY.md](SECURITY.md#verifying-a-download)).
 
-Intel Macs are not supported, because the inference runtime is no longer
-published for them.
+Intel Macs are not supported because prebuilt ONNX Runtime binaries are no longer published for macOS x86_64.
 
-A new version is released every Friday when something has changed. The app
-checks for updates and offers to install them; updates are signed.
+New releases go out on Fridays whenever changes have landed. The app checks for updates and installs signed updates in-app.
 
-## The models
+## Models
 
-SplitSound runs open models through [ONNX Runtime](https://onnxruntime.ai).
-They are downloaded the first time they are needed and kept on your computer.
+SplitSound runs local ONNX models through [ONNX Runtime](https://onnxruntime.ai). Each model downloads the first time you pick a mode or quality that needs it and is cached on disk afterward.
 
-| Model | Used for | Download | Licence of the weights |
+| Model | Role | Download | Weights license |
 | --- | --- | --- | --- |
-| [SCNet](https://github.com/starrytong/SCNet) small | vocals, drums, bass, other (Fast) | 20 MB | MIT |
-| SCNet large | the same, more cleanly (Best) | 78 MB | MIT |
-| [EfficientAT](https://github.com/fschmid56/EfficientAT) | naming the instruments | 19 MB | MIT |
-| [Demucs](https://github.com/facebookresearch/demucs) 6-stem | guitar and piano | 55 MB, from Meta | **Not open source** |
+| [SCNet](https://github.com/starrytong/SCNet) small | Fast quality (vocals, drums, bass, other) | ~20 MB | MIT |
+| SCNet large | Best quality, plus backing stems in Studio | ~78 MB | MIT |
+| [Mel-Band RoFormer Vocals](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) | Studio vocal isolation | ~422 MB | MIT |
+| [EfficientAT](https://github.com/fschmid56/EfficientAT) | Instrument detection | ~19 MB | MIT |
+| [Demucs](https://github.com/facebookresearch/demucs) 6-stem | Guitar and piano | ~55 MB (from Meta) | Not open source |
 
-**About Demucs.** It is the only practical model for separating guitar and
-piano, but Meta publishes its weights for research, not under an open-source
-licence, and they are probably limited to non-commercial use. SplitSound
-therefore does not include or redistribute them. If you choose "Every
-instrument", the app asks first, then downloads the original file directly
-from Meta and prepares it on your computer. Everything else works without it.
+**Studio quality** runs Mel-Band RoFormer first to pull the vocals out of the mix, then hands the remaining audio to SCNet large for drums and bass (and Demucs 6-stem for guitar and piano in 6-stem mode). It is a much bigger download and runs slower than Best, but it cuts down vocal bleed into the backing stems noticeably.
 
-Where every licence claim comes from, and what is known about the training
-data, is written down in [ml/LICENSES.md](ml/LICENSES.md).
+**Demucs 6-stem** is the only practical open model for separating guitar and piano, but Meta distributes its weights for research rather than under an open-source license (likely non-commercial). SplitSound does not bundle or redistribute those weights. If you run a 6-stem split, the app asks for confirmation, downloads the original checkpoint straight from Meta, and converts it locally. Two-stem and four-stem splits work without it.
 
-How well it separates, measured on the 50 test songs of the MUSDB18 sample
-set (median signal-to-distortion ratio, higher is better):
+Full license sources and training-data notes are in [ml/LICENSES.md](ml/LICENSES.md).
 
-| | vocals | drums | bass | other |
+### Separation quality and speed
+
+Measured on the 50 test excerpts of the MUSDB18 7-second sample set (median SDR in dB, higher is better):
+
+| Quality | Vocals | Drums | Bass | Other |
 | --- | --- | --- | --- | --- |
-| Best (SCNet large) | 10.7 dB | 10.3 dB | 8.6 dB | 7.1 dB |
-| Fast (SCNet small) | 9.5 dB | 9.7 dB | 8.5 dB | 6.0 dB |
+| Studio (Mel-Band RoFormer + SCNet large) | 11.6 | 10.5 | 9.1 | 7.4 |
+| Best (SCNet large) | 10.7 | 10.3 | 8.6 | 7.1 |
+| Fast (SCNet small) | 9.5 | 9.7 | 8.5 | 6.0 |
 
-On an Apple M4, a four-minute song takes about half a minute in Fast and
-about two minutes in Best.
+Two caveats on the Studio row: the training data for KimberleyJensen's checkpoint is not documented (so it may include MUSDB18 tracks), and these excerpts are 7-second AAC clips rather than full MUSDB18-HQ tracks. See [ml/BENCHMARKS.md](ml/BENCHMARKS.md) for the full measurements.
+
+On an Apple M4, a four-minute song takes roughly 30 seconds in Fast, about 2 minutes in Best, and around 5 to 8 minutes in Studio depending on the split mode.
 
 ## Privacy and security
 
-No account, no telemetry. The app contacts GitHub to download its models and
-check for updates, and Meta's download server only if you add the Demucs
-model. Models are pinned by SHA-256 and refused if they do not match; audio
-files are decoded by memory-safe code; the interface cannot touch your files
-except through a fixed set of checked commands. The details are in
-[SECURITY.md](SECURITY.md) and
-[docs/architecture.md](docs/architecture.md#security-model).
+SplitSound does not use accounts, cloud processing, or telemetry. Network access is limited to fetching models and update metadata from GitHub, plus Meta's download host if you opt into Demucs 6-stem. Every model file is checked against a pinned SHA-256 hash before loading, audio files are decoded with memory-safe Rust decoders, and the frontend only accesses local files through a fixed set of IPC commands. See [SECURITY.md](SECURITY.md) and [docs/architecture.md](docs/architecture.md#security-model) for details.
 
 ## Building from source
 
-You need [Rust](https://rustup.rs) (the version in `rust-toolchain.toml` is
-picked up automatically), [Node.js](https://nodejs.org) 24 or newer, and on
-Linux the [Tauri system libraries](https://tauri.app/start/prerequisites/)
-plus `libasound2-dev`.
+Requires [Rust](https://rustup.rs) (the toolchain in `rust-toolchain.toml` is picked up automatically), [Node.js](https://nodejs.org) 24+, and on Linux the [Tauri system libraries](https://tauri.app/start/prerequisites/) plus `libasound2-dev`.
 
 ```sh
 npm ci
-node scripts/fetch-onnxruntime.mjs   # Microsoft's official build, pinned and verified
-npm run tauri dev                    # run the app
-npm run tauri build                  # build an installer for this system
+node scripts/fetch-onnxruntime.mjs   # downloads pinned ONNX Runtime build
+npm run tauri dev                    # run the desktop app
+npm run tauri build                  # build an installer for this platform
 ```
 
-The interface also runs in a browser against a built-in mock, which is handy
-for design work: `npm run dev`, then open the address it prints.
+You can also run the UI in a regular browser against a built-in mock backend with `npm run dev`.
 
 ```sh
-npm run lint && npm run typecheck && npm test   # interface
-cargo test --workspace                          # engine and app shell
-cargo run --release -p splitsound-cli -- separate song.mp3 --mode band
+npm run lint && npm run typecheck && npm test   # frontend checks
+cargo test --workspace                          # Rust engine and app tests
+cargo run --release -p splitsound-cli -- separate song.mp3 --mode band --quality studio
 ```
 
-The engine is a plain Rust library with a command-line tool; see
-[crates/splitsound-core/README.md](crates/splitsound-core/README.md). How the
-pieces fit together is in [docs/architecture.md](docs/architecture.md), and
-the look of the app is specified in [docs/design.md](docs/design.md). The
-models are exported to ONNX by the scripts in [ml/](ml/README.md).
+More docs:
 
-## Thanks
+- [crates/splitsound-core/README.md](crates/splitsound-core/README.md): Rust separation engine and CLI
+- [docs/architecture.md](docs/architecture.md): overall architecture and security model
+- [docs/design.md](docs/design.md): UI design notes
+- [ml/README.md](ml/README.md): ONNX export, verification, and benchmark scripts
 
-SplitSound stands on [SCNet](https://github.com/starrytong/SCNet) by Weinan
-Tong and colleagues, [Demucs](https://github.com/facebookresearch/demucs) by
-Simon Rouard, Francisco Massa and Alexandre Défossez at Meta,
-[EfficientAT](https://github.com/fschmid56/EfficientAT) by Florian Schmid and
-colleagues, [ONNX Runtime](https://onnxruntime.ai) by Microsoft,
-[Symphonia](https://github.com/pdeljanov/Symphonia) and
-[Tauri](https://tauri.app). The typefaces are
-[Archivo](https://fonts.google.com/specimen/Archivo) by Omnibus-Type and
-[Just Another Hand](https://fonts.google.com/specimen/Just+Another+Hand) by
-Astigmatic.
+## Credits
 
-## Licence
+Built with [SCNet](https://github.com/starrytong/SCNet) (Weinan Tong et al.), [Mel-Band RoFormer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (KimberleyJensen, [ZFTurbo/Music-Source-Separation-Training](https://github.com/ZFTurbo/Music-Source-Separation-Training), and [lucidrains/BS-RoFormer](https://github.com/lucidrains/BS-RoFormer)), [Demucs](https://github.com/facebookresearch/demucs) (Simon Rouard, Francisco Massa, and Alexandre Défossez / Meta), [EfficientAT](https://github.com/fschmid56/EfficientAT) (Florian Schmid et al.), [ONNX Runtime](https://onnxruntime.ai), [Symphonia](https://github.com/pdeljanov/Symphonia), and [Tauri](https://tauri.app). Fonts are [Archivo](https://fonts.google.com/specimen/Archivo) and [Just Another Hand](https://fonts.google.com/specimen/Just+Another+Hand).
 
-The code is [MIT](LICENSE). Third-party components keep their own licences,
-listed in [THIRD-PARTY.md](THIRD-PARTY.md). The models are licensed
-separately, as described above.
+## License
+
+Code is licensed under the [MIT License](LICENSE). Third-party dependency notices are in [THIRD-PARTY.md](THIRD-PARTY.md), and model weights follow their respective licenses listed above.
