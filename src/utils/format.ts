@@ -1,4 +1,10 @@
-import type { ModelDownloadProgress, ModelStatus } from "../ipc/contract";
+import type { ModelDownloadProgress, ModelStatus, Quality } from "../ipc/contract";
+
+export const QUALITY_LABEL: Record<Quality, string> = {
+  fast: "Fast",
+  best: "Best",
+  studio: "Studio",
+};
 
 export function formatTime(seconds: number): string {
   const clamped = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
@@ -57,7 +63,7 @@ export function formatElapsed(seconds: number): string {
   return `${mins} m ${rem} s`;
 }
 
-export function formatDurationEstimate(seconds: number, quality: "fast" | "best"): string {
+export function formatDurationEstimate(seconds: number, quality: Quality): string {
   const s = Math.max(5, Math.round(seconds));
   let base: string;
   if (s < 55) {
@@ -69,6 +75,7 @@ export function formatDurationEstimate(seconds: number, quality: "fast" | "best"
     const mins = Math.max(2, Math.round(s / 60));
     base = `About ${mins} minutes`;
   }
+  if (quality === "studio") return `${base}, cleanest vocals`;
   return quality === "best" ? `${base}, cleaner result` : base;
 }
 

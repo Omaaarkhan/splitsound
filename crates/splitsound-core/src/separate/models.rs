@@ -1,11 +1,9 @@
-//! The per-kind segment transforms of `ml/CONTRACT.md` sections 2 and 3:
+//! The per-kind segment transforms of `ml/CONTRACT.md` sections 2, 3 and 4:
 //! host-side STFT, one graph call, host-side inverse STFT.
 //!
 //! Each type owns its ONNX Runtime session and scratch buffers and
 //! implements [`SegmentModel`], so [`super::chunk::separate_track`] can
-//! drive any of them. A third kind (the Mel-Band RoFormer of contract
-//! section 4) slots in as one more type here plus one arm in
-//! [`open_segment_model`].
+//! drive any of them.
 
 use ort::session::Session;
 use ort::value::TensorRef;
@@ -14,7 +12,8 @@ use super::chunk::SegmentModel;
 use crate::error::{Error, Result};
 use crate::runtime::run_error;
 use crate::stft::{
-    BINS, FRAMES, HtdemucsStft, PLANE, SC_BINS, SC_FRAMES, SC_PLANE, SC_SEGMENT, SEGMENT, ScnetStft,
+    BINS, FRAMES, HtdemucsStft, MB_BINS, MB_FRAMES, MB_PLANE, MB_SEGMENT, MelbandRoformerStft,
+    PLANE, SC_BINS, SC_FRAMES, SC_PLANE, SC_SEGMENT, SEGMENT, ScnetStft,
 };
 
 /// The separation model families the engine knows how to drive.
@@ -25,8 +24,7 @@ pub enum SeparatorKind {
     Scnet,
     /// HTDemucs: spectrogram and waveform in, both branches out.
     Htdemucs,
-    /// Mel-Band RoFormer (vocals). Declared so manifests that list it
-    /// parse; running it is not implemented yet.
+    /// Mel-Band RoFormer (vocals).
     MelbandRoformer,
 }
 
@@ -40,9 +38,9 @@ pub fn open_segment_model(
     match kind {
         SeparatorKind::Scnet => Ok(Box::new(ScnetModel::new(session, num_sources))),
         SeparatorKind::Htdemucs => Ok(Box::new(HtdemucsModel::new(session, num_sources))),
-        SeparatorKind::MelbandRoformer => Err(Error::internal(
-            "the Mel-Band RoFormer transform is not implemented in this build",
-        )),
+        SeparatorKind::MelbandRoformer => {
+            Ok(Box::new(MelbandRoformerModel::new(session, num_sources)))
+        }
     }
 }
 
@@ -233,6 +231,88 @@ impl SegmentModel for HtdemucsModel {
                 let re = &sdata[sbase + 2 * c * PLANE..sbase + (2 * c + 1) * PLANE];
                 let im = &sdata[sbase + (2 * c + 1) * PLANE..sbase + (2 * c + 2) * PLANE];
                 self.stft.inverse_add(re, im, channel)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mel-Band RoFormer (contract section 4).
+pub struct MelbandRoformerModel {
+    session: Session,
+    stft: MelbandRoformerStft,
+    sources: usize,
+    /// `[1, 4, 1025, 801]`.
+    spec: Vec<f32>,
+}
+
+impl MelbandRoformerModel {
+    /// Wraps a session of a Mel-Band RoFormer graph with `sources` outputs.
+    pub fn new(session: Session, sources: usize) -> Self {
+        MelbandRoformerModel {
+            session,
+            stft: MelbandRoformerStft::new(),
+            sources,
+            spec: vec![0.0; 4 * MB_PLANE],
+        }
+    }
+}
+
+impl SegmentModel for MelbandRoformerModel {
+    fn segment_len(&self) -> usize {
+        MB_SEGMENT
+    }
+
+    fn num_sources(&self) -> usize {
+        self.sources
+    }
+
+    fn normalize(&self) -> bool {
+        false
+    }
+
+    fn run_segment(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        wanted: &[usize],
+        out: &mut [[Vec<f32>; 2]],
+    ) -> Result<()> {
+        {
+            let (l, r) = self.spec.split_at_mut(2 * MB_PLANE);
+            let (l_re, l_im) = l.split_at_mut(MB_PLANE);
+            let (r_re, r_im) = r.split_at_mut(MB_PLANE);
+            self.stft.forward(left, l_re, l_im)?;
+            self.stft.forward(right, r_re, r_im)?;
+        }
+        let input = TensorRef::from_array_view(([1usize, 4, MB_BINS, MB_FRAMES], &self.spec[..]))
+            .map_err(run_error)?;
+        let outputs = self
+            .session
+            .run(ort::inputs!["spec" => input])
+            .map_err(run_error)?;
+        let value = outputs
+            .get("spec_out")
+            .ok_or_else(|| Error::internal("melband_roformer: graph has no `spec_out` output"))?;
+        let (shape, data) = value.try_extract_tensor::<f32>().map_err(run_error)?;
+        check_output(
+            shape,
+            data.len(),
+            &[1, self.sources, 4, MB_BINS, MB_FRAMES],
+            "melband_roformer",
+        )?;
+        for (dst, &s) in out.iter_mut().zip(wanted) {
+            if s >= self.sources {
+                return Err(Error::internal(
+                    "melband_roformer: source index out of range",
+                ));
+            }
+            let base = s * 4 * MB_PLANE;
+            for (c, channel) in dst.iter_mut().enumerate() {
+                let re = &data[base + 2 * c * MB_PLANE..base + (2 * c + 1) * MB_PLANE];
+                let im = &data[base + (2 * c + 1) * MB_PLANE..base + (2 * c + 2) * MB_PLANE];
+                channel.resize(MB_SEGMENT, 0.0);
+                self.stft.inverse(re, im, channel)?;
             }
         }
         Ok(())

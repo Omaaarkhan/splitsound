@@ -3,6 +3,7 @@
     uv run --locked python check_reference.py --model scnet_large
     uv run --locked python check_reference.py --model scnet_small
     uv run --locked python check_reference.py --model htdemucs_6s
+    uv run --locked python check_reference.py --model melband_roformer_vocals --wav song.wav
     uv run --locked python check_reference.py --random-init        # untrained HTDemucs, no checkpoint (CI)
     ... --wav song.wav      also compare on a 44.1 kHz file
     ... --quick             fewer track lengths and shift settings
@@ -86,6 +87,88 @@ class SCNetForApply(torch.nn.Module):
             return self.model(mix)
 
 
+class MelbandForApply(torch.nn.Module):
+    """Mel-Band RoFormer Core module wrapped for `demucs.apply.apply_model`."""
+
+    def __init__(self, core: torch.nn.Module):
+        super().__init__()
+        self.core = core
+        self.sources = ["vocals"]
+        self.audio_channels = reference.CHANNELS
+        self.samplerate = reference.SAMPLE_RATE
+        self.segment = Fraction(reference.MB_SEGMENT, reference.SAMPLE_RATE)  # 8.0 s
+
+    def valid_length(self, length: int) -> int:
+        return reference.MB_SEGMENT
+
+    def forward(self, mix: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            window = torch.hann_window(reference.MB_NFFT, periodic=True, device=mix.device)
+            b, c, n = mix.shape
+            pad_tail = reference.MB_SEGMENT - n
+            if pad_tail > 0:
+                mix = F.pad(mix, (0, pad_tail))
+            flat = mix.reshape(b * c, reference.MB_SEGMENT)
+            spec = torch.stft(
+                flat, n_fft=reference.MB_NFFT, hop_length=reference.MB_HOP,
+                win_length=reference.MB_NFFT, window=window, center=True, normalized=False,
+                return_complex=True,
+            )  # [B*C, F, T]
+            spec_real = torch.view_as_real(spec).permute(0, 3, 1, 2)  # [B*C, 2, F, T]
+            spec_4 = spec_real.reshape(b, c * 2, reference.MB_BINS, reference.MB_FRAMES)
+            out_spec = self.core(spec_4)[:, 0]  # [B, 4, F, T]
+            out_sc = out_spec.reshape(b * c, 2, reference.MB_BINS, reference.MB_FRAMES).permute(0, 2, 3, 1).contiguous()
+            wave = torch.istft(
+                torch.view_as_complex(out_sc), n_fft=reference.MB_NFFT, hop_length=reference.MB_HOP,
+                win_length=reference.MB_NFFT, window=window, center=True, normalized=False,
+                length=reference.MB_SEGMENT,
+            )
+            return wave.reshape(b, 1, c, reference.MB_SEGMENT)[..., :n]
+
+
+def check_melband_upstream(core: torch.nn.Module, model: reference.Model, extra_wav: str | None, rows: list) -> None:
+    """Compare MelBandRoformerCore + ONNX against ZFTurbo's upstream module if optional deps are installed."""
+    try:
+        import beartype  # noqa: F401
+        import einops  # noqa: F401
+        import librosa  # noqa: F401
+        import rotary_embedding_torch  # noqa: F401
+    except ImportError:
+        print("  upstream MelBandRoformer check skipped (optional upstream packages beartype/einops/librosa/rotary_embedding_torch are not in uv.lock)")
+        return
+    import export_melband_roformer
+    import weights
+
+    cfg = export_melband_roformer.load_verified_config()
+    src_root = weights.local_path(weights.lock_entry("melband_roformer_vocals:source")).parents[2]
+    sys.path.insert(0, str(src_root))
+    try:
+        from models.bs_roformer.mel_band_roformer import MelBandRoformer as UpstreamRoformer  # type: ignore
+
+        ckpt = weights.lock_entry("melband_roformer_vocals")
+        weights.require_loadable(ckpt)
+        sd = torch.load(weights.local_path(ckpt), map_location="cpu", weights_only=True)
+        model_cfg = {k: v for k, v in cfg["model"].items() if not str(k).startswith("multi_stft")}
+        model_cfg["flash_attn"] = False
+        up = UpstreamRoformer(**model_cfg)
+        up.load_state_dict(sd, strict=True)
+        up.eval()
+        clip = reference.read_wav(extra_wav)[:, :reference.MB_SEGMENT] if extra_wav else synth.synth_clip(12.0)[:, :reference.MB_SEGMENT]
+        # All three see the same full segment: a file shorter than one segment is zero-padded, then trimmed back.
+        n = clip.shape[1]
+        wav = np.zeros((clip.shape[0], reference.MB_SEGMENT), dtype=np.float32)
+        wav[:, :n] = clip
+        with torch.no_grad():
+            up_wave = up(torch.from_numpy(wav)[None])[0].numpy()[..., :n]  # [1, 2, n]
+        core_wave = MelbandForApply(core)(torch.from_numpy(wav)[None])[0].numpy()[..., :n]
+        onnx_wave = reference.melband_run_segment(model.session, wav)[None][..., :n]
+        compare("upstream MelBandRoformer vs Core [segment]", up_wave, core_wave, rows)
+        compare("upstream MelBandRoformer vs ONNX [segment]", up_wave, onnx_wave, rows)
+    finally:
+        if sys.path and sys.path[0] == str(src_root):
+            sys.path.pop(0)
+
+
 def torch_apply(model, mix: np.ndarray, overlap: float, shifts: int = 0) -> np.ndarray:
     from demucs.apply import apply_model
 
@@ -113,6 +196,30 @@ def transform_checks(kind: str, torch_model, rows: list) -> None:
         round_trip = reference.htdemucs_istft(reference.htdemucs_stft(clip[:, :n])[None])[0]
         compare("istft(stft(x)) vs x, whole segment (not exact by design)", clip[:, :n], round_trip, rows)
         compare("istft(stft(x)) vs x, interior only", clip[:, 4096:n - 4096], round_trip[:, 4096:n - 4096], rows)
+    elif kind == "melband_roformer":
+        n = reference.MB_SEGMENT
+        window = torch.hann_window(reference.MB_NFFT, periodic=True)
+        config = dict(n_fft=reference.MB_NFFT, hop_length=reference.MB_HOP, win_length=reference.MB_NFFT,
+                      window=window, center=True, normalized=False)
+        for label, segment in (("synthetic clip", clip[:, :n]),
+                               ("white noise", (0.3 * rng.standard_normal((2, n))).astype(np.float32))):
+            with torch.no_grad(), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                z = torch.view_as_real(torch.stft(torch.from_numpy(segment), **config, return_complex=True))  # [2, F, T, 2]
+                torch_spec = z.permute(0, 3, 1, 2).reshape(4, reference.MB_BINS, reference.MB_FRAMES).numpy()
+                torch_back = torch.istft(torch.view_as_complex(z.contiguous()), **config, length=n).numpy()
+            mine = reference.melband_stft(segment)
+            compare(f"stft [{label}]", torch_spec, mine, rows)
+            back = np.stack([reference.melband_istft_channel(mine[2 * c], mine[2 * c + 1]) for c in range(2)])
+            compare(f"istft [{label}] vs torch.istft", torch_back, back, rows)
+            compare(f"istft(stft(x)) vs x [{label}]", segment, back, rows)
+        spec = rng.standard_normal((2, reference.MB_BINS, reference.MB_FRAMES)).astype(np.float32)
+        spec_i = rng.standard_normal((2, reference.MB_BINS, reference.MB_FRAMES)).astype(np.float32)
+        with torch.no_grad(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch_wave = torch.istft(torch.complex(torch.from_numpy(spec), torch.from_numpy(spec_i)), **config, length=n).numpy()
+        mine = np.stack([reference.melband_istft_channel(spec[c], spec_i[c]) for c in range(2)])
+        compare("istft [random complex input, DC/Nyquist imag != 0]", torch_wave, mine, rows)
     else:
         n = reference.SC_SEGMENT
         config = dict(n_fft=reference.NFFT, hop_length=reference.HOP, win_length=reference.NFFT, center=True, normalized=True)
@@ -159,12 +266,13 @@ def track_checks(apply_target, model: reference.Model, extra_wav: str | None, qu
         est = reference.separate(model, mix, shifts=0, normalize=False)
         compare(f"track [{label}]", ref, est, rows, sources)
 
-    print("Track normalisation (demucs.separate / SCNet inference)")
-    wav = torch.from_numpy(clip.copy())
-    mono = wav.mean(0)
-    ref = torch_apply(apply_target, ((wav - mono.mean()) / mono.std()).numpy(), overlap)
-    ref = ref * float(mono.std()) + float(mono.mean())
-    compare("track normalize=True [12 s synthetic]", ref, reference.separate(model, clip, shifts=0, normalize=True), rows, sources)
+    if model.normalize:
+        print("Track normalisation (demucs.separate / SCNet inference)")
+        wav = torch.from_numpy(clip.copy())
+        mono = wav.mean(0)
+        ref = torch_apply(apply_target, ((wav - mono.mean()) / mono.std()).numpy(), overlap)
+        ref = ref * float(mono.std()) + float(mono.mean())
+        compare("track normalize=True [12 s synthetic]", ref, reference.separate(model, clip, shifts=0, normalize=True), rows, sources)
 
     print("Deterministic shifts vs demucs' shift trick with its random draws pinned")
     import demucs.apply as demucs_apply
@@ -185,7 +293,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--random-init", action="store_true", help="untrained HTDemucs exported to a temp file")
-    group.add_argument("--model", help="scnet_small | scnet_large | htdemucs_6s (needs dist/<id>.onnx and the checkpoint)")
+    group.add_argument("--model", help="scnet_small | scnet_large | melband_roformer_vocals | htdemucs_6s (needs dist/<id>.onnx and the checkpoint)")
     parser.add_argument("--onnx", type=Path, help="graph to test instead of dist/<model>.onnx "
                         "(e.g. the float32-weights comparison export of an SCNet model)")
     parser.add_argument("--wav", help="additional 44.1 kHz WAV to compare on")
@@ -213,13 +321,24 @@ def main() -> int:
 
             original, _ = export_scnet.load_scnet(args.model)
             torch_model = SCNetForApply(original)
+            transform_checks(model.kind, torch_model, rows)
+            track_checks(torch_model, model, args.wav, args.quick, rows)
+        elif model.kind == "melband_roformer":
+            import export_melband_roformer
+
+            core, _, _ = export_melband_roformer.load_core_and_entry()
+            torch_model = MelbandForApply(core)
+            assert model.sources == list(torch_model.sources)
+            transform_checks(model.kind, torch_model, rows)
+            check_melband_upstream(core, model, args.wav, rows)
+            track_checks(torch_model, model, args.wav, args.quick, rows)
         else:
             import weights
 
             torch_model, _ = weights.load_htdemucs(args.model)
-        assert model.sources == list(torch_model.sources)
-        transform_checks(model.kind, torch_model, rows)
-        track_checks(torch_model, model, args.wav, args.quick, rows)
+            assert model.sources == list(torch_model.sources)
+            transform_checks(model.kind, torch_model, rows)
+            track_checks(torch_model, model, args.wav, args.quick, rows)
 
     scored = [row for row in rows if "vs x" not in row["check"]]
     worst = min(scored, key=lambda row: row["snrDb"])

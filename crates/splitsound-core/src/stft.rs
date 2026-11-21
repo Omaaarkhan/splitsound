@@ -7,11 +7,16 @@
 //! * [`ScnetStft`] (contract section 3): segment `N = 485100`, rectangular
 //!   window, `T = 476` frames of all `F = 2049` bins, inverse divided by the
 //!   number of overlapping frames.
+//! * [`MelbandRoformerStft`] (contract section 4): segment `N = 352800`,
+//!   periodic Hann window (`NFFT = 2048`, `HOP = 441`), unnormalized `rfft`,
+//!   `T = 801` frames of all `F = 1025` bins, inverse divided by the exact
+//!   overlap-add squared Hann window.
 //!
-//! Both use a 4096-point FFT with hop 1024 and scale by `1 / sqrt(NFFT)`.
-//! Spectrogram planes are laid out `[bin][frame]` (index `k * frames + j`),
-//! one plane for the real parts and one for the imaginary parts, which is
-//! the layout of one channel of the graphs' complex-as-channels tensors.
+//! `HtdemucsStft` and `ScnetStft` use a 4096-point FFT with hop 1024 and scale
+//! by `1 / sqrt(NFFT)`. Spectrogram planes are laid out `[bin][frame]`
+//! (index `k * frames + j`), one plane for the real parts and one for the
+//! imaginary parts, which is the layout of one channel of the graphs'
+//! complex-as-channels tensors.
 
 use std::sync::Arc;
 
@@ -20,9 +25,10 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use crate::error::{Error, Result};
 
-/// FFT size (and window length) of every separation model.
+/// FFT size (and window length) for HTDemucs and SCNet (Mel-Band RoFormer
+/// uses `MB_NFFT`).
 pub const NFFT: usize = 4096;
-/// Hop length of every separation model.
+/// Hop length for HTDemucs and SCNet (Mel-Band RoFormer uses `MB_HOP`).
 pub const HOP: usize = 1024;
 
 /// HTDemucs segment length in samples (7.8 s at 44.1 kHz).
@@ -55,6 +61,29 @@ pub const SC_PADDED: usize = NFFT + (SC_FRAMES - 1) * HOP;
 /// Values in one SCNet spectrogram plane (`SC_BINS * SC_FRAMES`).
 pub const SC_PLANE: usize = SC_BINS * SC_FRAMES;
 
+/// Mel-Band RoFormer FFT and window length.
+pub const MB_NFFT: usize = 2048;
+/// Mel-Band RoFormer hop length.
+pub const MB_HOP: usize = 441;
+/// Mel-Band RoFormer segment length in samples (8 s at 44.1 kHz).
+pub const MB_SEGMENT: usize = 352_800;
+/// Mel-Band RoFormer frequency bins per frame (`MB_NFFT / 2 + 1`).
+pub const MB_BINS: usize = MB_NFFT / 2 + 1;
+/// Mel-Band RoFormer frames per segment.
+pub const MB_FRAMES: usize = 801;
+/// Mel-Band RoFormer reflect padding on both sides (`MB_NFFT / 2`).
+pub const MB_CENTER: usize = MB_NFFT / 2;
+/// Mel-Band RoFormer padded signal length: `MB_NFFT + (MB_FRAMES - 1) * MB_HOP`.
+pub const MB_PADDED: usize = MB_NFFT + (MB_FRAMES - 1) * MB_HOP;
+/// Values in one Mel-Band RoFormer spectrogram plane (`MB_BINS * MB_FRAMES`).
+pub const MB_PLANE: usize = MB_BINS * MB_FRAMES;
+
+fn hann_window(len: usize) -> Vec<f32> {
+    (0..len)
+        .map(|n| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / len as f64).cos()) as f32)
+        .collect()
+}
+
 /// HTDemucs transform state: FFT plans, the window and scratch buffers.
 ///
 /// Not `Sync`; make one per worker thread.
@@ -83,11 +112,7 @@ impl HtdemucsStft {
         let forward = planner.plan_fft_forward(NFFT);
         let inverse = planner.plan_fft_inverse(NFFT);
         // Periodic Hann, computed in f64 for accuracy.
-        let window = (0..NFFT)
-            .map(|n| {
-                (0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / NFFT as f64).cos()) as f32
-            })
-            .collect();
+        let window = hann_window(NFFT);
         HtdemucsStft {
             scratch_fwd: forward.make_scratch_vec(),
             scratch_inv: inverse.make_scratch_vec(),
@@ -286,6 +311,129 @@ impl ScnetStft {
     }
 }
 
+/// Mel-Band RoFormer transform state.
+///
+/// Not `Sync`; make one per worker thread.
+pub struct MelbandRoformerStft {
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    window: Vec<f32>,
+    env: Vec<f32>,
+    padded: Vec<f32>,
+    frame: Vec<f32>,
+    spectrum: Vec<Complex32>,
+    scratch_fwd: Vec<Complex32>,
+    scratch_inv: Vec<Complex32>,
+    acc: Vec<f32>,
+}
+
+impl Default for MelbandRoformerStft {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MelbandRoformerStft {
+    /// Plans the transforms and precomputes the periodic Hann window and
+    /// overlap-add squared-window envelope.
+    pub fn new() -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(MB_NFFT);
+        let inverse = planner.plan_fft_inverse(MB_NFFT);
+        let window = hann_window(MB_NFFT);
+        let mut env_pad = vec![0.0f64; MB_PADDED];
+        for j in 0..MB_FRAMES {
+            for (dst, w) in env_pad[j * MB_HOP..j * MB_HOP + MB_NFFT]
+                .iter_mut()
+                .zip(&window)
+            {
+                let wf = f64::from(*w);
+                *dst += wf * wf;
+            }
+        }
+        let env = env_pad[MB_CENTER..MB_CENTER + MB_SEGMENT]
+            .iter()
+            .map(|v| *v as f32)
+            .collect();
+        MelbandRoformerStft {
+            scratch_fwd: forward.make_scratch_vec(),
+            scratch_inv: inverse.make_scratch_vec(),
+            spectrum: forward.make_output_vec(),
+            forward,
+            inverse,
+            window,
+            env,
+            padded: vec![0.0; MB_PADDED],
+            frame: vec![0.0; MB_NFFT],
+            acc: vec![0.0; MB_PADDED],
+        }
+    }
+
+    /// Forward STFT of one channel: [`MB_SEGMENT`] samples in, two
+    /// [`MB_PLANE`]-sized planes out (unnormalized rfft).
+    pub fn forward(&mut self, x: &[f32], re: &mut [f32], im: &mut [f32]) -> Result<()> {
+        if x.len() != MB_SEGMENT || re.len() != MB_PLANE || im.len() != MB_PLANE {
+            return Err(Error::internal("melband stft: wrong buffer size"));
+        }
+        for (i, p) in self.padded[..MB_CENTER].iter_mut().enumerate() {
+            *p = x[MB_CENTER - i];
+        }
+        self.padded[MB_CENTER..MB_CENTER + MB_SEGMENT].copy_from_slice(x);
+        for i in 0..MB_CENTER {
+            self.padded[MB_CENTER + MB_SEGMENT + i] = x[MB_SEGMENT - 2 - i];
+        }
+        for j in 0..MB_FRAMES {
+            let src = &self.padded[j * MB_HOP..j * MB_HOP + MB_NFFT];
+            for ((f, s), w) in self.frame.iter_mut().zip(src).zip(&self.window) {
+                *f = s * w;
+            }
+            self.forward
+                .process_with_scratch(&mut self.frame, &mut self.spectrum, &mut self.scratch_fwd)
+                .map_err(|e| Error::internal(format!("fft: {e}")))?;
+            for k in 0..MB_BINS {
+                let z = self.spectrum[k];
+                re[k * MB_FRAMES + j] = z.re;
+                im[k * MB_FRAMES + j] = z.im;
+            }
+        }
+        Ok(())
+    }
+
+    /// Inverse STFT of one source channel, written to `out`
+    /// ([`MB_SEGMENT`] samples; previous contents are replaced).
+    pub fn inverse(&mut self, re: &[f32], im: &[f32], out: &mut [f32]) -> Result<()> {
+        if out.len() != MB_SEGMENT || re.len() != MB_PLANE || im.len() != MB_PLANE {
+            return Err(Error::internal("melband istft: wrong buffer size"));
+        }
+        self.acc.fill(0.0);
+        // realfft's inverse is unnormalized, while numpy/torch unnormalized irfft
+        // divides by NFFT.
+        let scale = 1.0 / (MB_NFFT as f32);
+        for j in 0..MB_FRAMES {
+            for k in 0..MB_BINS {
+                self.spectrum[k] = Complex32::new(re[k * MB_FRAMES + j], im[k * MB_FRAMES + j]);
+            }
+            self.spectrum[0].im = 0.0;
+            self.spectrum[MB_BINS - 1].im = 0.0;
+            self.inverse
+                .process_with_scratch(&mut self.spectrum, &mut self.frame, &mut self.scratch_inv)
+                .map_err(|e| Error::internal(format!("ifft: {e}")))?;
+            let dst = &mut self.acc[j * MB_HOP..j * MB_HOP + MB_NFFT];
+            for ((d, f), w) in dst.iter_mut().zip(&self.frame).zip(&self.window) {
+                *d += f * w * scale;
+            }
+        }
+        for ((o, a), e) in out
+            .iter_mut()
+            .zip(&self.acc[MB_CENTER..MB_CENTER + MB_SEGMENT])
+            .zip(&self.env)
+        {
+            *o = *a / *e;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +624,38 @@ mod tests {
             "left edge"
         );
         assert!(crate::audio::snr_db(&x[SC_SEGMENT - 2048..], &y[SC_SEGMENT - 2048..]) > 110.0);
+        assert!(st.forward(&x[..100], &mut re, &mut im).is_err());
+        assert!(st.inverse(&re, &im, &mut y[..100]).is_err());
+    }
+
+    #[test]
+    fn melband_constants_agree_with_the_contract() {
+        assert_eq!(MB_SEGMENT % MB_HOP, 0);
+        assert_eq!(MB_SEGMENT / MB_HOP + 1, MB_FRAMES);
+        assert_eq!(MB_PADDED, MB_SEGMENT + 2 * MB_CENTER);
+        assert_eq!(MB_BINS, MB_NFFT / 2 + 1);
+    }
+
+    #[test]
+    fn melband_round_trip_is_exact() {
+        let mut rng = Lcg(17);
+        let x: Vec<f32> = (0..MB_SEGMENT).map(|_| rng.next_f32() * 0.8).collect();
+        let mut st = MelbandRoformerStft::new();
+        let mut re = vec![0f32; MB_PLANE];
+        let mut im = vec![0f32; MB_PLANE];
+        st.forward(&x, &mut re, &mut im).unwrap();
+        let mut y = vec![1.0f32; MB_SEGMENT];
+        st.inverse(&re, &im, &mut y).unwrap();
+        let snr = crate::audio::snr_db(&x, &y);
+        assert!(snr > 105.0, "round trip SNR {snr:.1} dB");
+        assert!(
+            crate::audio::snr_db(&x[..1024], &y[..1024]) > 105.0,
+            "left edge"
+        );
+        assert!(
+            crate::audio::snr_db(&x[MB_SEGMENT - 1024..], &y[MB_SEGMENT - 1024..]) > 105.0,
+            "right edge"
+        );
         assert!(st.forward(&x[..100], &mut re, &mut im).is_err());
         assert!(st.inverse(&re, &im, &mut y[..100]).is_err());
     }

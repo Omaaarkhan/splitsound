@@ -13,7 +13,7 @@ onnxruntime 1.32.0, demucs 4.0.1.
 | Files come only from the publisher's own host, over HTTPS; every redirect hop is checked against an allow-list | `weights.py` (`_check_url`, `_CheckedRedirects`), hosts in `weights.lock.json` |
 | Every downloaded file is pinned by size and full SHA-256 and refused on mismatch | `weights.lock.json`, `weights.verify` |
 | A checkpoint is scanned statically before anything loads it, and its set of pickle globals must equal the recorded set exactly | `scan_pickle.py` (stdlib only), `weights.verify` |
-| Checkpoints are loaded only with `torch.load(weights_only=True)`, or not unpickled at all | `weights.py`, `export_scnet.py`, `export_tagger.py`, `convert_reference.py` |
+| Checkpoints are loaded only with `torch.load(weights_only=True)`, or not unpickled at all | `weights.py`, `export_scnet.py`, `export_melband_roformer.py`, `export_tagger.py`, `convert_reference.py` |
 | A checkpoint referencing globals outside torch / numpy / collections / its own package cannot be passed to `torch.load` without owner approval | `weights.require_loadable`, `approvedExceptions` in the lock (empty) |
 | Python dependencies: exact versions and hashes, PyPI only | `uv.lock`, every command uses `--locked` |
 | Exported ONNX files are inert data | `verify_onnx.py` (exit status 1 on violation), called by every export and by `package.py` |
@@ -40,6 +40,7 @@ Downloaded by `weights.py fetch` on 2026-11-20 between 03:38 and 03:59
 | `scnet_small.th` (Drive name `checkpoint.th`) | `https://drive.usercontent.google.com/download?id=1CdEIIqsoRfHn1SJ7rccPfyYioW3BlXcW&export=download&confirm=t` | 42434545 | `f8aff3bc8dd816aad392800d9d69519add719a2fbd22550af6f8cb2138d25ff5` | **none published** |
 | `scnet_large.th` (Drive name `SCNet-large.th`) | `...download?id=1s7QvQwn8ag9oVstGDBQ6KZvacJkvyK7t&export=download&confirm=t` | 168848417 | `719e5abb8ed920305dad546ac3cd6fb0b1e9c3092d14ce21827bfc0423af3070` | **none published** |
 | `mn10_as_mAP_471.pt` (tagger) | `https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/mn10_as_mAP_471.pt` | 19708753 | `0bd7dc2443af498c289a2e739f02ebb515d6aa3fd3ab9db539c86123ae368a4e` | **none published** (GitHub API `digest: null`; its stated size matches) |
+| `MelBandRoformer.ckpt` (melband_roformer_vocals) | `https://huggingface.co/KimberleyJSN/melbandroformer/resolve/ac9b0614ab3cd7f77219e18ba494dfd93956c348/MelBandRoformer.ckpt` (`302 -> us.aws.cdn.hf.co`) | 913106900 | `87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e` | HF LFS SHA-256 `87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e`: **matches** |
 
 **Demucs.** Host and path are the ones hard-coded in the hash-locked
 `demucs==4.0.1` package (`ROOT_URL` in `pretrained.py`, names in
@@ -89,6 +90,7 @@ SHA-256 in the lock, and were read in full before first use.
 |---------|--------|-------|--------------|
 | `starrytong/SCNet` | `5d95bf96b19c3eede63248d171efeca8e3abb948` | `scnet/SCNet.py`, `scnet/separation.py`, `scnet/__init__.py`, `conf/config.yaml` | model definition only: no I/O, network, subprocess or dynamic code. `apply.py` / `inference.py` (which import `accelerate`) are not fetched. Configs are parsed with `yaml.safe_load` |
 | `fschmid56/EfficientAT` | `a425fdce92572e602a1d5634799bd9f1f2efa806` | `models/mn/model.py`, `utils.py`, `block_types.py`, `attention_pooling.py`, `models/preprocess.py`, `metadata/class_labels_indices.csv` | `model.py` can download weights by itself when given a `pretrained_name`; it is always called with `pretrained_name=None`, so that path never runs. `helpers/utils.py` (reads a CSV from the working directory at import) is not fetched; the one name imported from it is supplied locally |
+| `ZFTurbo/Music-Source-Separation-Training` | `1f700c386e0dd763fe0a57242bb9420dce987354` | `configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml`, `models/bs_roformer/mel_band_roformer.py`, `models/bs_roformer/attend.py` | Only the model definition and config are fetched; runtime export uses a self-contained ONNX-compatible reimplementation in `export_melband_roformer.py` (`yaml.SafeLoader` with tuple constructor only), and the fetched upstream files are used solely for one-off manual PyTorch parity verification (when upstream optional deps excluded from `uv.lock` are supplied, invoked via `check_reference.py --model melband_roformer_vocals`) |
 
 The large-model `config.yaml` comes from the author's Drive link
 (1080 bytes, `629a4901184bf1d3a75b0b13904f35974785aa042cad3c010fd576248cdce3f0`).
@@ -117,6 +119,7 @@ All three report the same globals for every file.
 | checkpoint | globals referenced | outside the base policy |
 |------------|--------------------|-------------------------|
 | SCNet small, SCNet large | `collections.OrderedDict`, `torch.FloatStorage`, `torch._utils._rebuild_tensor_v2` | none |
+| Mel-Band RoFormer (`MelBandRoformer.ckpt`) | `collections.OrderedDict`, `torch.FloatStorage`, `torch._utils._rebuild_tensor_v2` | none |
 | EfficientAT `mn10_as` | the same three plus `torch.LongStorage` | none |
 | Demucs `5c90dfd2` (htdemucs_6s) | `collections.OrderedDict`, `torch.HalfStorage`, `torch._utils._rebuild_tensor_v2`, `demucs.htdemucs.HTDemucs`, **`fractions.Fraction`** | `fractions.Fraction` |
 | Demucs, the other five | the same plus `numpy.core.multiarray.scalar`, `numpy.dtype`, **`_codecs.encode`** | `fractions.Fraction`, `_codecs.encode` |
@@ -141,6 +144,7 @@ refuses to hand any of them to `torch.load`.
 | checkpoint | method |
 |------------|--------|
 | SCNet small / large | `torch.load(weights_only=True)`, no extra allow-list; the `best_state` dict goes to `load_state_dict(strict=True)` |
+| Mel-Band RoFormer vocals | `torch.load(weights_only=True)`, no extra allow-list (`dist/security/scan_melband_roformer.json`); bare `OrderedDict` state dict loaded via `load_state_dict(strict=True)` |
 | EfficientAT | `torch.load(weights_only=True)`, no extra allow-list; `load_state_dict(strict=True)` |
 | SCNet mirror copies | `torch.load(weights_only=True)` after the same scan, for the tensor comparison only |
 | Demucs `htdemucs_6s` | **not unpickled at all.** `convert_reference.py` interprets the pickle symbolically: 28 known opcodes, 5 allowed names kept as inert tokens, REDUCE recorded and never executed, all sizes bounded. The float16 tensors are copied out of the zip. The export builds `HTDemucs(**kwargs)` from the plain values and constructs `Fraction(39, 5)` itself from the recorded string |
@@ -192,6 +196,7 @@ initializers; no external data (with the one exception below); and
 |------|-------|---------|-------|-----------|-----------|---------------|---------|
 | `scnet_large.onnx` | 17 | default only | 2592 | 0 | 0 | none (316 initializers embedded) | ok |
 | `scnet_small.onnx` | 17 | default only | 2585 | 0 | 0 | none (316 embedded) | ok |
+| `melband_roformer_vocals.onnx` | 17 | default only | 4134 | 0 | 0 | none (672 embedded) | ok |
 | `efficientat_mn10_as.onnx` | 17 | default only | 429 | 0 | 0 | none (131 embedded) | ok |
 | `htdemucs_6s.onnx` | 17 | default only | 4959 | 0 | 0 | **525 initializers in `htdemucs_6s.weights`**, by design | ok |
 
@@ -241,6 +246,8 @@ Final digests (also in `dist/manifest.json`):
 | `scnet_large.onnx.zst` | 77996104 | `05b28dee5fe5da3456c66d477d2250af70dac0d4d1683666d99a8f81ffc4f338` |
 | `scnet_small.onnx` | 22516980 | `358d85f1f89727fa4a64553ab29493d32d70c9be7a888d20ca0fbc2fc7e4a440` |
 | `scnet_small.onnx.zst` | 19752783 | `1aed68ce5f7454df1a0942e9ffd3b5846d682a0772bed27576b8376a3aeb455c` |
+| `melband_roformer_vocals.onnx` | 462710420 | `4524d3d3a00fe6ad4c17631140f262f51f83ece71e09a3fa042ea4278146d4cc` |
+| `melband_roformer_vocals.onnx.zst` | 421660176 | `3926f2e0a951e6660de8aa0d29c49e725cddb02fdb28403014df4b83a74aaf52` |
 | `htdemucs_6s.onnx` | 921793 | `dabfbabffda5c64c8e7645cf8720028189f27825f3b6fb00c19a21d6f622cde2` |
 | `htdemucs_6s.onnx.zst` | 39985 | `6b650670a4c6dcb0366ef823a84e5f404abea6af59e7de07dc7455d413ae064b` |
 | `htdemucs_6s.tensors.json` | 85865 | `37e74ecc3e0983a03bd73a5b957eb29982c3fd5682f9a3bd5513f6d8ba5d1728` |

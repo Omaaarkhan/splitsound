@@ -147,6 +147,7 @@ impl SplitMode {
 pub enum Quality {
     Fast,
     Best,
+    Studio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -701,6 +702,7 @@ mod tests {
         assert_eq!(json!(SourceId::Mix), json!("mix"));
         assert_eq!(json!(SplitMode::Band), json!("band"));
         assert_eq!(json!(Quality::Best), json!("best"));
+        assert_eq!(json!(Quality::Studio), json!("studio"));
         assert_eq!(json!(ExportFormat::Wav32f), json!("wav32f"));
         assert_eq!(json!(ExportFormat::Mp3), json!("mp3"));
         assert_eq!(

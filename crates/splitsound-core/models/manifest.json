@@ -94,6 +94,49 @@
       "weightStorage": "float16"
     },
     {
+      "id": "melband_roformer_vocals",
+      "kind": "melband_roformer",
+      "revision": 1,
+      "name": "Mel-Band RoFormer Vocals",
+      "description": "Studio-grade vocal isolation that minimises vocal bleed into other stems; large and slow.",
+      "source": "GitHub",
+      "restricted": false,
+      "terms": null,
+      "license": "MIT",
+      "attribution": "Mel-Band RoFormer vocal separation model by KimberleyJensen (MIT License) and ZFTurbo/Music-Source-Separation-Training (MIT License). https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model",
+      "origin": "https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model",
+      "file": "melband_roformer_vocals.onnx",
+      "sha256": "4524d3d3a00fe6ad4c17631140f262f51f83ece71e09a3fa042ea4278146d4cc",
+      "sizeBytes": 462710420,
+      "acquire": {
+        "type": "download",
+        "file": "melband_roformer_vocals.onnx.zst",
+        "sha256": "3926f2e0a951e6660de8aa0d29c49e725cddb02fdb28403014df4b83a74aaf52",
+        "sizeBytes": 421660176
+      },
+      "opset": 17,
+      "sources": [
+        "vocals"
+      ],
+      "targets": [
+        "vocals"
+      ],
+      "sampleRate": 44100,
+      "channels": 2,
+      "segmentSamples": 352800,
+      "strideSamples": 176400,
+      "nfft": 2048,
+      "hop": 441,
+      "bins": 1025,
+      "frames": 801,
+      "dynamicBatch": true,
+      "window": "hann",
+      "weightStorage": "float16",
+      "melBands": 60,
+      "winLength": 2048,
+      "normalize": false
+    },
+    {
       "id": "htdemucs_6s",
       "kind": "htdemucs",
       "revision": 1,

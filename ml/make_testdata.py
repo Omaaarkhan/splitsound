@@ -98,7 +98,7 @@ def make_transforms(index: dict, clip: np.ndarray) -> None:
             "roundTrip": "stft_melband_roundtrip.npy",
             "note": "roundTrip = ISTFT_melband(spec)."}
     weight = {str(n): reference.transition_weight(n)[[0, 1, n // 2 - 1, n // 2, n - 1]].tolist()
-              for n in (reference.HT_SEGMENT, reference.SC_SEGMENT)}
+              for n in (reference.HT_SEGMENT, reference.SC_SEGMENT, reference.MB_SEGMENT)}
     index["transforms"]["transitionWeightSamples"] = {
         "note": "weight[i] for i in [0, 1, N/2-1, N/2, N-1], keyed by N", "values": weight}
     index["transforms"]["shiftAmounts"] = {str(k): reference.shift_amounts(k) for k in (0, 1, 2, 3, 4)}
@@ -113,7 +113,7 @@ def make_stems(index: dict, clip: np.ndarray) -> None:
             print(f"-- stems: {model_id} is not exported, skipped")
             continue
         model = reference.open_model(path)
-        estimate = reference.separate(model, clip, shifts=0, normalize=True)
+        estimate = reference.separate(model, clip, shifts=0, normalize=model.normalize)
         folder = OUT / "stems" / model_id
         folder.mkdir(parents=True, exist_ok=True)
         files = {}
@@ -121,11 +121,12 @@ def make_stems(index: dict, clip: np.ndarray) -> None:
             soundfile.write(str(folder / f"{name}.wav"), estimate[s].T, reference.SAMPLE_RATE, subtype="FLOAT")
             files[name] = {"file": f"stems/{model_id}/{name}.wav", "peak": float(np.abs(estimate[s]).max()),
                            "rms": float(np.sqrt(np.mean(estimate[s].astype(np.float64) ** 2)))}
+        norm_flag = "" if model.normalize else " --no-normalize"
         index["stems"][model_id] = {
             "modelSha256": sha256(path), "segmentSamples": model.segment, "strideSamples": model.stride,
-            "shifts": 0, "normalize": True, "files": files,
+            "shifts": 0, "normalize": model.normalize, "files": files,
             "command": f"uv run --locked reference.py separate dist/{model_id}.onnx dist/testdata/synth_12s.wav "
-                       f"dist/testdata/stems/{model_id} --all-stems"}
+                       f"dist/testdata/stems/{model_id} --all-stems{norm_flag}"}
         print(f"stems: {model_id} -> {list(files)}")
 
 
@@ -291,8 +292,8 @@ Nothing here is committed. All `.npy` files are little-endian, version 1.0 heade
 | `stft_scnet_input.npy` | float32 `[485100]`: left channel of the first 11 s of the clip |
 | `stft_scnet_spec.npy` | complex64 `[2049, 476]`: `STFT_scnet` of it (CONTRACT.md 3.1) |
 | `stft_scnet_roundtrip.npy` | float32 `[485100]`: `ISTFT_scnet` of that spectrogram (equals the input to float precision) |
-| `stft_melband_*.npy` | the same three files for the `melband_roformer` transform, when that model is exported |
-| `stems/<model>/<stem>.wav` | float32 stereo: what `reference.py` produces for the clip with that model (shifts 0, normalisation on, the model's default stride) |
+| `stft_melband_*.npy` | the same three files for the `melband_roformer` transform (`STFT_melband` / `ISTFT_melband`, CONTRACT.md 4) |
+| `stems/<model>/<stem>.wav` | float32 stereo: what `reference.py` produces for the clip with that model (shifts 0, per-model `normalize`, default stride) |
 | `tagger_input_32k.npy` | float32 `[320000]`: one 10 s mono window at 32 kHz |
 | `tagger_probs.npy` | float32 `[527]`: the tagger's output for that window |
 | `tagger_long_input_32k.npy`, `tagger_long_max.npy`, `tagger_long_mean.npy` | a 23 s input (4 windows, the last zero-padded) and the max / mean aggregates |

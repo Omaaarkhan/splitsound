@@ -168,6 +168,25 @@ pub struct RuntimeConfig {
     pub cache_dir: Option<PathBuf>,
 }
 
+/// Per-session execution options layered on top of [`RuntimeConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Whether this model may attempt the configured GPU/NPU backend (CoreML).
+    pub allow_gpu: bool,
+    /// ONNX Runtime memory pattern planner (default `true`; disabling saves
+    /// peak RSS and wall time on large transformer graphs).
+    pub memory_pattern: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            allow_gpu: true,
+            memory_pattern: true,
+        }
+    }
+}
+
 /// The loaded ONNX Runtime.
 pub struct Runtime {
     env: Environment,
@@ -345,9 +364,13 @@ impl Runtime {
         }
     }
 
-    fn base_builder(&self) -> Result<SessionBuilder> {
+    fn base_builder(&self, session_cfg: SessionConfig) -> Result<SessionBuilder> {
         let threads = self.threads();
-        Session::builder(&self.env)
+        // The graphs' one symbolic dimension, `batch`, is deliberately
+        // left symbolic on the CPU provider: fixing it makes ONNX Runtime
+        // plan one arena for every intermediate tensor and triples peak
+        // memory for no gain in speed (ml/BENCHMARKS.md, section 3).
+        let builder = Session::builder(&self.env)
             .map_err(|e| ort_err("session options", e))?
             // `ort` switches on ONNX Runtime's automatic device selection
             // by default, which on macOS silently registers CoreML (and
@@ -361,15 +384,17 @@ impl Runtime {
             .map_err(|e| ort_err("session options", e))?
             // One model call at a time; no second pool competing for cores.
             .with_inter_threads(1)
-            .map_err(|e| ort_err("session options", e))
-        // The graphs' one symbolic dimension, `batch`, is deliberately
-        // left symbolic on the CPU provider: fixing it makes ONNX Runtime
-        // plan one arena for every intermediate tensor and triples peak
-        // memory for no gain in speed (ml/BENCHMARKS.md, section 3). The
-        // arena and memory-pattern defaults are the best measured there.
+            .map_err(|e| ort_err("session options", e))?;
+        if !session_cfg.memory_pattern {
+            builder
+                .with_memory_pattern(false)
+                .map_err(|e| ort_err("session options", e))
+        } else {
+            Ok(builder)
+        }
     }
 
-    fn gpu_builder(&self) -> Result<(SessionBuilder, Provider)> {
+    fn gpu_builder(&self, session_cfg: SessionConfig) -> Result<(SessionBuilder, Provider)> {
         #[cfg(target_os = "macos")]
         {
             use ort::ep::coreml::{ComputeUnits, ModelFormat};
@@ -387,7 +412,7 @@ impl Runtime {
                 ep = ep.with_model_cache_dir(dir.display());
             }
             let builder = self
-                .base_builder()?
+                .base_builder(session_cfg)?
                 // CoreML wants static shapes.
                 .with_dimension_override("batch", 1)
                 .map_err(|e| ort_err("session options", e))?
@@ -397,31 +422,54 @@ impl Runtime {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = session_cfg;
             Err(Error::internal("no GPU execution path in this build"))
         }
     }
 
     /// Builds a session with `commit`, trying the GPU path first when the
-    /// settings ask for it and falling back to CPU if the provider fails
-    /// to register or the session fails to build on it.
+    /// settings and `session_cfg` allow it and falling back to CPU if the
+    /// provider fails to register or the session fails to build on it.
     fn build_with_fallback(
         &self,
+        session_cfg: SessionConfig,
         commit: &dyn Fn(SessionBuilder) -> std::result::Result<Session, ort::Error>,
     ) -> Result<(Session, Provider)> {
-        if self.wants_gpu()
-            && let Ok((builder, provider)) = self.gpu_builder()
+        if session_cfg.allow_gpu
+            && self.wants_gpu()
+            && let Ok((builder, provider)) = self.gpu_builder(session_cfg)
             && let Ok(session) = commit(builder)
         {
             return Ok((session, provider));
         }
-        let session = commit(self.base_builder()?).map_err(|e| ort_err("loading the model", e))?;
+        let session =
+            commit(self.base_builder(session_cfg)?).map_err(|e| ort_err("loading the model", e))?;
         Ok((session, Provider::Cpu))
     }
 
     /// Builds a session from model bytes that are already verified. The
     /// model must be self-contained (no external data).
     pub fn session_from_memory(&self, model: &[u8]) -> Result<(Session, Provider)> {
-        self.build_with_fallback(&|mut b| b.commit_from_memory(model))
+        self.build_with_fallback(SessionConfig::default(), &|mut b| {
+            b.commit_from_memory(model)
+        })
+    }
+
+    /// Builds a session from verified bytes with explicit per-session options.
+    pub fn session_from_verified_with(
+        &self,
+        graph: &[u8],
+        external: Option<(&str, std::sync::Arc<[u8]>)>,
+        session_cfg: SessionConfig,
+    ) -> Result<(Session, Provider)> {
+        match external {
+            None => self.build_with_fallback(session_cfg, &|mut b| b.commit_from_memory(graph)),
+            Some((name, bytes)) => self.build_with_fallback(session_cfg, &|b| {
+                b.with_external_initializer_file_in_memory(name, bytes.clone())
+                    .map_err(ort::Error::<()>::from)?
+                    .commit_from_memory(graph)
+            }),
+        }
     }
 
     /// Builds a session from verified bytes: the graph, plus (for a graph
@@ -436,21 +484,14 @@ impl Runtime {
         graph: &[u8],
         external: Option<(&str, std::sync::Arc<[u8]>)>,
     ) -> Result<(Session, Provider)> {
-        match external {
-            None => self.session_from_memory(graph),
-            Some((name, bytes)) => self.build_with_fallback(&|b| {
-                b.with_external_initializer_file_in_memory(name, bytes.clone())
-                    .map_err(ort::Error::<()>::from)?
-                    .commit_from_memory(graph)
-            }),
-        }
+        self.session_from_verified_with(graph, external, SessionConfig::default())
     }
 
     /// Builds a session from a model file. Needed for graphs whose weights
     /// live in a sibling external-data file, which ONNX Runtime resolves
     /// relative to the graph's own folder.
     pub fn session_from_file(&self, path: &Path) -> Result<(Session, Provider)> {
-        self.build_with_fallback(&|mut b| b.commit_from_file(path))
+        self.build_with_fallback(SessionConfig::default(), &|mut b| b.commit_from_file(path))
     }
 }
 

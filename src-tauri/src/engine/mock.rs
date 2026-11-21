@@ -79,6 +79,18 @@ const CATALOG: &[MockModel] = &[
         terms: None,
     },
     MockModel {
+        id: "melband_roformer_vocals",
+        name: "Mel-Band RoFormer Vocals",
+        description: "Studio-grade vocal isolation that minimises vocal bleed into other stems; large and slow.",
+        size: 463 * MB,
+        download: 422 * MB,
+        license: "MIT",
+        attribution: "Mel-Band RoFormer vocal separation model by KimberleyJensen (MIT License) and ZFTurbo/Music-Source-Separation-Training (MIT License). https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model",
+        source: "GitHub",
+        restricted: false,
+        terms: None,
+    },
+    MockModel {
         id: "htdemucs_6s",
         name: "Demucs 6-stem",
         description: "Separates guitar and piano from the rest of the song.",
@@ -110,13 +122,16 @@ const DOWNLOAD_BPS: f64 = 40.0 * MB as f64;
 const CHUNK: usize = 65_536;
 
 fn models_for(options: &SplitOptions) -> Vec<&'static str> {
-    let scnet = match options.quality {
-        Quality::Fast => "scnet_small",
-        Quality::Best => "scnet_large",
-    };
-    match options.mode {
-        SplitMode::Vocals | SplitMode::Band => vec![scnet],
-        SplitMode::All => vec![scnet, "htdemucs_6s"],
+    match (options.mode, options.quality) {
+        (SplitMode::Vocals, Quality::Studio) => vec!["melband_roformer_vocals"],
+        (SplitMode::Band, Quality::Studio) => vec!["melband_roformer_vocals", "scnet_large"],
+        (SplitMode::All, Quality::Studio) => {
+            vec!["melband_roformer_vocals", "scnet_large", "htdemucs_6s"]
+        }
+        (SplitMode::Vocals | SplitMode::Band, Quality::Fast) => vec!["scnet_small"],
+        (SplitMode::Vocals | SplitMode::Band, Quality::Best) => vec!["scnet_large"],
+        (SplitMode::All, Quality::Fast) => vec!["scnet_small", "htdemucs_6s"],
+        (SplitMode::All, Quality::Best) => vec!["scnet_large", "htdemucs_6s"],
     }
 }
 
@@ -219,6 +234,7 @@ impl MockEngine {
         match quality {
             Quality::Fast => base,
             Quality::Best => base * 2.0,
+            Quality::Studio => base * 4.5,
         }
     }
 }

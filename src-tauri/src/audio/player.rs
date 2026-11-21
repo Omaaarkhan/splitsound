@@ -64,6 +64,7 @@ struct MixerInit {
 
 enum MixerCmd {
     Load(Box<SessionAudio>, MixerInit),
+    Reattach(Box<SessionAudio>, MixerInit),
     Unload(Option<Sender<()>>),
     /// Fence: acknowledges once every earlier command (including any prior
     /// Load/Unload replacing `self.audio`) has completed and dropped old files.
@@ -82,12 +83,29 @@ enum MixerCmd {
     Shutdown,
 }
 
+struct PlayerState {
+    playback: PlaybackState,
+    /// Stems currently auto-muted because `StemInfo.present` was `false`
+    /// and the user has not explicitly overridden their mute/solo state.
+    auto_muted: Vec<SourceId>,
+    /// Stems reported as `!present` on the most recent load or reattach.
+    absent: Vec<SourceId>,
+}
+
 struct Shared {
-    state: Mutex<PlaybackState>,
+    state: Mutex<PlayerState>,
     /// Song position (44.1 kHz frames) of what the listener hears now.
     heard: AtomicU64,
     events: Arc<dyn EventSink>,
     activity: Arc<ActivityFlag>,
+}
+
+fn stem_is_present(session: &Session, id: StemId) -> bool {
+    session
+        .stems
+        .iter()
+        .find(|s| s.id == id)
+        .is_some_and(|s| s.present)
 }
 
 impl Shared {
@@ -168,7 +186,11 @@ impl Player {
     pub fn new(events: Arc<dyn EventSink>, factory: BackendFactory) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
-            state: Mutex::new(empty_state(0.0)),
+            state: Mutex::new(PlayerState {
+                playback: empty_state(0.0),
+                auto_muted: Vec::new(),
+                absent: Vec::new(),
+            }),
             heard: AtomicU64::new(0),
             events,
             activity: Arc::new(ActivityFlag::default()),
@@ -210,13 +232,13 @@ impl Player {
 
     /// Current state, with the position of what is being heard.
     pub fn state(&self) -> PlaybackState {
-        let st = lock(&self.shared.state);
-        self.shared.snapshot(&st)
+        let inner = lock(&self.shared.state);
+        self.shared.snapshot(&inner.playback)
     }
 
     /// Id of the loaded session, if any.
     pub fn loaded_session(&self) -> Option<String> {
-        lock(&self.shared.state).session_id.clone()
+        lock(&self.shared.state).playback.session_id.clone()
     }
 
     fn open_audio(session: &Session, dir: &Path) -> IpcResult<SessionAudio> {
@@ -248,14 +270,35 @@ impl Player {
         })
     }
 
-    /// Loads a session (its folder is `dir`). Channels start at 0 dB,
-    /// unmuted; the master gain is kept. Plays stems when the session has
-    /// them, the original otherwise.
+    /// Loads a session (its folder is `dir`). Present channels start at 0 dB,
+    /// unmuted, while absent channels (`!present`) start auto-muted; the master
+    /// gain is kept. Plays stems when the session has them, the original
+    /// otherwise.
     pub fn load(&self, session: &Session, dir: &Path) -> IpcResult<PlaybackState> {
         let audio = Self::open_audio(session, dir)?;
         let frames = audio.mix.frames();
-        let mut st = lock(&self.shared.state);
+        let mut inner = lock(&self.shared.state);
         let has_stems = !audio.stems.is_empty();
+        let mut new_absent = Vec::new();
+        let channels: Vec<ChannelState> = audio
+            .stems
+            .iter()
+            .map(|(id, _)| {
+                let sid = SourceId::from(*id);
+                let present = stem_is_present(session, *id);
+                if !present {
+                    new_absent.push(sid);
+                }
+                ChannelState {
+                    id: sid,
+                    gain_db: 0.0,
+                    muted: !present,
+                    solo: false,
+                }
+            })
+            .collect();
+        inner.auto_muted = new_absent.clone();
+        inner.absent = new_absent;
         let next = PlaybackState {
             session_id: Some(session.id.clone()),
             playing: false,
@@ -267,17 +310,8 @@ impl Player {
                 PlaybackSource::Original
             },
             loop_range: None,
-            master_gain_db: st.master_gain_db,
-            channels: audio
-                .stems
-                .iter()
-                .map(|(id, _)| ChannelState {
-                    id: SourceId::from(*id),
-                    gain_db: 0.0,
-                    muted: false,
-                    solo: false,
-                })
-                .collect(),
+            master_gain_db: inner.playback.master_gain_db,
+            channels,
         };
         let init = MixerInit {
             channels: next.channels.iter().map(params_of).collect(),
@@ -286,11 +320,11 @@ impl Player {
             loop_frames: None,
             position: 0,
         };
-        *st = next;
+        inner.playback = next;
         self.shared.heard.store(0, Ordering::Relaxed);
         self.send(MixerCmd::Load(Box::new(audio), init));
-        self.shared.emit_state(&st);
-        Ok(self.shared.snapshot(&st))
+        self.shared.emit_state(&inner.playback);
+        Ok(self.shared.snapshot(&inner.playback))
     }
 
     fn wait_ack(rx: Receiver<()>, timeout: Duration) -> IpcResult<()> {
@@ -308,12 +342,14 @@ impl Player {
     fn unload_with_timeout(&self, timeout: Duration) -> IpcResult<()> {
         let (tx, rx) = mpsc::channel();
         {
-            let mut st = lock(&self.shared.state);
-            if st.session_id.is_some() {
-                *st = empty_state(st.master_gain_db);
+            let mut inner = lock(&self.shared.state);
+            if inner.playback.session_id.is_some() {
+                inner.playback = empty_state(inner.playback.master_gain_db);
+                inner.auto_muted.clear();
+                inner.absent.clear();
                 self.shared.heard.store(0, Ordering::Relaxed);
                 self.send(MixerCmd::Unload(Some(tx)));
-                self.shared.emit_state(&st);
+                self.shared.emit_state(&inner.playback);
             } else {
                 // Fence behind any earlier Load/Unload so no mapping is still
                 // being dropped on the mixer thread when we return.
@@ -336,12 +372,14 @@ impl Player {
     pub fn unload_if(&self, session_id: &str) -> IpcResult<()> {
         let (tx, rx) = mpsc::channel();
         {
-            let mut st = lock(&self.shared.state);
-            if st.session_id.as_deref() == Some(session_id) {
-                *st = empty_state(st.master_gain_db);
+            let mut inner = lock(&self.shared.state);
+            if inner.playback.session_id.as_deref() == Some(session_id) {
+                inner.playback = empty_state(inner.playback.master_gain_db);
+                inner.auto_muted.clear();
+                inner.absent.clear();
                 self.shared.heard.store(0, Ordering::Relaxed);
                 self.send(MixerCmd::Unload(Some(tx)));
-                self.shared.emit_state(&st);
+                self.shared.emit_state(&inner.playback);
             } else {
                 // Another session may have just replaced `session_id` via
                 // `load`; wait for the mixer thread to apply that Load and
@@ -360,12 +398,13 @@ impl Player {
     pub fn detach(&self, session_id: &str) -> IpcResult<bool> {
         let (tx, rx) = mpsc::channel();
         let was_loaded = {
-            let mut st = lock(&self.shared.state);
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
             if st.session_id.as_deref() == Some(session_id) {
                 self.send(MixerCmd::Unload(Some(tx)));
                 if st.playing {
                     st.playing = false;
-                    self.shared.emit_state(&st);
+                    self.shared.emit_state(st);
                 }
                 true
             } else {
@@ -390,31 +429,78 @@ impl Player {
                 return;
             }
         };
-        let mut st = lock(&self.shared.state);
-        if st.session_id.as_deref() != Some(session.id.as_str()) {
+        let mut inner = lock(&self.shared.state);
+        if inner.playback.session_id.as_deref() != Some(session.id.as_str()) {
             return;
         }
-        let old = std::mem::take(&mut st.channels);
-        st.channels = audio
+        let prev_auto = std::mem::take(&mut inner.auto_muted);
+        let prev_absent = std::mem::take(&mut inner.absent);
+        let old = std::mem::take(&mut inner.playback.channels);
+        let mut new_auto = Vec::new();
+        let mut new_absent = Vec::new();
+        inner.playback.channels = audio
             .stems
             .iter()
             .map(|(id, _)| {
                 let sid = SourceId::from(*id);
-                old.iter()
-                    .find(|c| c.id == sid)
-                    .cloned()
-                    .unwrap_or(ChannelState {
-                        id: sid,
-                        gain_db: 0.0,
-                        muted: false,
-                        solo: false,
-                    })
+                let present = stem_is_present(session, *id);
+                let prev = old.iter().find(|c| c.id == sid);
+                let was_auto = prev_auto.contains(&sid);
+                let was_absent = prev_absent.contains(&sid);
+                if !present {
+                    new_absent.push(sid);
+                    if was_absent && !was_auto {
+                        prev.cloned().unwrap_or(ChannelState {
+                            id: sid,
+                            gain_db: 0.0,
+                            muted: true,
+                            solo: false,
+                        })
+                    } else if !was_absent && prev.is_some_and(|p| p.muted) {
+                        // Keep a manual mute set while the stem was present so a
+                        // later re-split finding it present does not unmute it.
+                        ChannelState {
+                            id: sid,
+                            gain_db: prev.map_or(0.0, |c| c.gain_db),
+                            muted: true,
+                            solo: false,
+                        }
+                    } else {
+                        new_auto.push(sid);
+                        ChannelState {
+                            id: sid,
+                            gain_db: prev.map_or(0.0, |c| c.gain_db),
+                            muted: true,
+                            solo: false,
+                        }
+                    }
+                } else {
+                    match prev {
+                        Some(p) => {
+                            let mut ch = p.clone();
+                            if was_auto {
+                                ch.muted = false;
+                            }
+                            ch
+                        }
+                        None => ChannelState {
+                            id: sid,
+                            gain_db: 0.0,
+                            muted: false,
+                            solo: false,
+                        },
+                    }
+                }
             })
             .collect();
+        inner.auto_muted = new_auto;
+        inner.absent = new_absent;
+        let st = &mut inner.playback;
         if st.channels.is_empty() {
             st.source = PlaybackSource::Original;
-        } else if old.is_empty() && !st.playing {
-            // First split of a song that was loaded: switch to the stems.
+        } else if old.is_empty() {
+            // First split of a song that was loaded (whether paused or playing):
+            // switch to the stems so playback controls apply immediately.
             st.source = PlaybackSource::Stems;
         }
         st.duration_sec = audio.mix.frames() as f64 / RATE as f64;
@@ -425,11 +511,11 @@ impl Player {
             loop_frames: loop_frames(st.loop_range),
             position: self.shared.heard.load(Ordering::Relaxed),
         };
-        self.send(MixerCmd::Load(Box::new(audio), init));
-        if st.playing {
-            self.send(MixerCmd::Play);
-        }
-        self.shared.emit_state(&st);
+        // No `Play` here: a playing mixer keeps playing across the swap, and
+        // one that already rendered to the end must not restart while its
+        // tail is still draining to the device.
+        self.send(MixerCmd::Reattach(Box::new(audio), init));
+        self.shared.emit_state(st);
     }
 
     fn require_loaded(st: &PlaybackState) -> IpcResult<()> {
@@ -443,12 +529,13 @@ impl Player {
     /// Starts playback. Opens the output device if needed; rejects with
     /// `audio_device` if there is none.
     pub fn play(&self) -> IpcResult<()> {
-        Self::require_loaded(&lock(&self.shared.state))?;
+        Self::require_loaded(&lock(&self.shared.state).playback)?;
         self.device()
             .ensure_open(Duration::from_secs(4))
             .map_err(|m| IpcError::new(ErrorCode::AudioDevice, m))?;
-        let mut st = lock(&self.shared.state);
-        Self::require_loaded(&st)?;
+        let mut inner = lock(&self.shared.state);
+        let st = &mut inner.playback;
+        Self::require_loaded(st)?;
         if st.playing {
             return Ok(());
         }
@@ -460,22 +547,24 @@ impl Player {
             self.shared.heard.store(start, Ordering::Relaxed);
         }
         self.send(MixerCmd::Play);
-        self.shared.emit_state(&st);
+        self.shared.emit_state(st);
         Ok(())
     }
 
     pub fn pause(&self) {
-        let mut st = lock(&self.shared.state);
+        let mut inner = lock(&self.shared.state);
+        let st = &mut inner.playback;
         if st.playing {
             st.playing = false;
             self.send(MixerCmd::Pause);
-            self.shared.emit_state(&st);
+            self.shared.emit_state(st);
         }
     }
 
     pub fn seek(&self, position_sec: f64) -> IpcResult<()> {
-        let st = lock(&self.shared.state);
-        Self::require_loaded(&st)?;
+        let inner = lock(&self.shared.state);
+        let st = &inner.playback;
+        Self::require_loaded(st)?;
         let sec = if position_sec.is_finite() {
             position_sec.clamp(0.0, st.duration_sec)
         } else {
@@ -489,7 +578,7 @@ impl Player {
                 .events
                 .emit(AppEvent::PlaybackTick(PlaybackTick {
                     position_sec: sec,
-                    levels: zero_levels(&st),
+                    levels: zero_levels(st),
                 }));
         }
         Ok(())
@@ -502,13 +591,17 @@ impl Player {
         muted: Option<bool>,
         solo: Option<bool>,
     ) -> IpcResult<()> {
-        let mut st = lock(&self.shared.state);
-        Self::require_loaded(&st)?;
-        let Some(index) = st.channels.iter().position(|c| c.id == id) else {
+        let mut inner = lock(&self.shared.state);
+        Self::require_loaded(&inner.playback)?;
+        let Some(index) = inner.playback.channels.iter().position(|c| c.id == id) else {
             return Err(IpcError::not_found(
                 "That stem isn't part of the loaded song.",
             ));
         };
+        if muted.is_some() || solo.is_some() {
+            inner.auto_muted.retain(|&s| s != id);
+        }
+        let st = &mut inner.playback;
         let ch = &mut st.channels[index];
         if let Some(g) = gain_db {
             ch.gain_db = mixer::clamp_db(g);
@@ -539,28 +632,37 @@ impl Player {
             (None, None) => {}
         }
         let p = params_of(ch);
+        let switched = st.source == PlaybackSource::Original;
+        if switched {
+            st.source = PlaybackSource::Stems;
+        }
         self.send(MixerCmd::Channel(index, p));
-        self.shared.emit_state(&st);
+        if switched {
+            self.send(MixerCmd::Original(false));
+        }
+        self.shared.emit_state(st);
         Ok(())
     }
 
     pub fn set_master(&self, gain_db: f64) {
-        let mut st = lock(&self.shared.state);
+        let mut inner = lock(&self.shared.state);
+        let st = &mut inner.playback;
         st.master_gain_db = mixer::clamp_db(gain_db);
         self.send(MixerCmd::Master(st.master_gain_db));
-        self.shared.emit_state(&st);
+        self.shared.emit_state(st);
     }
 
     pub fn set_source(&self, source: PlaybackSource) -> IpcResult<()> {
-        let mut st = lock(&self.shared.state);
-        Self::require_loaded(&st)?;
+        let mut inner = lock(&self.shared.state);
+        let st = &mut inner.playback;
+        Self::require_loaded(st)?;
         if source == PlaybackSource::Stems && st.channels.is_empty() {
             return Err(IpcError::not_found("This song hasn't been split yet."));
         }
         if st.source != source {
             st.source = source;
             self.send(MixerCmd::Original(source == PlaybackSource::Original));
-            self.shared.emit_state(&st);
+            self.shared.emit_state(st);
         }
         Ok(())
     }
@@ -568,8 +670,9 @@ impl Player {
     /// Sets or clears the loop. Requests that are not a valid range inside
     /// the song (non-finite, reversed, shorter than 10 ms) clear it.
     pub fn set_loop(&self, range: Option<LoopRange>) -> IpcResult<()> {
-        let mut st = lock(&self.shared.state);
-        Self::require_loaded(&st)?;
+        let mut inner = lock(&self.shared.state);
+        let st = &mut inner.playback;
+        Self::require_loaded(st)?;
         let l = normalise_loop(range, st.duration_sec);
         st.loop_range = l;
         if let Some(l) = l {
@@ -581,7 +684,7 @@ impl Player {
             }
         }
         self.send(MixerCmd::Loop(loop_frames(l)));
-        self.shared.emit_state(&st);
+        self.shared.emit_state(st);
         Ok(())
     }
 
@@ -589,7 +692,8 @@ impl Player {
     /// settings (mute/solo applied), plus the master gain. `None` if that
     /// session is not loaded.
     pub fn mixdown_gains(&self, session_id: &str) -> Option<(Vec<(StemId, f32)>, f32)> {
-        let st = lock(&self.shared.state);
+        let inner = lock(&self.shared.state);
+        let st = &inner.playback;
         if st.session_id.as_deref() != Some(session_id) {
             return None;
         }
@@ -713,29 +817,56 @@ impl MixerThread {
         }
     }
 
+    fn install_audio(&mut self, audio: Box<SessionAudio>, init: MixerInit, preserve_live: bool) {
+        // Live while the core is rendering, and also while blocks it already
+        // rendered are still queued for the device (a pause fade, or the tail
+        // of a track that reached its end): rewinding to the heard position
+        // then would play that queued audio a second time.
+        let live = preserve_live
+            && self.audio.is_some()
+            && (self.core.is_active() || !self.marks.is_empty());
+        let prev_pos = self.core.position();
+        let prev_transport = self.core.transport();
+        let prev_xfade = self.core.xfade();
+        let prev_playing = self.core.is_playing();
+        let prev_ended = self.core.has_ended();
+        // Drop any previous session's mappings before installing the new one.
+        drop(self.audio.take());
+        let frames = audio.mix.frames();
+        self.core = MixerCore::new(audio.stems.len(), frames);
+        for (i, p) in init.channels.iter().enumerate() {
+            self.core.set_channel(i, *p);
+        }
+        self.core.set_master_db(init.master_db);
+        let pos = if live {
+            prev_pos.min(frames)
+        } else {
+            init.position
+        };
+        self.core.seek(pos);
+        self.core.set_loop(init.loop_frames);
+        if live {
+            self.core
+                .restore_live(prev_transport, prev_xfade, prev_playing, prev_ended);
+        }
+        self.core.set_original(init.original);
+        self.ids = audio
+            .stems
+            .iter()
+            .map(|(id, _)| SourceId::from(*id))
+            .collect();
+        self.audio = Some(audio);
+        if !live {
+            self.marks.clear();
+            self.tick_peaks = [0.0; MAX_METERS];
+        }
+    }
+
     /// Returns false on shutdown.
     fn handle(&mut self, cmd: MixerCmd) -> bool {
         match cmd {
-            MixerCmd::Load(audio, init) => {
-                // Drop any previous session's mappings before installing the new one.
-                drop(self.audio.take());
-                self.core = MixerCore::new(audio.stems.len(), audio.mix.frames());
-                for (i, p) in init.channels.iter().enumerate() {
-                    self.core.set_channel(i, *p);
-                }
-                self.core.set_master_db(init.master_db);
-                self.core.set_original(init.original);
-                self.core.set_loop(init.loop_frames);
-                self.core.seek(init.position);
-                self.ids = audio
-                    .stems
-                    .iter()
-                    .map(|(id, _)| SourceId::from(*id))
-                    .collect();
-                self.audio = Some(audio);
-                self.marks.clear();
-                self.tick_peaks = [0.0; MAX_METERS];
-            }
+            MixerCmd::Load(audio, init) => self.install_audio(audio, init, false),
+            MixerCmd::Reattach(audio, init) => self.install_audio(audio, init, true),
             MixerCmd::Unload(ack) => {
                 drop(self.audio.take());
                 self.core = MixerCore::new(0, 0);
@@ -776,10 +907,11 @@ impl MixerThread {
                 self.marks.clear();
                 self.core.stop_now();
                 self.core.seek(self.shared.heard.load(Ordering::Relaxed));
-                let mut st = lock(&self.shared.state);
+                let mut inner = lock(&self.shared.state);
+                let st = &mut inner.playback;
                 if st.playing {
                     st.playing = false;
-                    self.shared.emit_state(&st);
+                    self.shared.emit_state(st);
                 }
             }
             #[cfg(test)]
@@ -871,10 +1003,11 @@ impl MixerThread {
             consumed = true;
         }
         if ended {
-            let mut st = lock(&self.shared.state);
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
             if st.session_id.is_some() {
                 st.playing = false;
-                self.shared.emit_state(&st);
+                self.shared.emit_state(st);
             }
         }
         let due = self.last_tick.elapsed() >= TICK_EVERY;
@@ -1352,6 +1485,312 @@ mod tests {
         drop(tx);
         player.unload().unwrap();
         assert_eq!(MappedWav::live_mappings_under(&dir), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reattach_while_playing_and_channel_edit_switch_from_original_to_stems() {
+        let sink = Arc::new(RecordingSink::default());
+        // A quarter of real time: the 0.5 s file lasts 2 s, so a stalled CI
+        // machine cannot reach its end before the assertions below.
+        let player = Player::new(sink.clone(), fake_factory(0.25));
+        let (dir, mut s_unsplit) = fixture(&[StemId::Vocals, StemId::Instrumental]);
+        s_unsplit.stems.clear();
+        player.load(&s_unsplit, &dir).unwrap();
+        assert_eq!(player.state().source, PlaybackSource::Original);
+        sink.take();
+        player.play().unwrap();
+        assert!(player.state().playing);
+
+        // Wait until live audio is playing and ticks have advanced before
+        // attaching stems without detaching (the real first-split path).
+        wait_for(&sink, Duration::from_secs(2), |ev| {
+            ev.iter()
+                .any(|e| matches!(e, AppEvent::PlaybackTick(t) if t.position_sec > 0.02))
+        });
+        let pos_before = player.state().position_sec;
+
+        let mut s_split = s_unsplit.clone();
+        s_split.stems = session(&s_split.id, &dir, &[StemId::Vocals, StemId::Instrumental]).stems;
+        player.reattach(&s_split, &dir);
+        let st = player.state();
+        assert!(
+            st.playing,
+            "playback should keep playing across first-split reattach"
+        );
+        assert_eq!(
+            st.source,
+            PlaybackSource::Stems,
+            "first split while playing should switch to Stems"
+        );
+
+        wait_for(&sink, Duration::from_secs(2), |_| {
+            player.state().position_sec > pos_before + 0.03
+        });
+        let events = sink.snapshot();
+        let ticks: Vec<f64> = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::PlaybackTick(t) => Some(t.position_sec),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ticks.windows(2).all(|w| w[1] >= w[0]),
+            "live reattach must not rewind playback position: {ticks:?}"
+        );
+        assert!(player.state().position_sec > pos_before);
+
+        // Switching back to Original and muting a channel switches to Stems.
+        player.set_source(PlaybackSource::Original).unwrap();
+        assert_eq!(player.state().source, PlaybackSource::Original);
+        player
+            .set_channel(SourceId::Vocals, None, Some(true), None)
+            .unwrap();
+        assert_eq!(player.state().source, PlaybackSource::Stems);
+        assert!(player.state().channels[0].muted);
+
+        player.unload().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A mixer thread driven by hand, with no device thread: the test decides
+    /// exactly how much of the queued audio the "device" has played.
+    struct Rig {
+        mixer: MixerThread,
+        shared: Arc<Shared>,
+        consumer: rtrb::Consumer<f32>,
+        played: Arc<AtomicU64>,
+        captured: Vec<f32>,
+        _tx: Sender<MixerCmd>,
+    }
+
+    impl Rig {
+        /// Loads `session` unsplit-or-split as given, opens an output at the
+        /// working rate and starts playing.
+        fn playing(session: &Session, dir: &Path) -> Rig {
+            let (tx, rx) = mpsc::channel();
+            let shared = Arc::new(Shared {
+                state: Mutex::new(PlayerState {
+                    playback: PlaybackState {
+                        session_id: Some(session.id.clone()),
+                        playing: true,
+                        ..empty_state(0.0)
+                    },
+                    auto_muted: Vec::new(),
+                    absent: Vec::new(),
+                }),
+                heard: AtomicU64::new(0),
+                events: Arc::new(RecordingSink::default()),
+                activity: Arc::new(ActivityFlag::default()),
+            });
+            let mut mixer = MixerThread::new(rx, shared.clone());
+            let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_FRAMES * 2);
+            let played = Arc::new(AtomicU64::new(0));
+            mixer.handle(MixerCmd::Load(
+                Box::new(Player::open_audio(session, dir).unwrap()),
+                Rig::init(session, 0),
+            ));
+            mixer.handle(MixerCmd::Output(OutputLink {
+                producer,
+                played: played.clone(),
+                sample_rate: RATE,
+            }));
+            mixer.handle(MixerCmd::Play);
+            Rig {
+                mixer,
+                shared,
+                consumer,
+                played,
+                captured: Vec::new(),
+                _tx: tx,
+            }
+        }
+
+        fn init(session: &Session, position: u64) -> MixerInit {
+            MixerInit {
+                channels: vec![ChannelParams::default(); session.stems.len()],
+                master_db: 0.0,
+                original: session.stems.is_empty(),
+                loop_frames: None,
+                position,
+            }
+        }
+
+        fn queued(&self) -> usize {
+            self.consumer.slots() / 2
+        }
+
+        /// The device plays `frames` of what is queued.
+        fn play_out(&mut self, frames: usize) {
+            let mut buf = vec![0f32; frames * 2];
+            crate::audio::output::fill_device_buffer(&mut buf, 2, &mut self.consumer, &self.played);
+            self.captured.extend_from_slice(&buf);
+            self.mixer.follow_device();
+        }
+
+        /// What the player does on a first split: swap in the stems at the
+        /// heard position, without detaching.
+        fn reattach(&mut self, session: &Session, dir: &Path) {
+            let heard = self.shared.heard.load(Ordering::Relaxed);
+            self.mixer.handle(MixerCmd::Reattach(
+                Box::new(Player::open_audio(session, dir).unwrap()),
+                Rig::init(session, heard),
+            ));
+        }
+
+        fn audible_frames(&self) -> usize {
+            self.captured
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|f| f[0] != 0.0 || f[1] != 0.0)
+                .count()
+        }
+    }
+
+    fn unsplit_and_split() -> (PathBuf, Session, Session) {
+        let (dir, split) = fixture(&[StemId::Vocals, StemId::Instrumental]);
+        let mut unsplit = split.clone();
+        unsplit.stems.clear();
+        (dir, unsplit, split)
+    }
+
+    #[test]
+    fn live_reattach_keeps_the_render_position_not_the_heard_one() {
+        let (dir, unsplit, split) = unsplit_and_split();
+        let mut rig = Rig::playing(&unsplit, &dir);
+        rig.mixer.render_ahead();
+        rig.play_out(BLOCK);
+        let rendered = rig.mixer.core.position();
+        let heard = rig.shared.heard.load(Ordering::Relaxed);
+        assert!(
+            rendered > heard + 1000,
+            "audio is queued ahead of what was heard: {rendered} vs {heard}"
+        );
+
+        rig.reattach(&split, &dir);
+        assert_eq!(
+            rig.mixer.core.position(),
+            rendered,
+            "rewinding to the heard position would replay the queued audio"
+        );
+        assert!(rig.mixer.core.is_playing());
+        assert!(!rig.mixer.core.is_original(), "stems take over");
+
+        drop(rig);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reattach_after_rendering_to_the_end_does_not_replay_the_tail() {
+        let (dir, unsplit, split) = unsplit_and_split();
+        let frames = 22_050;
+        let mut rig = Rig::playing(&unsplit, &dir);
+        // Play until the mixer has rendered the whole track but the device
+        // still has its tail queued.
+        while !rig.mixer.core.has_ended() {
+            rig.play_out(BLOCK);
+            rig.mixer.render_ahead();
+        }
+        assert!(rig.queued() > 1000, "tail queued: {}", rig.queued());
+        assert!(lock(&rig.shared.state).playback.playing);
+        assert!(rig.shared.heard.load(Ordering::Relaxed) < frames);
+
+        rig.reattach(&split, &dir);
+        assert_eq!(rig.mixer.core.position(), frames);
+        assert!(rig.mixer.core.has_ended() && !rig.mixer.core.is_active());
+
+        // The tail drains once, then playback reports the end as usual.
+        for _ in 0..8 {
+            rig.mixer.render_ahead();
+            let queued = rig.queued();
+            rig.play_out(queued.max(BLOCK));
+        }
+        assert!(!lock(&rig.shared.state).playback.playing);
+        assert_eq!(rig.shared.heard.load(Ordering::Relaxed), frames);
+        let audible = rig.audible_frames();
+        assert!(
+            audible.abs_diff(frames as usize) <= BLOCK,
+            "the track plays exactly once: {audible} audible frames of {frames}"
+        );
+
+        // Playing again starts over from the top.
+        rig.mixer.handle(MixerCmd::Play);
+        assert_eq!(rig.mixer.core.position(), 0);
+
+        drop(rig);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn absent_stems_are_muted_until_a_resplit_finds_them() {
+        let sink = Arc::new(RecordingSink::default());
+        let player = Player::new(sink, fake_factory(1.0));
+        let (dir, mut s) = fixture(&[StemId::Vocals, StemId::Guitar, StemId::Piano, StemId::Other]);
+        s.stems[1].present = false; // guitar initially absent
+        s.stems[2].present = true; // piano initially present
+
+        player.load(&s, &dir).unwrap();
+        let ch = &player.state().channels;
+        assert!(!ch[0].muted);
+        assert!(ch[1].muted, "absent stem should be auto-muted on load");
+        assert!(!ch[2].muted);
+        assert!(!ch[3].muted);
+
+        // User mutes vocals, manually mutes piano, and explicitly unmutes+solos absent guitar.
+        player
+            .set_channel(SourceId::Vocals, None, Some(true), None)
+            .unwrap();
+        player
+            .set_channel(SourceId::Piano, None, Some(true), None)
+            .unwrap();
+        player
+            .set_channel(SourceId::Guitar, None, Some(false), Some(true))
+            .unwrap();
+
+        // Re-split 1: guitar is still absent; piano becomes absent too.
+        s.stems[2].present = false;
+        player.detach(&s.id).unwrap();
+        player.reattach(&s, &dir);
+        let ch = &player.state().channels;
+        assert!(ch[0].muted, "manual mute on present stem is kept");
+        assert!(
+            !ch[1].muted && ch[1].solo,
+            "explicit unmute/solo on absent stem is preserved"
+        );
+        assert!(ch[2].muted, "newly absent piano stays muted");
+
+        // Re-split 2: guitar becomes present (explicit override kept -> unmuted);
+        // piano becomes present again -> manually-set mute BEFORE it became absent must survive!
+        s.stems[1].present = true;
+        s.stems[2].present = true;
+        player.detach(&s.id).unwrap();
+        player.reattach(&s, &dir);
+        let ch = &player.state().channels;
+        assert!(ch[0].muted, "manual vocal mute stays");
+        assert!(!ch[1].muted, "newly present guitar stays unmuted");
+        assert!(
+            ch[2].muted,
+            "manual mute across present -> absent -> present sequence must survive"
+        );
+
+        // Also check auto-muted stem (never touched by user) unmutes when found present.
+        s.stems[2].present = false;
+        player.load(&s, &dir).unwrap();
+        assert!(
+            player.state().channels[2].muted,
+            "absent stem auto-muted on load"
+        );
+        s.stems[2].present = true;
+        player.detach(&s.id).unwrap();
+        player.reattach(&s, &dir);
+        assert!(
+            !player.state().channels[2].muted,
+            "auto-muted absent stem unmutes once a re-split finds it present"
+        );
+
+        player.unload().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

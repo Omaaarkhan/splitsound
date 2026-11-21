@@ -32,6 +32,8 @@ runtime.
    the networks only ever see and return plain tensors.
    - Vocals, drums and bass come from **SCNet** (small for Fast, large for
      Best).
+   - **Studio** quality isolates vocals first using **Mel-Band RoFormer** before
+     separating the remaining instruments, substantially reducing vocal bleed.
    - Guitar and piano come from **Demucs 6-stem**, the only practical model
      for them. Its licence is restricted, so it is optional and the app asks
      first (see Models).
@@ -64,6 +66,7 @@ comes from.
 | Model | Used for | Weights licence | How the app gets it |
 | --- | --- | --- | --- |
 | SCNet Small, SCNet Large | vocals, drums, bass, other | MIT (stated by the author) | zstd-compressed ONNX from this repository's `models-v1` release |
+| Mel-Band RoFormer Vocals | vocals (Studio tier) | MIT (author statement & HF model card) | same |
 | Instrument detector (EfficientAT) | naming the instruments | MIT | same |
 | Demucs 6-stem | guitar, piano | **Not open source.** Published by Meta for research; likely CC BY-NC | downloaded from Meta by the user's own copy of the app, after they agree to the terms |
 

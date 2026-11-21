@@ -439,6 +439,81 @@
       "sha256": "bc16895f69551cd8becbba384ae33e6e615a4792649b866036884f4a9a4bb4b0",
       "publisherChecksum": null,
       "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "MelBandRoformer.ckpt",
+      "usedBy": [
+        "melband_roformer_vocals"
+      ],
+      "url": "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/ac9b0614ab3cd7f77219e18ba494dfd93956c348/MelBandRoformer.ckpt",
+      "extraAllowedHosts": {
+        "huggingface.co": "Hugging Face model host; canonical location published by KimberleyJensen (KimberleyJSN/melbandroformer).",
+        "us.aws.cdn.hf.co": "Hugging Face LFS CDN redirect target.",
+        "cas-bridge.xethub.hf.co": "Hugging Face Xet storage CDN redirect target.",
+        "cdn-lfs-us-1.hf.co": "Hugging Face LFS CDN redirect target."
+      },
+      "publisher": "KimberleyJensen (KimberleyJSN/melbandroformer on Hugging Face, commit ac9b0614ab3cd7f77219e18ba494dfd93956c348)",
+      "license": "MIT (author statement, KimberleyJensen/Mel-Band-Roformer-Vocal-Model#18; model card license: mit)",
+      "sizeBytes": 913106900,
+      "sha256": "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e",
+      "publisherChecksum": {
+        "type": "sha256",
+        "value": "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e"
+      },
+      "pickle": {
+        "modelPackage": null,
+        "expectedGlobals": [
+          "collections.OrderedDict",
+          "torch.FloatStorage",
+          "torch._utils._rebuild_tensor_v2"
+        ],
+        "approvedExceptions": []
+      }
+    },
+    {
+      "name": "roformer/config_vocals_mel_band_roformer_kj.yaml",
+      "usedBy": [
+        "melband_roformer_vocals:config"
+      ],
+      "kind": "config",
+      "url": "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/1f700c386e0dd763fe0a57242bb9420dce987354/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+      "cachePath": "roformer/1f700c386e0dd763fe0a57242bb9420dce987354/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+      "publisher": "ZFTurbo/Music-Source-Separation-Training, git commit 1f700c386e0dd763fe0a57242bb9420dce987354",
+      "license": "MIT",
+      "sizeBytes": 1721,
+      "sha256": "f63f38eb1e6e40a7db0dade714a5ae257555dd8748f4e774eae8679275a81926",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed. Parsed with a restricted yaml.SafeLoader."
+    },
+    {
+      "name": "roformer/models/bs_roformer/mel_band_roformer.py",
+      "usedBy": [
+        "melband_roformer_vocals:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/1f700c386e0dd763fe0a57242bb9420dce987354/models/bs_roformer/mel_band_roformer.py",
+      "cachePath": "roformer/1f700c386e0dd763fe0a57242bb9420dce987354/models/bs_roformer/mel_band_roformer.py",
+      "publisher": "ZFTurbo/Music-Source-Separation-Training, git commit 1f700c386e0dd763fe0a57242bb9420dce987354 (architecture originally lucidrains/BS-RoFormer, MIT)",
+      "license": "MIT",
+      "sizeBytes": 22708,
+      "sha256": "a28fce62020faad6461176660e012cf5799ae8a26c76fe4b2bc636f5b44b9fc5",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
+    },
+    {
+      "name": "roformer/models/bs_roformer/attend.py",
+      "usedBy": [
+        "melband_roformer_vocals:source"
+      ],
+      "kind": "source",
+      "url": "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/1f700c386e0dd763fe0a57242bb9420dce987354/models/bs_roformer/attend.py",
+      "cachePath": "roformer/1f700c386e0dd763fe0a57242bb9420dce987354/models/bs_roformer/attend.py",
+      "publisher": "ZFTurbo/Music-Source-Separation-Training, git commit 1f700c386e0dd763fe0a57242bb9420dce987354 (based on lucidrains/BS-RoFormer, MIT)",
+      "license": "MIT",
+      "sizeBytes": 4410,
+      "sha256": "c7abbc40a3fd20ff7f6001fa9f8ee9ad5df6452272712a5e719b8f8468bf2223",
+      "publisherChecksum": null,
+      "publisherChecksumNote": "Pinned by the full git commit SHA in the URL; the SHA-256 is of the file as reviewed."
     }
   ]
 }

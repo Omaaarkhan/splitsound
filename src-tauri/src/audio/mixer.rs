@@ -246,6 +246,25 @@ impl MixerCore {
         self.original
     }
 
+    pub fn xfade(&self) -> f32 {
+        self.xfade
+    }
+
+    pub fn transport(&self) -> f32 {
+        self.transport
+    }
+
+    /// Restores live playback state when hot-swapping audio without an
+    /// audible dip; call after seeking and before `set_original` so a source
+    /// change crossfades smoothly from `xfade`. `ended` carries over a track
+    /// that already rendered to its end, so the next `play` restarts it.
+    pub fn restore_live(&mut self, transport: f32, xfade: f32, playing: bool, ended: bool) {
+        self.transport = transport.clamp(0.0, 1.0);
+        self.xfade = xfade.clamp(0.0, 1.0);
+        self.playing = playing;
+        self.ended = ended;
+    }
+
     pub fn play(&mut self) {
         if self.ended || self.pos >= self.len {
             self.pos = self.loop_range.map_or(0, |(a, _)| a);

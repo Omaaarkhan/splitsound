@@ -231,10 +231,49 @@ window, which for a rectangular window is the frame count.
 
 ---------------------------------------------------------------------------
 
-## 4. `melband_roformer` segment transform  (reserved)
+## 4. `melband_roformer` segment transform
 
-Not built. The kind name is reserved in the manifest schema; no model of this
-kind is in `dist/manifest.json` and `reference.py` raises for it.
+    N      = 352800     (8 s at 44100 Hz; STRIDE = 176400, 4 s / 50 % overlap)
+    NFFT   = 2048
+    HOP    = 441
+    BINS   = 1025       (all complex bins 0..1024, DC through Nyquist)
+    FRAMES = 801        (N / HOP + 1)
+    CENTER = 1024       (NFFT / 2, reflect padding on both sides)
+    PADDED = 354848     (N + 2 * CENTER = NFFT + (FRAMES - 1) * HOP)
+
+Track normalisation (section 1.1) is **disabled** (`normalize: false` in the
+manifest): the KimberleyJensen checkpoint operates directly on unnormalised
+track waveforms (`mean = 0`, `std = 1`).
+
+### 4.1 `STFT_melband` (per channel `x[0..N)`)
+
+    y = reflect_pad(x, CENTER, CENTER)            // length 354848
+    w = hann(NFFT)                                // periodic: 0.5 - 0.5 cos(2*pi*n/2048)
+    for j in 0..FRAMES:
+        z = rfft(w * y[j*HOP .. j*HOP + NFFT])    // length 1025; NO 1/sqrt scaling
+        spec[channel*2    ][k][j] = Re z[k]       // k in 0..1025
+        spec[channel*2 + 1][k][j] = Im z[k]
+
+Graph I/O (`melband_roformer_vocals.onnx`):
+
+| tensor | dir | dtype | shape | content |
+|---|---|---|---|---|
+| `spec` | in | float32 | `[batch, 4, 1025, 801]` | mix spectrogram |
+| `spec_out` | out | float32 | `[batch, 1, 4, 1025, 801]` | vocals spectrogram (`zero_dc` zeroes bin 0) |
+
+### 4.2 `ISTFT_melband` (per source and channel)
+
+    env_pad = zeros(PADDED)
+    for j in 0..FRAMES:
+        env_pad[j*HOP .. j*HOP + NFFT] += hann(NFFT)^2
+    env = env_pad[CENTER .. CENTER + N]           // exact NOLA divisor per sample
+
+    acc = zeros(PADDED)
+    for j in 0..FRAMES:
+        b = [spec[k][j] for k in 0..BINS]         // Im b[0] = Im b[1024] = 0
+        frame = irfft(b, n=NFFT)                  // numpy irfft includes 1/NFFT
+        acc[j*HOP .. j*HOP + NFFT] += w * frame
+    out[m] = acc[CENTER + m] / env[m]             // for m in 0..N
 
 ---------------------------------------------------------------------------
 
@@ -506,6 +545,8 @@ Separation models add:
 | `sampleRate`, `channels` | 44100, 2 |
 | `segmentSamples`, `strideSamples` | `N` and `STRIDE` of section 1 |
 | `nfft`, `hop`, `bins`, `frames`, `window` | transform constants (`window`: `"hann"` or `"rectangular"`); informative, the transform is fixed per `kind` |
+| `melBands`, `winLength` | optional transform metadata (`melband_roformer`: `60`, `2048`) |
+| `normalize` | optional bool (`true` when omitted; `false` skips section 1.1 track normalisation) |
 | `dynamicBatch` | true: the graph has a symbolic `batch` dimension |
 | `weightStorage` | `"float32"` or `"float16"` (stored as float16, cast to float32 inside the graph at load; all arithmetic is float32) |
 
@@ -534,6 +575,7 @@ Measured on the shipped files (`package.py`, zstd level 19, one frame):
 |------|-----|--------|-------|
 | `scnet_large.onnx` (float16 storage) | 85.75 MB | 78.00 MB | 91.0 % |
 | `scnet_small.onnx` (float16 storage) | 22.52 MB | 19.75 MB | 87.7 % |
+| `melband_roformer_vocals.onnx` (float16 storage) | 462.71 MB | 421.66 MB | 91.1 % |
 | `efficientat_mn10_as.onnx` (float32) | 23.74 MB | 18.99 MB | 80.0 % |
 | `htdemucs_6s.onnx` (graph only) | 0.92 MB | 0.04 MB | 4.3 % |
 
@@ -543,16 +585,20 @@ random low mantissa bits. Demucs is the opposite case: Meta stores its
 checkpoints in float16, so the widened float32 weights file (109.66 MB) would
 compress to 54.91 MB (50.1 %); it is built locally and never downloaded.
 
-**float16 storage (SCNet).** The SCNet checkpoints are float32. The shipped
-graphs keep every large weight tensor as a float16 initializer followed by a
-`Cast` to float32, so all arithmetic is still float32 and onnxruntime folds
-the casts once when the session is created. This halves the download (19.75
-instead of 39.43 MB; 78.00 instead of 156.75 MB). The cost is the rounding
-of the weights: the output differs from the float32-weight graph at 55 to 73
-dB SNR, and the separation quality is unchanged (`scnet_small`, 50 MUSDB test
-excerpts: mean of the per-stem median SDR 8.43 dB with either storage, every
-stem within 0.01 dB). About 6400 of the weights per model are smaller than
-the smallest float16 and become zero; none overflow.
+**float16 storage (SCNet and Mel-Band RoFormer).** The SCNet and Mel-Band
+RoFormer checkpoints are float32. The shipped graphs keep every large weight
+tensor as a float16 initializer followed by a `Cast` to float32, so all
+arithmetic is still float32 and onnxruntime folds the casts once when the
+session is created. This halves the download (19.75 instead of 39.43 MB for
+SCNet; 78.00 instead of 156.75 MB for SCNet Large; 421.66 MB zstd / 462.71 MB raw
+instead of ~919 MB for Mel-Band RoFormer). The cost is the rounding of the
+weights: SCNet output differs from the float32-weight graph at 55 to 73 dB SNR,
+and the separation quality is unchanged (`scnet_small`, 50 MUSDB test excerpts:
+mean of the per-stem median SDR 8.43 dB with either storage, every stem within
+0.01 dB). About 6400 of the weights per SCNet model are smaller than the
+smallest float16 and become zero; none overflow. For `melband_roformer_vocals`,
+162 weights underflow to zero, none overflow, and real-vocal output achieves
+75.05 dB SNR against upstream PyTorch (75.22 dB against the PyTorch Core).
 
 **float16 arithmetic** (running the graph itself in half precision) was not
 pursued: onnxruntime's CPU kernels for Conv, LSTM and MatMul are float32, so a
@@ -574,3 +620,6 @@ logarithm, where weight rounding is not worth the 9 MB.
 - v2.1: added the conversion spec (5) and the manifest schema (7).
 - v2.2: SCNet stride fixed at 363825; section 4 reserved (model deferred);
   added storage and compression measurements (8).
+- v2.3: added `melband_roformer_vocals` (section 4, 60 mel bands, Hann STFT
+  nfft 2048 hop 441, unnormalized segments, stride 176400) and optional
+  `melBands`, `winLength`, `normalize` manifest fields.

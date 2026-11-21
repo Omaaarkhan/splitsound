@@ -16,9 +16,11 @@ providers). Raw results: `dist/reports/bench.json`, `bench_memory.json`,
 
 "Segment time" is one run of the ONNX graph on one segment. "Realtime" is
 seconds of audio in the segment divided by that time. A whole track costs
-`N / STRIDE = 1.33` graph runs per segment of audio, plus the host-side STFT
-and inverse STFT (about 0.3 s per segment in the numpy reference; a compiled
-FFT is several times faster).
+`N / STRIDE = 1.33` graph runs per segment of audio for SCNet and HTDemucs
+(`2.0` for `melband_roformer_vocals` at 50 % overlap; each 7 s test excerpt
+takes two 8 s RoFormer calls because `stride = 4 s < 7 s`), plus the
+host-side STFT and inverse STFT (about 0.3 s per segment in the numpy
+reference; a compiled FFT is several times faster).
 
 ## 1. Recommendation
 
@@ -42,6 +44,12 @@ optimisation, one segment per call.**
   four-minute song in about two minutes at best on this machine. `scnet_small`
   is three to four times faster for 0.8 dB less SDR. Consider making the
   small model the default on machines with fewer than four performance cores.
+* `melband_roformer_vocals` must run CPU-only (`allow_gpu = false`,
+  `memory_pattern = false`, symbolic batch, 4 performance cores): CoreML
+  (`MLProgram, ALL`) fails to compile/execute the 228M-parameter transformer and
+  inflates swap/temp storage. Unrolling time attention per head (`seq_len >
+  128`) plus `memory_pattern = false` brings peak RSS down from ~6.85–7.0 GiB
+  to **3.58 GiB** (`3671 MiB`) at **5.28 s** per 8 s segment (1.52× realtime).
 
 ## 2. Segment time by provider and thread count
 
@@ -86,6 +94,12 @@ CoreML output was **not** done. The NeuralNetwork format and the
 | `scnet_large` | 4.62 s / 6294 MiB | 6.20 s / 3858 MiB | 5.72 s / 4548 MiB | **4.42 s / 1900 MiB** | 4.91 s / 3095 MiB |
 | `htdemucs_6s` | 1.23 s / 4198 MiB | 1.27 s / 2658 MiB | 1.30 s / 2438 MiB | **1.12 s / 1861 MiB** | 1.13 s / 2153 MiB |
 
+For `melband_roformer_vocals` (8 s segment, per-head unrolled time attention,
+symbolic batch, CPU 4 threads): default (`mem_pattern=true, arena=true`) runs
+`5.37 s / 3961 MiB` (3.87 GiB), **`mem_pattern=false, arena=true`** runs
+**`5.28 s / 3671 MiB` (3.58 GiB)** (1.52× realtime), and `both=false` runs
+`5.59 s / 4120 MiB`.
+
 (segment time / peak resident memory of the whole process.) With every shape
 static, onnxruntime plans one arena for all intermediate tensors and peak
 memory triples. Leaving `batch` symbolic is the cheapest fix and is what
@@ -116,6 +130,7 @@ a baseline for regressions and for comparing the models with each other.
 
 | model | drums | bass | other | vocals | mean of the four |
 |---|---|---|---|---|---|
+| `Studio` (`melband_roformer_vocals` + `scnet_large` on residual) | **10.48** | **9.08** | **7.42** | **11.59** | **9.64 dB** |
 | `scnet_large` | 10.33 | 8.64 | 7.08 | 10.69 | **9.19 dB** |
 | `scnet_small` | 9.72 | 8.50 | 5.99 | 9.51 | **8.43 dB** |
 | `htdemucs_6s` | 9.21 | 8.19 | 4.97 | 8.54 | **7.73 dB** |
@@ -129,6 +144,18 @@ MUSDB's "other" stem contains those instruments. `htdemucs_ft` and
 * Chunk overlap, `scnet_small`, on a 70 s medley of ten excerpts: overlap 0.25
   gives 7.40 dB, overlap 0.5 gives 7.36 dB for 1.5 times the work. The default
   stride stays at overlap 0.25.
+* Studio cascade (`melband_roformer_vocals` followed by `scnet_large`): running
+  Pass 2 (`scnet_large`) on the vocal-free **residual** (`9.64 dB` mean of
+  medians) outperformed running Pass 2 on the raw mix (`9.43 dB` mean of
+  medians; `10.33 / 8.64 / 7.15 / 11.59`). Note two caveats for the Studio
+  row: (1) KimberleyJensen's checkpoint training data is undocumented, so
+  whether test tracks were seen in training is unknown; (2) the 7 s MUSDB18
+  excerpts are shorter than RoFormer's 8 s segment, so both model calls
+  (chunks at 0 s and 4 s) see zero-padded audio and overlap-add is exercised
+  only over the last 3 s of each excerpt. Separately, stride
+  `176400` (50% overlap) vs `88200` (75% overlap) on `melband_roformer_vocals`
+  differed by only ~0.1 dB vocal bleed on a 20 s vocal-heavy excerpt while
+  costing 2.08× runtime, so default stride stays `176400`.
 
 ## 6. Numerical agreement with the PyTorch originals
 
@@ -145,7 +172,18 @@ PyTorch module driven by `demucs.apply.apply_model`.
 | `scnet_large`, float32 weights (quick set) | 119 to 122 dB |
 | `scnet_large` **as shipped** (float16 storage) | 65 dB (63 to 66 on the non-silent stems) |
 | `scnet_small` **as shipped**, real music | 55 to 73 dB per stem |
+| `melband_roformer_vocals`, PyTorch Core vs upstream (`MelBandRoformer.forward`), real vocals (Clairo 8 s)* | 128.54 dB |
+| `melband_roformer_vocals`, float32 ONNX vs PyTorch Core, real vocals (Clairo 8 s) | 127.72 dB wave (122.66 dB spec) |
+| `melband_roformer_vocals` **as shipped** (float16 storage), real vocals (Clairo 8 s)* | 75.22 dB vs PyTorch Core (75.05 dB vs upstream) |
 | tagger probabilities against the original model and frontend | max abs error 7e-7 |
+
+*\* The `melband_roformer_vocals` upstream (`MelBandRoformer.forward`) numbers were
+recorded in a one-off manual parity check on the Clairo 8 s excerpt with the
+optional upstream packages (`beartype`, `einops`, `rotary_embedding_torch`,
+`librosa`) excluded from `uv.lock`. `check_reference.py --model
+melband_roformer_vocals --wav <clip.wav>` reproduces the PyTorch
+`MelBandRoformerCore` / STFT checks with `uv run --locked` (and also runs the
+upstream comparison automatically when those optional packages are present).*
 
 A finding that matters for any future export: onnxruntime's single-precision
 reductions over millions of elements are inaccurate. Exported naively, SCNet

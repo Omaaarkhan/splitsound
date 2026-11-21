@@ -35,21 +35,22 @@ import onnxruntime as ort
 SAMPLE_RATE = 44100
 CHANNELS = 2
 MAX_SHIFT = SAMPLE_RATE // 2            # 22050, range of the deterministic shifts
-NFFT = 4096                             # every separation model here uses a 4096-point FFT ...
-HOP = 1024                              # ... with a hop of 1024
+NFFT = 4096                             # HTDemucs and SCNet use a 4096-point FFT ...
+HOP = 1024                              # ... with a hop of 1024 (Mel-Band RoFormer uses MB_NFFT / MB_HOP)
 
 
 class Model:
     """An opened separation model: the ONNX session plus the constants the host needs."""
 
     def __init__(self, session: ort.InferenceSession, kind: str, sources: list[str], targets: list[str],
-                 segment: int, stride: int):
+                 segment: int, stride: int, normalize: bool = True):
         self.session = session
         self.kind = kind                # "htdemucs" | "scnet" | "melband_roformer"
         self.sources = sources          # output order of the graph
         self.targets = targets          # the sources this model is trusted for
         self.segment = segment          # N: samples per model call
         self.stride = stride            # samples between chunk starts
+        self.normalize = normalize      # default track normalisation flag
 
 
 # ============================================================================
@@ -107,8 +108,10 @@ def shift_amounts(shifts: int) -> list[int]:
     return [(k * MAX_SHIFT) // passes for k in range(passes)]
 
 
-def separate(model: Model, mix: np.ndarray, shifts: int = 0, normalize: bool = True) -> np.ndarray:
+def separate(model: Model, mix: np.ndarray, shifts: int = 0, normalize: bool | None = None) -> np.ndarray:
     """Full pipeline for one model: [2, L] float32 at 44.1 kHz -> [S, 2, L] float32."""
+    if normalize is None:
+        normalize = model.normalize
     mix = mix.astype(np.float32)
     channels, length = mix.shape
     assert channels == CHANNELS, "duplicate mono to stereo before calling"
@@ -307,8 +310,75 @@ def scnet_run_segment(session: ort.InferenceSession, segment: np.ndarray) -> np.
 # 4. melband_roformer segment transform (CONTRACT.md section 4)
 # ============================================================================
 
+MB_NFFT = 2048
+MB_HOP = 441
+MB_SEGMENT = 352800                     # 8 s (800 hops)
+MB_BINS = MB_NFFT // 2 + 1              # 1025, bins 0..1024 (DC to Nyquist)
+MB_FRAMES = 801                         # MB_SEGMENT // MB_HOP + 1
+MB_CENTER = MB_NFFT // 2                # 1024, reflect padding on both sides
+
+assert MB_SEGMENT % MB_HOP == 0 and MB_SEGMENT // MB_HOP + 1 == MB_FRAMES
+
+
+def _mb_hann_window() -> np.ndarray:
+    n = np.arange(MB_NFFT, dtype=np.float64)
+    return (0.5 - 0.5 * np.cos(2.0 * np.pi * n / MB_NFFT)).astype(np.float32)
+
+
+def _mb_istft_envelope() -> np.ndarray:
+    win_sq = MB_HANN.astype(np.float64) ** 2
+    env = np.zeros(MB_NFFT + (MB_FRAMES - 1) * MB_HOP, dtype=np.float64)
+    for j in range(MB_FRAMES):
+        env[j * MB_HOP: j * MB_HOP + MB_NFFT] += win_sq
+    return env[MB_CENTER: MB_CENTER + MB_SEGMENT].astype(np.float32)
+
+
+MB_HANN = _mb_hann_window()
+MB_ENV = _mb_istft_envelope()
+
+
+def melband_stft(segment: np.ndarray) -> np.ndarray:
+    """[C, MB_SEGMENT] float32 -> [2*C, MB_BINS, MB_FRAMES] float32. Periodic Hann, unnormalized."""
+    channels, length = segment.shape
+    assert length == MB_SEGMENT
+    spec = np.zeros((2 * channels, MB_BINS, MB_FRAMES), dtype=np.float32)
+    for c in range(channels):
+        padded = np.pad(segment[c], (MB_CENTER, MB_CENTER), mode="reflect")
+        assert padded.shape[0] == MB_NFFT + (MB_FRAMES - 1) * MB_HOP
+        for j in range(MB_FRAMES):
+            bins = np.fft.rfft(padded[j * MB_HOP: j * MB_HOP + MB_NFFT] * MB_HANN)
+            spec[2 * c, :, j] = bins.real
+            spec[2 * c + 1, :, j] = bins.imag
+    return spec
+
+
+def melband_istft_channel(real: np.ndarray, imag: np.ndarray) -> np.ndarray:
+    """[MB_BINS, MB_FRAMES] real and imaginary parts -> [MB_SEGMENT] float32."""
+    assert real.shape == (MB_BINS, MB_FRAMES) and imag.shape == (MB_BINS, MB_FRAMES)
+    accumulator = np.zeros(MB_NFFT + (MB_FRAMES - 1) * MB_HOP, dtype=np.float32)
+    bins = np.zeros(MB_BINS, dtype=np.complex64)
+    for j in range(MB_FRAMES):
+        bins[:] = real[:, j] + 1j * imag[:, j]
+        bins[0] = bins[0].real
+        bins[MB_BINS - 1] = bins[MB_BINS - 1].real
+        accumulator[j * MB_HOP: j * MB_HOP + MB_NFFT] += np.fft.irfft(bins, n=MB_NFFT).astype(np.float32) * MB_HANN
+    return accumulator[MB_CENTER: MB_CENTER + MB_SEGMENT] / MB_ENV
+
+
+def melband_istft(spec_out: np.ndarray) -> np.ndarray:
+    """[S, 2*C, MB_BINS, MB_FRAMES] -> [S, C, MB_SEGMENT]."""
+    sources, twice_channels = spec_out.shape[0], spec_out.shape[1]
+    out = np.zeros((sources, twice_channels // 2, MB_SEGMENT), dtype=np.float32)
+    for s in range(sources):
+        for c in range(twice_channels // 2):
+            out[s, c] = melband_istft_channel(spec_out[s, 2 * c], spec_out[s, 2 * c + 1])
+    return out
+
+
 def melband_run_segment(session: ort.InferenceSession, segment: np.ndarray) -> np.ndarray:
-    raise NotImplementedError("melband_roformer is not exported yet (CONTRACT.md section 4)")
+    spec = melband_stft(segment)
+    spec_out = session.run(["spec_out"], {"spec": spec[np.newaxis]})[0][0]
+    return melband_istft(spec_out)
 
 
 # ============================================================================
@@ -327,6 +397,8 @@ def open_model(path: str | Path, threads: int = 0, providers: list | None = None
     options = ort.SessionOptions()
     if threads > 0:
         options.intra_op_num_threads = threads
+    if "melband" in Path(path).stem.lower():
+        options.enable_mem_pattern = False
     # The graph has one symbolic dimension, "batch". On the CPU provider it is
     # left symbolic: fixing it makes onnxruntime plan one static arena for the
     # whole graph, which costs 2 to 4 GB more peak memory for no speed gain
@@ -335,8 +407,9 @@ def open_model(path: str | Path, threads: int = 0, providers: list | None = None
     session = ort.InferenceSession(str(path), options, providers=providers or ["CPUExecutionProvider"])
     metadata = session.get_modelmeta().custom_metadata_map
     assert int(metadata["sampleRate"]) == SAMPLE_RATE
+    normalize = metadata.get("normalize", "true").lower() != "false"
     return Model(session, metadata["kind"], json.loads(metadata["sources"]), json.loads(metadata["targets"]),
-                 int(metadata["segmentSamples"]), stride or int(metadata["strideSamples"]))
+                 int(metadata["segmentSamples"]), stride or int(metadata["strideSamples"]), normalize=normalize)
 
 
 def read_wav(path: str | Path) -> np.ndarray:
@@ -363,7 +436,7 @@ def write_wav(path: str | Path, audio: np.ndarray) -> None:
 
 
 def separate_file(model_paths: list[str], wav_path: str, out_dir: str, shifts: int = 0,
-                  normalize: bool = True, threads: int = 0, all_stems: bool = False,
+                  normalize: bool | None = None, threads: int = 0, all_stems: bool = False,
                   stride: int | None = None) -> dict[str, np.ndarray]:
     mix = read_wav(wav_path)
     estimates, target_indices, sources = [], [], None
@@ -403,8 +476,8 @@ def main() -> int:
     args = parser.parse_args()
 
     stems = separate_file(args.model.split(","), args.wav, args.outdir, shifts=args.shifts,
-                          normalize=not args.no_normalize, threads=args.threads, all_stems=args.all_stems,
-                          stride=args.stride)
+                          normalize=(False if args.no_normalize else None), threads=args.threads,
+                          all_stems=args.all_stems, stride=args.stride)
     for name, audio in stems.items():
         print(f"{name}: {audio.shape[1]} samples, peak {np.abs(audio).max():.4f} -> {Path(args.outdir) / (name + '.wav')}")
     return 0

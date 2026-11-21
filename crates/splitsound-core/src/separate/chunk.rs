@@ -24,6 +24,11 @@ pub trait SegmentModel {
     /// Number of sources the model outputs (`S`).
     fn num_sources(&self) -> usize;
 
+    /// Whether track-level mean/std normalisation is applied around segmentation.
+    fn normalize(&self) -> bool {
+        true
+    }
+
     /// Separates one segment.
     ///
     /// `left` and `right` hold `segment_len()` samples. For each index in
@@ -121,7 +126,7 @@ pub fn separate_track(
     }
 
     // 1.1 Track normalisation: mean and unbiased std of the mono fold-down.
-    let (mean, std) = {
+    let (mean, std) = if model.normalize() {
         let mut sum = 0f64;
         for (l, r) in mix.left.iter().zip(&mix.right) {
             sum += 0.5 * (f64::from(*l) + f64::from(*r));
@@ -142,6 +147,8 @@ pub fn separate_track(
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         let std = if !(std >= 1e-8) { 1.0 } else { std };
         (mean as f32, std as f32)
+    } else {
+        (0.0f32, 1.0f32)
     };
     let inv_std = 1.0 / std;
 
@@ -496,5 +503,47 @@ mod tests {
         .unwrap_err();
         assert!(err.is_cancelled());
         assert_eq!(model.calls, 3, "no further model calls after cancellation");
+    }
+
+    #[test]
+    fn unnormalized_model_receives_raw_audio() {
+        struct CaptureModel {
+            n: usize,
+            seen_first_left: Option<f32>,
+        }
+        impl SegmentModel for CaptureModel {
+            fn segment_len(&self) -> usize {
+                self.n
+            }
+            fn num_sources(&self) -> usize {
+                1
+            }
+            fn normalize(&self) -> bool {
+                false
+            }
+            fn run_segment(
+                &mut self,
+                left: &[f32],
+                right: &[f32],
+                _wanted: &[usize],
+                out: &mut [[Vec<f32>; 2]],
+            ) -> Result<()> {
+                if self.seen_first_left.is_none() {
+                    self.seen_first_left = Some(left[0]);
+                }
+                out[0][0].copy_from_slice(left);
+                out[0][1].copy_from_slice(right);
+                Ok(())
+            }
+        }
+        // Large DC offset + tiny amplitude: normalization would shift and scale heavily.
+        let mix = Stereo::from_channels(vec![10.0, 10.01, 10.02, 10.03], vec![10.0; 4]);
+        let mut model = CaptureModel {
+            n: 4,
+            seen_first_left: None,
+        };
+        let stems = separate_track(&mut model, &mix, 2, &[0], 0, &mut |_, _| Ok(())).unwrap();
+        assert!((model.seen_first_left.unwrap() - 10.0).abs() < 1e-6);
+        assert!((stems[0].left[2] - 10.02).abs() < 1e-5);
     }
 }

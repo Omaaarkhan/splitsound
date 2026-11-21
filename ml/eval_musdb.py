@@ -223,7 +223,7 @@ MODEL_SETS = {
 def separate_with_reference(models: list, mix: np.ndarray) -> dict[str, np.ndarray]:
     estimates, targets = [], []
     for model in models:
-        estimates.append(reference.separate(model, mix, shifts=0, normalize=True))
+        estimates.append(reference.separate(model, mix, shifts=0, normalize=None))
         targets.append([model.sources.index(t) for t in model.targets])
     combined = reference.combine_bag(estimates, targets)
     return {models[0].sources[index]: audio for index, audio in combined.items()}

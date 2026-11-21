@@ -7,6 +7,7 @@ import { modelsStore } from "../stores/modelsStore";
 import { playbackStore, seekPlayback, setLoopRegion } from "../stores/playbackStore";
 import { sessionStore, setSplitMode, setSplitQuality } from "../stores/sessionStore";
 import {
+  QUALITY_LABEL,
   computeModelDownloadFraction,
   formatBytes,
   formatDurationEstimate,
@@ -47,6 +48,11 @@ const QUALITY_TIPS: Record<Quality, { title: string; detail: string }> = {
   best: {
     title: "Best quality",
     detail: "Takes longer using the larger model for cleaner separation and less bleed.",
+  },
+  studio: {
+    title: "Studio quality",
+    detail:
+      "Isolates vocals first with Mel-Band RoFormer to dramatically cut vocal bleed into other stems.",
   },
 };
 
@@ -91,9 +97,11 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
 
   const estimateText = estimate
     ? formatDurationEstimate(estimate.estimatedSec, splitOptions.quality)
-    : splitOptions.quality === "best"
-      ? "About 4 minutes, cleaner result"
-      : "About 40 seconds";
+    : splitOptions.quality === "studio"
+      ? "About 12 minutes, cleanest vocals"
+      : splitOptions.quality === "best"
+        ? "About 4 minutes, cleaner result"
+        : "About 40 seconds";
 
   return (
     <main className="desk">
@@ -229,8 +237,9 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
           <section className="presplit-section" aria-label="Quality">
             <h2 className="presplit-section__title">Quality</h2>
             <div className="quality-switch" role="radiogroup" aria-label="Quality">
-              {(["fast", "best"] as Quality[]).map((q) => {
+              {(["fast", "best", "studio"] as Quality[]).map((q) => {
                 const active = splitOptions.quality === q;
+                const label = QUALITY_LABEL[q];
                 return (
                   <button
                     key={q}
@@ -244,7 +253,7 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
                       placement: "right",
                     })}
                   >
-                    {q === "fast" ? "Fast" : "Best"}
+                    {label}
                   </button>
                 );
               })}
