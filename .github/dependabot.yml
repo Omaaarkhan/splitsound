@@ -65,6 +65,10 @@ updates:
       # together, by hand.
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
+      # typescript-eslint 8.x declares peer typescript "<6.1.0"; bump TypeScript
+      # majors manually once typescript-eslint supports TypeScript 7.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -108,3 +112,7 @@ updates:
       ml:
         applies-to: "version-updates"
         patterns: ["*"]
+    ignore:
+      # Pinned to 4.0.1 (sdist reviewed in ml/SECURITY.md; 4.1.0 pins
+      # torch<2.3 on macOS x86_64 and conflicts with torch>=2.6).
+      - dependency-name: "demucs"
