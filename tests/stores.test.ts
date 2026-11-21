@@ -60,7 +60,7 @@ describe("application stores", () => {
 
   it("loads library, models, and settings on bootstrap", () => {
     expect(libraryStore.getState().sessions.length).toBeGreaterThanOrEqual(4);
-    expect(modelsStore.getState().models.length).toBe(4);
+    expect(modelsStore.getState().models.length).toBe(5);
     expect(settingsStore.getState().loaded).toBe(true);
   });
 
@@ -106,8 +106,24 @@ describe("application stores", () => {
 
   it("updates solo and mute audibility accurately and keeps them mutually exclusive", async () => {
     await openSongById("golden-hour");
+    const stems = sessionStore.getState().current!.stems;
     const before = playbackStore.getState().playback.channels;
-    expect(before.every((c) => isChannelAudible(c, before))).toBe(true);
+    expect(
+      before.every((c) => {
+        const present = stems.find((s) => s.id === c.id)?.present ?? false;
+        return isChannelAudible(c, before) === present;
+      }),
+    ).toBe(true);
+
+    // Editing a channel while listening to the original automatically switches to stems
+    await backend.invoke("playback_set_source", { source: "original" });
+    playbackStore.setState((prev) => ({
+      ...prev,
+      playback: { ...prev.playback, source: "original" },
+    }));
+    await toggleChannelMute("vocals");
+    expect(playbackStore.getState().playback.source).toBe("stems");
+    await toggleChannelMute("vocals");
 
     // Soloing drums silences vocals
     await toggleChannelSolo("drums");

@@ -172,12 +172,20 @@ export async function seekPlaybackBy(deltaSec: number): Promise<void> {
   await seekPlayback(current + deltaSec);
 }
 
+function activeStemsSource(playback: PlaybackState, id: SourceId): PlaybackState["source"] {
+  return playback.source === "original" && playback.channels.some((c) => c.id === id)
+    ? "stems"
+    : playback.source;
+}
+
 export async function setChannelGain(id: SourceId, gainDb: number): Promise<void> {
+  if (!playbackStore.getState().playback.channels.some((c) => c.id === id)) return;
   const snapped = snapDb(gainDb);
   playbackStore.setState((prev) => ({
     ...prev,
     playback: {
       ...prev.playback,
+      source: activeStemsSource(prev.playback, id),
       channels: prev.playback.channels.map((ch) =>
         ch.id === id ? { ...ch, gainDb: snapped } : ch,
       ),
@@ -195,6 +203,7 @@ export async function toggleChannelSolo(id: SourceId): Promise<void> {
     ...prev,
     playback: {
       ...prev.playback,
+      source: activeStemsSource(prev.playback, id),
       channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, solo, muted } : c)),
     },
   }));
@@ -213,6 +222,7 @@ export async function toggleChannelMute(id: SourceId): Promise<void> {
     ...prev,
     playback: {
       ...prev.playback,
+      source: activeStemsSource(prev.playback, id),
       channels: prev.playback.channels.map((c) => (c.id === id ? { ...c, muted, solo } : c)),
     },
   }));

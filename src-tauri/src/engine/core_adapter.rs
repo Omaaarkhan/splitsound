@@ -192,6 +192,7 @@ fn options(options: &SplitOptions) -> core::SplitOptions {
         quality: match options.quality {
             Quality::Fast => core::Quality::Fast,
             Quality::Best => core::Quality::Best,
+            Quality::Studio => core::Quality::Studio,
         },
     }
 }

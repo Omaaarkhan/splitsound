@@ -8,7 +8,12 @@ import { cancelModelDownloads, modelsStore, removeModel } from "../stores/models
 import { settingsStore, updateSettings } from "../stores/settingsStore";
 import { showNotice } from "../stores/uiStore";
 import { formatIpcError } from "../utils/errors";
-import { formatBytes, formatImportedModelsNotice, formatModelMeta } from "../utils/format";
+import {
+  QUALITY_LABEL,
+  formatBytes,
+  formatImportedModelsNotice,
+  formatModelMeta,
+} from "../utils/format";
 import { Checkbox } from "../components/primitives/Checkbox";
 import { DialogPanel } from "../components/primitives/DialogPanel";
 import { SelectMenu, type SelectOption } from "../components/primitives/SelectMenu";
@@ -101,8 +106,17 @@ export function SettingsPanel({
               <span className="settings-row__name">Default quality</span>
             </div>
             <div className="settings-switch" role="radiogroup" aria-label="Default quality">
-              {(["fast", "best"] as Quality[]).map((q) => {
+              {(["fast", "best", "studio"] as Quality[]).map((q) => {
                 const active = settings.defaultQuality === q;
+                const title =
+                  q === "fast" ? "Fast quality" : q === "best" ? "Best quality" : "Studio quality";
+                const detail =
+                  q === "fast"
+                    ? "Uses the smaller model for quicker splits."
+                    : q === "best"
+                      ? "Uses the larger model for cleaner separation."
+                      : "Uses Mel-Band RoFormer first for minimal vocal bleed (slower, largest download).";
+                const label = QUALITY_LABEL[q];
                 return (
                   <button
                     key={q}
@@ -115,15 +129,12 @@ export function SettingsPanel({
                         : "console-key console-key--compact"
                     }
                     onClick={() => void updateSettings({ defaultQuality: q })}
-                    {...tip(q === "fast" ? "Fast quality" : "Best quality", {
-                      detail:
-                        q === "fast"
-                          ? "Uses the smaller model for quicker splits."
-                          : "Uses the larger model for cleaner separation.",
+                    {...tip(title, {
+                      detail,
                       placement: "top",
                     })}
                   >
-                    {q === "fast" ? "Fast" : "Best"}
+                    {label}
                   </button>
                 );
               })}

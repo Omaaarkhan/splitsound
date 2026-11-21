@@ -15,11 +15,12 @@ use crate::audio::{SAMPLE_RATE, Stereo, TAGGER_SAMPLE_RATE};
 use crate::decode::{Artwork, DecodeLimits, SourceInfo, decode_file};
 use crate::error::{Error, ErrorCode, Result};
 use crate::export::{ExportFormat, export_audio, mixdown};
+use crate::manifest::ModelKind;
 use crate::peaks::{Peaks, compute_peaks};
 use crate::progress::{PlannedStep, Progress, Stage, Tracker, check_cancelled};
-use crate::runtime::{Acceleration, Provider, Runtime, RuntimeConfig};
+use crate::runtime::{Acceleration, Provider, Runtime, RuntimeConfig, SessionConfig};
 use crate::separate::chunk::{SegmentModel, count_segments, separate_track};
-use crate::separate::models::open_segment_model;
+use crate::separate::models::{SeparatorKind, open_segment_model};
 use crate::separate::pipeline::{Pass, PassInput, SplitOptions, passes, remainder_stem};
 use crate::store::{DownloadObserver, ModelSource, ModelStatus, ModelStore};
 use crate::tagger::{Detection, InstrumentMap, SplitMode, StemId, Tagger, suggest_mode};
@@ -228,6 +229,7 @@ fn cost_per_audio_sec(model_id: &str) -> f64 {
     match model_id {
         "scnet_small" => 0.145,
         "scnet_large" => 0.54,
+        "melband_roformer_vocals" => 1.32,
         "htdemucs_6s" => 0.19,
         _ => 0.3,
     }
@@ -730,9 +732,13 @@ impl Engine {
             .external
             .as_ref()
             .map(|(n, b)| (n.as_str(), b.clone()));
-        let (session, _provider) = self
-            .runtime()?
-            .session_from_verified(&verified.graph, external)?;
+        let session_cfg = SessionConfig {
+            allow_gpu: kind != SeparatorKind::MelbandRoformer,
+            memory_pattern: kind != SeparatorKind::MelbandRoformer,
+        };
+        let (session, _provider) =
+            self.runtime()?
+                .session_from_verified_with(&verified.graph, external, session_cfg)?;
         *slot = Some(LoadedSeparator {
             id: id.to_string(),
             model: open_segment_model(kind, session, entry.sources.len())?,
@@ -831,28 +837,32 @@ impl Engine {
             }
             let stride = entry.stride_samples;
             let total = count_segments(mix.len(), stride, 0).max(1);
-            // Load time counts as the first few percent of the step.
-            tracker.update(0.03)?;
+            // Mel-Band RoFormer holds ~3.6 GiB on CPU and only costs ~0.4 s to
+            // reload, so release it after every pass (including cancelled or
+            // failed runs) rather than keeping it pinned across SCNet/Demucs or
+            // after an early exit.
+            let drop_after =
+                mix.duration_sec(SAMPLE_RATE) > 300.0 || entry.kind == ModelKind::MelbandRoformer;
             let input = match pass.input {
                 PassInput::Mix => mix,
                 PassInput::Residual => &residual,
             };
-            let stems = separate_track(
-                loaded.model.as_mut(),
-                input,
-                stride,
-                &wanted,
-                0,
-                &mut |done, _| tracker.update(0.03 + 0.97 * done as f64 / total as f64),
-            )?;
-            model_ids.push(entry.id.clone());
-            // On a long track the model is released before the stems are
-            // measured and written (and before the next model loads): there,
-            // keeping it is the difference between fitting in memory and
-            // not. A short track keeps it loaded for the next job.
-            if mix.duration_sec(SAMPLE_RATE) > 300.0 {
+            // Load time counts as the first few percent of the step.
+            let result = tracker.update(0.03).and_then(|()| {
+                separate_track(
+                    loaded.model.as_mut(),
+                    input,
+                    stride,
+                    &wanted,
+                    0,
+                    &mut |done, _| tracker.update(0.03 + 0.97 * done as f64 / total as f64),
+                )
+            });
+            if drop_after || result.is_err() {
                 *slot = None;
             }
+            let stems = result?;
+            model_ids.push(entry.id.clone());
             for (stem, audio) in pass.stems.iter().zip(stems) {
                 residual.subtract(&audio);
                 on_stem(*stem, audio)?;
@@ -1164,7 +1174,30 @@ mod tests {
                 240.0,
             )
             .unwrap();
-        assert!(secs > fast && fast > 1.0, "{secs} {fast}");
+        let studio = e
+            .estimate_seconds(
+                SplitOptions {
+                    mode: SplitMode::All,
+                    quality: Quality::Studio,
+                },
+                240.0,
+            )
+            .unwrap();
+        assert!(
+            studio > secs && secs > fast && fast > 1.0,
+            "{studio} {secs} {fast}"
+        );
+        let studio_plan = e
+            .plan(SplitOptions {
+                mode: SplitMode::All,
+                quality: Quality::Studio,
+            })
+            .unwrap();
+        let s_ids: Vec<&str> = studio_plan.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            s_ids,
+            ["melband_roformer_vocals", "scnet_large", "htdemucs_6s"]
+        );
     }
 
     #[test]

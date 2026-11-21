@@ -60,8 +60,9 @@ export const STEMS_BY_MODE: Readonly<Record<SplitMode, readonly StemId[]>> = {
 /**
  * - `fast`: the small models, one pass.
  * - `best`: the large models, with more overlap. Several times slower.
+ * - `studio`: Mel-Band RoFormer vocal isolation followed by separation for minimal bleed.
  */
-export type Quality = "fast" | "best";
+export type Quality = "fast" | "best" | "studio";
 
 export type ExportFormat = "wav16" | "wav24" | "wav32f" | "flac" | "mp3";
 

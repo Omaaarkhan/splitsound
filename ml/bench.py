@@ -43,7 +43,7 @@ MODELS = {
     "scnet_small": ("scnet_small.onnx", 11.0),
     "scnet_large": ("scnet_large.onnx", 11.0),
     "htdemucs_6s": ("htdemucs_6s.onnx", 7.8),
-    "melband_roformer_vocals": ("melband_roformer_vocals.onnx", None),
+    "melband_roformer_vocals": ("melband_roformer_vocals.onnx", 8.0),
     "efficientat_mn10_as": ("efficientat_mn10_as.onnx", 10.0),
 }
 

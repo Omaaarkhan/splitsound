@@ -127,6 +127,11 @@ function codecFromExt(ext: string): string {
 }
 
 export function requiredModelIdsForSplit(options: SplitOptions): string[] {
+  if (options.quality === "studio") {
+    if (options.mode === "vocals") return ["melband_roformer_vocals"];
+    if (options.mode === "band") return ["melband_roformer_vocals", "scnet_large"];
+    return ["melband_roformer_vocals", "scnet_large", "htdemucs_6s"];
+  }
   const ids = [options.quality === "best" ? "scnet_large" : "scnet_small"];
   if (options.mode === "all") {
     ids.push("htdemucs_6s");
@@ -252,10 +257,14 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
     masterGainDb: 0,
     channels: [],
   };
+  let autoMuted = new Set<SourceId>();
+  let absentStems = new Set<SourceId>();
 
   const applyReadyPlaybackSnapshot = (soloed: boolean) => {
     const s = sessions.get("golden-hour");
     if (!s) return;
+    autoMuted = new Set();
+    absentStems = new Set();
     playback = {
       sessionId: s.id,
       playing: false,
@@ -265,13 +274,18 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
       loop: null,
       masterGainDb: 0,
       channels: s.stems.map((stem) => {
+        // Same rule as playback_load: a stem the split did not find starts auto-muted.
+        if (!stem.present) {
+          absentStems.add(stem.id);
+          autoMuted.add(stem.id);
+        }
         if (!soloed) {
-          return { id: stem.id, gainDb: 0, muted: false, solo: false };
+          return { id: stem.id, gainDb: 0, muted: !stem.present, solo: false };
         }
         return {
           id: stem.id,
           gainDb: stem.id === "bass" ? -4.5 : stem.id === "other" ? 2.0 : 0,
-          muted: stem.id === "bass",
+          muted: stem.id === "bass" || !stem.present,
           solo: stem.id === "drums",
         };
       }),
@@ -597,7 +611,8 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
     steps.push({ stage: "writing", label: "Saving stems", durationMs: 340 });
 
     const stepCount = steps.length;
-    const totalEstSec = options.quality === "best" ? 210 : 42;
+    const totalEstSec =
+      options.quality === "studio" ? 420 : options.quality === "best" ? 210 : 42;
     let missingIdx = 0;
 
     for (let idx = 0; idx < stepCount; idx++) {
@@ -680,7 +695,7 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
       mode: options.mode,
       quality: options.quality,
       finishedAt: new Date(getNowMs()).toISOString(),
-      elapsedSec: options.quality === "best" ? 184 : 44,
+      elapsedSec: options.quality === "studio" ? 390 : options.quality === "best" ? 184 : 44,
       modelIds: neededModels.map((m) => m.id),
     };
     activeSplits.delete(session.id);
@@ -689,15 +704,41 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
     emit("library:changed", listSummaries());
 
     if (playback.sessionId === session.id) {
+      const prevAuto = new Set(autoMuted);
+      const prevAbsent = new Set(absentStems);
+      const oldChannels = playback.channels;
+      autoMuted = new Set();
+      absentStems = new Set();
+      const channels: ChannelState[] = session.stems.map((st) => {
+        const prev = oldChannels.find((c) => c.id === st.id);
+        const wasAuto = prevAuto.has(st.id);
+        const wasAbsent = prevAbsent.has(st.id);
+        if (!st.present) {
+          absentStems.add(st.id);
+          if (wasAbsent && !wasAuto && prev) {
+            return { ...prev };
+          }
+          if (!wasAbsent && prev?.muted) {
+            return { id: st.id, gainDb: prev.gainDb, muted: true, solo: false };
+          }
+          autoMuted.add(st.id);
+          return { id: st.id, gainDb: prev?.gainDb ?? 0, muted: true, solo: false };
+        }
+        if (prev) {
+          return { ...prev, muted: wasAuto ? false : prev.muted };
+        }
+        return { id: st.id, gainDb: 0, muted: false, solo: false };
+      });
+      const source =
+        channels.length === 0
+          ? "original"
+          : oldChannels.length === 0
+            ? "stems"
+            : playback.source;
       playback = {
         ...playback,
-        source: "stems",
-        channels: session.stems.map((st) => ({
-          id: st.id,
-          gainDb: 0,
-          muted: false,
-          solo: false,
-        })),
+        source,
+        channels,
       };
       emit("playback:state", playback);
     }
@@ -877,7 +918,8 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
         const downloadBytes = needed
           .filter((m) => !m.installed)
           .reduce((sum, m) => sum + m.downloadBytes, 0);
-        const baseFactor = options.quality === "best" ? 1.0 : 0.18;
+        const baseFactor =
+          options.quality === "studio" ? 2.4 : options.quality === "best" ? 1.0 : 0.18;
         const modeBonus = options.mode === "all" ? 1.15 : 1.0;
         const estimate: SplitEstimate = {
           estimatedSec: Math.round(duration * baseFactor * modeBonus),
@@ -977,14 +1019,22 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
           return clone(playback) as Commands[K]["result"];
         }
         stopPlaybackTimer();
+        autoMuted = new Set();
+        absentStems = new Set();
         const channels: ChannelState[] =
           s.status === "ready"
-            ? s.stems.map((st) => ({
-                id: st.id,
-                gainDb: 0,
-                muted: false,
-                solo: false,
-              }))
+            ? s.stems.map((st) => {
+                if (!st.present) {
+                  absentStems.add(st.id);
+                  autoMuted.add(st.id);
+                }
+                return {
+                  id: st.id,
+                  gainDb: 0,
+                  muted: !st.present,
+                  solo: false,
+                };
+              })
             : [];
         playback = {
           sessionId: s.id,
@@ -1002,6 +1052,8 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
 
       case "playback_unload": {
         stopPlaybackTimer();
+        autoMuted = new Set();
+        absentStems = new Set();
         playback = {
           sessionId: null,
           playing: false,
@@ -1050,6 +1102,12 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
         const patch = args as Commands["playback_set_channel"]["args"];
         const ch = playback.channels.find((c) => c.id === patch.id);
         if (ch) {
+          if (patch.muted !== undefined || patch.solo !== undefined) {
+            autoMuted.delete(patch.id);
+          }
+          if (playback.source === "original") {
+            playback.source = "stems";
+          }
           if (patch.gainDb !== undefined) ch.gainDb = patch.gainDb;
           if (patch.muted === true && patch.solo === true) {
             ch.solo = true;

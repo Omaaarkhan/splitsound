@@ -16,6 +16,7 @@ describe("mock backend state machine", () => {
     expect(models.map((m) => m.id)).toEqual([
       "scnet_small",
       "scnet_large",
+      "melband_roformer_vocals",
       "htdemucs_6s",
       "tagger",
     ]);
@@ -230,5 +231,36 @@ describe("mock backend state machine", () => {
       solo: true,
       muted: false,
     });
+
+    // Adjusting a channel while listening to original automatically switches to stems
+    await backend.invoke("playback_set_source", { source: "original" });
+    expect(latestState.source).toBe("original");
+    await backend.invoke("playback_set_channel", { id: "vocals", gainDb: -3 });
+    expect(latestState.source).toBe("stems");
+
+    // Re-splitting preserves manual gain/mute on loaded playback
+    await backend.invoke("playback_set_channel", { id: "drums", muted: true });
+    await backend.invoke("start_split", {
+      sessionId: "golden-hour",
+      options: { mode: "all", quality: "fast" },
+      acceptRestricted: true,
+    });
+    await new Promise((r) => setTimeout(r, 250));
+    expect(latestState.channels.find((c) => c.id === "vocals")?.gainDb).toBe(-3);
+    expect(latestState.channels.find((c) => c.id === "drums")?.muted).toBe(true);
+    expect(latestState.channels.find((c) => c.id === "piano")?.muted).toBe(true);
+  });
+
+  it("supports studio quality splits with RoFormer model plan", async () => {
+    backend = createMockBackend({ timeScale: 0.02 });
+    const est = await backend.invoke("estimate_split", {
+      sessionId: "velvet-static",
+      options: { mode: "all", quality: "studio" },
+    });
+    expect(est.models.map((m) => m.id)).toEqual([
+      "melband_roformer_vocals",
+      "scnet_large",
+      "htdemucs_6s",
+    ]);
   });
 });

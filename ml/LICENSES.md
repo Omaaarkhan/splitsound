@@ -16,7 +16,7 @@ by an author in an issue thread, that is said plainly.
 | model | shipped? | code | weights | basis for the weights licence |
 |-------|----------|------|---------|-------------------------------|
 | `scnet_large`, `scnet_small` | yes, converted to ONNX | MIT | **MIT** | author's written confirmation (issue comment) |
-| `melband_roformer_vocals` | **not built** (deferred); recorded for when it is | MIT | **MIT** | author's written statement (below) |
+| `melband_roformer_vocals` | yes, converted to ONNX | MIT | **MIT** | author's written statement + HF model card (below) |
 | `efficientat_mn10_as` (tagger) | yes, converted to ONNX | MIT | **MIT by implication** | weights published in the MIT-licensed repository's own releases; no separate statement |
 | `htdemucs_6s` | **graph only**; weights fetched from Meta by the user's machine | MIT | **not open source**, likely CC BY-NC | author statements below |
 | `htdemucs`, `htdemucs_ft` | **no** (comparison exports only, never distributed) | MIT | not open source | same |
@@ -73,18 +73,20 @@ by an author in an issue thread, that is said plainly.
 
 ---------------------------------------------------------------------------
 
-## Mel-Band RoFormer vocals (`melband_roformer_vocals`): not built
-
-This model was deferred. Nothing was downloaded, exported or measured for it;
-the licence evidence is recorded so that the work can start from it.
+## Mel-Band RoFormer vocals (`melband_roformer_vocals`)
 
 * **Project:** https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model ;
-  weights on https://huggingface.co/KimberleyJSN/melbandroformer . As given by
-  the orchestrator and **not checked here**: file `MelBandRoformer.ckpt`,
+  weights on https://huggingface.co/KimberleyJSN/melbandroformer (commit
+  `ac9b0614ab3cd7f77219e18ba494dfd93956c348`, file `MelBandRoformer.ckpt`,
   913106900 bytes, Hugging Face LFS SHA-256
   `87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e`, model
-  card `license: mit`.
-* **Weights licence:** MIT. Source read here through the GitHub API:
+  card `license: mit`, verified locally on download).
+* **Code licence:** MIT. Model definition in
+  `ZFTurbo/Music-Source-Separation-Training` at commit
+  `1f700c386e0dd763fe0a57242bb9420dce987354` (`LICENSE`: "MIT License.
+  Copyright (c) 2024 Roman Solovyev (ZFTurbo)", based on
+  `lucidrains/BS-RoFormer`, MIT).
+* **Weights licence:** MIT. Source read through the GitHub API:
   https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model/issues/18
   ("License clarification for Kim_Vocal_2 checkpoint"), comment by
   **KimberleyJensen** (author association: OWNER), 2026-04-22T12:36:21Z:
@@ -94,6 +96,10 @@ the licence evidence is recorded so that the work can start from it.
   > these models and redistribute them in any way you like. I hope this is ok
   > for you.
 
+* **Attribution used in the app and embedded in the ONNX metadata:**
+  "Mel-Band RoFormer vocal separation model by KimberleyJensen (MIT License)
+  and ZFTurbo/Music-Source-Separation-Training (MIT License).
+  https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model"
 * **Training data:** not stated in the sources read. Treat as undocumented
   until the author's model card or repository says otherwise.
 * **Caveats:** the same single-statement basis as SCNet; training data

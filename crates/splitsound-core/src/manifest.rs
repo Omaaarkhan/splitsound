@@ -102,6 +102,10 @@ pub struct ModelEntry {
     pub segment_samples: usize,
     /// Default samples between chunk starts (separators only).
     pub stride_samples: usize,
+    /// Whether section 1.1 track normalisation runs around separation. The
+    /// engine takes this from the model kind; validation only checks that
+    /// the manifest agrees with it.
+    pub normalize: bool,
     /// The ONNX graph as installed.
     pub file: PinnedFile,
     /// The zstd-compressed graph in the project's models release. `None`
@@ -277,6 +281,14 @@ struct RawModel {
     #[serde(default)]
     #[allow(dead_code)]
     window: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    mel_bands: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    win_length: Option<u32>,
+    #[serde(default)]
+    normalize: Option<bool>,
     #[allow(dead_code)]
     dynamic_batch: bool,
     #[serde(default)]
@@ -335,6 +347,11 @@ impl RawModel {
         {
             return fail("unknown upstream format");
         }
+        let normalize = self.normalize.unwrap_or(true);
+        let expected_normalize = self.kind != ModelKind::MelbandRoformer;
+        if self.kind != ModelKind::Tagger && normalize != expected_normalize {
+            return fail("normalize setting differs from the engine's");
+        }
         Ok(ModelEntry {
             file: PinnedFile {
                 name: self.file,
@@ -377,6 +394,7 @@ impl RawModel {
             targets: self.targets,
             segment_samples: self.segment_samples,
             stride_samples: self.stride_samples,
+            normalize,
         })
     }
 }
@@ -578,12 +596,15 @@ mod tests {
         for id in [
             "scnet_small",
             "scnet_large",
+            "melband_roformer_vocals",
             "htdemucs_6s",
             "efficientat_mn10_as",
         ] {
             m.get(id).unwrap();
         }
         assert_eq!(m.get("nope").unwrap_err().code(), ErrorCode::NotFound);
+        assert!(m.get("scnet_large").unwrap().normalize);
+        assert!(!m.get("melband_roformer_vocals").unwrap().normalize);
     }
 
     #[test]
@@ -629,6 +650,11 @@ mod tests {
             ok.replace("\"sampleRate\":44100", "\"sampleRate\":48000"),
             ok.replace("\"channels\":2", "\"channels\":6"),
             ok.replace("\"opset\":17,", ""),
+            ok.replace(
+                "\"dynamicBatch\":true",
+                "\"dynamicBatch\":true,\"normalize\":false",
+            ),
+            ok.replace("\"kind\":\"scnet\"", "\"kind\":\"melband_roformer\""),
         ];
         for (i, c) in cases.iter().enumerate() {
             assert!(Manifest::from_json(c).is_err(), "case {i} accepted: {c}");

@@ -1,7 +1,7 @@
 //! `splitsound`: command-line front end for the SplitSound engine.
 //!
 //! ```text
-//! splitsound separate <file> [--mode vocals|band|all] [--quality fast|best]
+//! splitsound separate <file> [--mode vocals|band|all] [--quality fast|best|studio]
 //!                            [--out DIR] [--format wav32f|wav24|wav16|flac|mp3]
 //!                            [--download] [--accept-restricted] [--no-tag]
 //! splitsound detect <file>
@@ -143,7 +143,12 @@ fn parse_options(args: &Args) -> Result<SplitOptions, String> {
     let quality = match args.value("--quality").unwrap_or("fast") {
         "fast" => Quality::Fast,
         "best" => Quality::Best,
-        other => return Err(format!("--quality: expected fast or best, got {other}")),
+        "studio" => Quality::Studio,
+        other => {
+            return Err(format!(
+                "--quality: expected fast, best or studio, got {other}"
+            ));
+        }
     };
     Ok(SplitOptions { mode, quality })
 }
@@ -619,7 +624,11 @@ fn cmd_bench(args: &Args) -> Result<(), String> {
         (SplitMode::Band, "band"),
         (SplitMode::All, "all"),
     ] {
-        for (quality, quality_name) in [(Quality::Fast, "fast"), (Quality::Best, "best")] {
+        for (quality, quality_name) in [
+            (Quality::Fast, "fast"),
+            (Quality::Best, "best"),
+            (Quality::Studio, "studio"),
+        ] {
             let key = format!("{mode_name}/{quality_name}");
             if only.as_ref().is_some_and(|o| !o.contains(&key.as_str())) {
                 continue;
@@ -680,7 +689,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: splitsound <separate|detect|models|bench> ...\n\
-                 \n  separate <file> [--mode vocals|band|all] [--quality fast|best] [--out DIR]\n\
+                 \n  separate <file> [--mode vocals|band|all] [--quality fast|best|studio] [--out DIR]\n\
                  \x20          [--format wav32f|wav24|wav16|flac|mp3] [--download] [--accept-restricted]\n\
                  \x20 detect <file>\n\
                  \x20 models list | fetch [ID...] | import <FILE...> | verify [ID...] | remove <ID...>\n\

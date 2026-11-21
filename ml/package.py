@@ -52,7 +52,7 @@ MODELS = {
     },
     "melband_roformer_vocals": {
         "name": "Mel-Band RoFormer Vocals",
-        "description": "Vocals and instrumental only, at the highest vocal quality; large and slow.",
+        "description": "Studio-grade vocal isolation that minimises vocal bleed into other stems; large and slow.",
         "source": "GitHub", "restricted": False, "terms": None, "license": "MIT",
         "origin": "https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model",
     },
@@ -123,7 +123,7 @@ def build_entry(model_id: str) -> dict | None:
                                                "strideSamples", "nfft", "hop", "bins", "frames", "dynamicBatch")})
     entry["window"] = {"htdemucs": "hann", "scnet": "rectangular"}.get(entry["kind"], report.get("window"))
     entry["weightStorage"] = report.get("weightStorage", "float32")
-    for key in ("melBands", "winLength"):
+    for key in ("melBands", "winLength", "normalize"):
         if key in report:
             entry[key] = report[key]
     if weight_free:

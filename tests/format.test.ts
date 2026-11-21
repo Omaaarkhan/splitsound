@@ -48,6 +48,7 @@ describe("formatters", () => {
     expect(formatElapsed(198)).toBe("3 m 18 s");
     expect(formatDurationEstimate(41, "fast")).toBe("About 40 seconds");
     expect(formatDurationEstimate(235, "best")).toBe("About 4 minutes, cleaner result");
+    expect(formatDurationEstimate(520, "studio")).toBe("About 9 minutes, cleanest vocals");
     expect(formatEta(null)).toBe("Estimating time left");
     expect(formatEta(58)).toBe("About a minute left");
     expect(formatSessionDate("2026-11-19T18:00:00.000Z", MOCK_NOW_MS)).toBe("Today");

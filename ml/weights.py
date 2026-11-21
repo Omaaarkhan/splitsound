@@ -159,6 +159,10 @@ def verify(entry: dict) -> dict:
     publisher = entry.get("publisherChecksum")
     if publisher is None:
         result["publisherChecksum"] = "none published. " + entry.get("publisherChecksumNote", "")
+    elif publisher["type"] == "sha256":
+        if sha256 != publisher["value"]:
+            raise WeightsError(f"{entry['name']}: publisher checksum {publisher['value']} does not match")
+        result["publisherChecksum"] = f"full sha256 {publisher['value']} matches"
     elif publisher["type"] == "sha256-prefix":
         if not sha256.startswith(publisher["value"]) or f"-{publisher['value']}." not in entry["name"]:
             raise WeightsError(f"{entry['name']}: publisher checksum prefix {publisher['value']} does not match")

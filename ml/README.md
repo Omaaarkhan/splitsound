@@ -18,6 +18,7 @@ Python is used here only; the app has no Python at run time.
 |----|------|-----------|-------|
 | `scnet_large` | `scnet` | `scnet_large.onnx.zst` | default engine, 4 stems |
 | `scnet_small` | `scnet` | `scnet_small.onnx.zst` | faster, smaller, 4 stems |
+| `melband_roformer_vocals` | `melband_roformer` | `melband_roformer_vocals.onnx.zst` | Studio-tier vocal isolation, vocals stem |
 | `htdemucs_6s` | `htdemucs` | `htdemucs_6s.onnx.zst` (graph only) + `htdemucs_6s.tensors.json` | restricted: the weights are fetched from Meta and converted on the user's machine |
 | `efficientat_mn10_as` | `tagger` | `efficientat_mn10_as.onnx.zst` | instrument tagger, 527 AudioSet classes |
 
@@ -44,6 +45,7 @@ uv run --locked python -I weights.py fetch
 # 2. Export. Each script checks its graph against the original PyTorch model
 #    and runs verify_onnx on the result.
 uv run --locked python export_scnet.py                          # scnet_small, scnet_large
+uv run --locked python export_melband_roformer.py               # melband_roformer_vocals
 uv run --locked python export_htdemucs.py                       # htdemucs_6s graph, tensor table, local weights file
 uv run --locked --group tagger python export_tagger.py          # tagger + assets/audioset_labels.json
 
@@ -58,7 +60,7 @@ uv run --locked python make_testdata.py
 
 ```bash
 # Inert-data check on the exported graphs (exit status 1 on any violation); meant for CI.
-uv run --locked python verify_onnx.py dist/scnet_large.onnx dist/scnet_small.onnx dist/efficientat_mn10_as.onnx
+uv run --locked python verify_onnx.py dist/scnet_large.onnx dist/scnet_small.onnx dist/melband_roformer_vocals.onnx dist/efficientat_mn10_as.onnx
 uv run --locked python verify_onnx.py --external-data htdemucs_6s.weights --max-inline-bytes 65536 dist/htdemucs_6s.onnx
 
 # Reference implementation against the original PyTorch code.

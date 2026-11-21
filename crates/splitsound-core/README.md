@@ -61,7 +61,7 @@ engine.unload();   // optional: frees the model sessions (hundreds of MB) betwee
 | contract (`contract.ts`) | engine |
 | --- | --- |
 | `IpcError.code` / `.message` | `Error::code().as_str()` / `Error::message()`. `Error::detail()` is technical text for logs, never for users. The codes are the contract's list one to one, including `terms_required`. |
-| `StemId`, `SplitMode`, `Quality`, `SplitOptions`, `ExportFormat` | same names, serde gives the contract's strings (`"vocals"`, `"all"`, `"best"`, `"wav32f"`). `SplitMode::stems()` is `STEMS_BY_MODE`; `StemId::ORDER` is `STEM_ORDER`. |
+| `StemId`, `SplitMode`, `Quality`, `SplitOptions`, `ExportFormat` | same names, serde gives the contract's strings (`"vocals"`, `"all"`, `"best"`, `"studio"`, `"wav32f"`). `SplitMode::stems()` is `STEMS_BY_MODE`; `StemId::ORDER` is `STEM_ORDER`. |
 | `Detection` | `Detection { label, family, confidence }` |
 | `AnalysisStatus` | `DetectOutcome::Done(report)` is `done`, `DetectOutcome::Unavailable { missing }` is `unavailable`, an `Err` is `failed`. `report.suggested_mode` is `Session.suggestedMode`. |
 | `TrackInfo` | `SourceInfo` (title, artist, album, duration_sec, sample_rate, channels, codec, bitrate_kbps, file_size_bytes, has_artwork). The shell adds `path`, `fileName` and the title fallback. `ImportedTrack::artwork` holds the cover bytes and media type for `get_artwork`. |
@@ -150,20 +150,28 @@ the id it recognised, or `None`), `clean_temp_files()`.
 | --- | --- | --- |
 | vocals | fast | `scnet_small`: vocals |
 | vocals | best | `scnet_large`: vocals |
+| vocals | studio | `melband_roformer_vocals`: vocals |
 | band | fast | `scnet_small`: vocals, drums, bass |
 | band | best | `scnet_large`: vocals, drums, bass |
+| band | studio | `melband_roformer_vocals`: vocals; `scnet_large` on the residual: drums, bass |
 | all | fast | `htdemucs_6s` on the mix: vocals, drums, bass, guitar, piano |
 | all | best | `scnet_large`: vocals, drums, bass; then `htdemucs_6s` on what is left: guitar, piano |
+| all | studio | `melband_roformer_vocals`: vocals; `scnet_large` on the residual: drums, bass; then `htdemucs_6s` on what is left: guitar, piano |
 
 Fast and best differ in the model, not in the chunk overlap: every pass uses
-the model's own stride (25 % overlap). ML measured 50 % overlap as no better
-for 1.5 times the work.
+the model's own stride (25 % overlap for SCNet/HTDemucs; 50 % overlap for
+Mel-Band RoFormer). ML measured tighter overlap as no better for the extra work.
 
 "Other" (and "instrumental" in the two-stem mode) is always the mix minus the
 named stems, so stems sum to the mix exactly. `separate::pipeline` holds this
-table as code. The Mel-Band RoFormer vocal model is not wired in; the model
-kind exists in the manifest types and `separate::models::open_segment_model`
-is the single place a new kind is added.
+table as code. In `studio`, vocals are isolated first with
+`melband_roformer_vocals` (no track normalisation) before passing the vocal-free
+residual to `scnet_large` for drums and bass (and `htdemucs_6s` for guitar and
+piano in `all`). This was measured to improve all four MUSDB18 stems (`9.64 dB`
+vs `9.19 dB` mean median SDR for `scnet_large`) and sharply reduces vocal bleed
+(note: KimberleyJensen's checkpoint training data is undocumented and the 7 s
+MUSDB18 excerpts are zero-padded to 8 s, so see `ml/BENCHMARKS.md` for
+caveats).
 
 ### Guitar and piano: mix or residual
 
@@ -264,8 +272,9 @@ track took 0.2 s; the preview detection 3.7 s; peaks for a 3.4 minute working
 file at 2000 buckets 5 ms warm, 117 ms cold.
 
 **Memory.** ONNX Runtime needs about 0.8 GB to run a segment of
-`scnet_small` and about 1.9 GB for `scnet_large` or `htdemucs_6s`
-(`ml/BENCHMARKS.md`). On top of that the engine holds the mix, the residual
+`scnet_small`, about 1.9 GB for `scnet_large` or `htdemucs_6s`, and about
+3.6 GB peak RSS for `melband_roformer_vocals` (CPU, `memory_pattern = false`,
+per-head time attention; `ml/BENCHMARKS.md`). On top of that the engine holds the mix, the residual
 and one stereo accumulator per stem of the pass that is running (about 21 MB
 per minute each). `split_to_dir` measures, writes and releases each stem as
 soon as its pass is done, and on tracks over five minutes releases the model

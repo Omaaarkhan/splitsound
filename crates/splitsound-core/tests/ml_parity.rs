@@ -14,13 +14,16 @@ use std::path::{Path, PathBuf};
 
 use splitsound_core::audio::snr_db;
 use splitsound_core::checkpoint::{TensorTable, convert_checkpoint};
-use splitsound_core::manifest::Manifest;
+use splitsound_core::manifest::{Manifest, ModelKind};
 use splitsound_core::progress::NoProgress;
-use splitsound_core::runtime::{Acceleration, Runtime, RuntimeConfig, resolve_library_path};
+use splitsound_core::runtime::{
+    Acceleration, Runtime, RuntimeConfig, SessionConfig, resolve_library_path,
+};
 use splitsound_core::separate::chunk::separate_track;
 use splitsound_core::separate::models::open_segment_model;
 use splitsound_core::stft::{
-    HtdemucsStft, PLANE, SC_FRAMES, SC_PLANE, SC_SEGMENT, SEGMENT, ScnetStft,
+    HtdemucsStft, MB_FRAMES, MB_PLANE, MB_SEGMENT, MelbandRoformerStft, PLANE, SC_FRAMES, SC_PLANE,
+    SC_SEGMENT, SEGMENT, ScnetStft,
 };
 use splitsound_core::store::{ModelSource, ModelStore};
 use splitsound_core::tagger::Tagger;
@@ -126,6 +129,35 @@ fn stft_scnet_matches_the_reference_vectors() {
     );
     // The rectangular window lets full-scale content through unattenuated,
     // so float32 rounding in a 4096-point FFT is a little larger here.
+    assert!(d_re < 3e-5 && d_im < 3e-5, "forward: {d_re} {d_im}");
+    assert!(d_inv < 1e-5, "inverse: {d_inv}");
+}
+
+#[test]
+fn stft_melband_matches_the_reference_vectors() {
+    let Some(dir) = testdata() else { return };
+    let input = read_npy(&dir.join("stft_melband_input.npy"));
+    let spec = read_npy(&dir.join("stft_melband_spec.npy"));
+    let roundtrip = read_npy(&dir.join("stft_melband_roundtrip.npy"));
+    assert_eq!(input.len(), MB_SEGMENT);
+    assert_eq!(spec.len(), 2 * MB_PLANE);
+    assert_eq!(MB_PLANE % MB_FRAMES, 0);
+    let expected_re: Vec<f32> = spec.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
+    let expected_im: Vec<f32> = spec.as_chunks::<2>().0.iter().map(|c| c[1]).collect();
+
+    let mut st = MelbandRoformerStft::new();
+    let mut re = vec![0f32; MB_PLANE];
+    let mut im = vec![0f32; MB_PLANE];
+    st.forward(&input, &mut re, &mut im).unwrap();
+    let d_re = max_abs_diff(&re, &expected_re);
+    let d_im = max_abs_diff(&im, &expected_im);
+    let mut out = vec![0f32; MB_SEGMENT];
+    st.inverse(&expected_re, &expected_im, &mut out).unwrap();
+    let d_inv = max_abs_diff(&out, &roundtrip);
+    println!(
+        "melband STFT: max |diff| re {d_re:.2e}, im {d_im:.2e}; inverse {d_inv:.2e}, SNR {:.1} dB",
+        snr_db(&roundtrip, &out)
+    );
     assert!(d_re < 3e-5 && d_im < 3e-5, "forward: {d_re} {d_im}");
     assert!(d_inv < 1e-5, "inverse: {d_inv}");
 }
@@ -243,7 +275,14 @@ fn stems_match_the_reference() {
             .as_ref()
             .map(|(n, b)| (n.as_str(), b.clone()));
         let (session, _) = runtime
-            .session_from_verified(&verified.graph, external)
+            .session_from_verified_with(
+                &verified.graph,
+                external,
+                SessionConfig {
+                    allow_gpu: false,
+                    memory_pattern: !matches!(entry.kind, ModelKind::MelbandRoformer),
+                },
+            )
             .unwrap();
         let mut model = open_segment_model(
             entry.kind.separator().unwrap(),
