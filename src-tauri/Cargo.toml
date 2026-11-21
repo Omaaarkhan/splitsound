@@ -43,5 +43,5 @@ log = "0.4"
 cpal = "0.18"
 rtrb = "0.4"
 memmap2 = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
