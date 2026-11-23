@@ -2,9 +2,8 @@ name: CI
 
 # Checks every change. Also called by the release workflow before it builds.
 #
-# The three-platform installer build is expensive (macOS minutes cost ten times
-# Linux ones on a private repository), so on pull requests it only runs when
-# the pull request carries the "full-build" label.
+# The three-platform installer build is slow (especially macOS), so on pull
+# requests it only runs when the pull request carries the "full-build" label.
 
 on:
   pull_request:
@@ -58,31 +57,21 @@ jobs:
     name: Engine and shell
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .node-version
       - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libxdo-dev libssl-dev libasound2-dev patchelf
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+            libwebkit2gtk-4.1-dev libasound2-dev mold
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: Fetch ONNX Runtime (pinned, checksummed)
-        run: node scripts/fetch-onnxruntime.mjs
+          shared-key: ci-rust
       - name: Stand in for the built interface
         # The shell embeds the interface at compile time; an empty page is enough to compile and test.
         run: mkdir -p dist && echo '<!doctype html><title>SplitSound</title>' > dist/index.html
@@ -151,6 +140,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
+          cache: npm
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: installers-*

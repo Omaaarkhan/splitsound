@@ -9,16 +9,82 @@ license = "MIT"
 repository = "https://github.com/Omaaarkhan/splitsound"
 authors = ["SplitSound contributors"]
 
-# The engine does heavy DSP. Unoptimised it is unusably slow, so optimise it
-# (and every dependency) even in dev builds.
+# Keep debug info out of third-party crates so dev/test compiles, links and
+# target/ caches stay fast and compact, while preserving full backtraces for
+# workspace crates.
 [profile.dev.package."*"]
-opt-level = 3
+debug = 0
 
+# The engine does heavy DSP. Unoptimised it is unusably slow, so optimise the
+# core engine and its DSP/codec crates in dev and test builds without paying
+# optimised codegen on the rest of the GUI/Tauri/network dependency tree.
 [profile.dev.package.splitsound-core]
-opt-level = 3
+opt-level = 2
+[profile.dev.package.rubato]
+opt-level = 2
+[profile.dev.package.rustfft]
+opt-level = 2
+[profile.dev.package.realfft]
+opt-level = 2
+[profile.dev.package.flacenc]
+opt-level = 2
+[profile.dev.package.opuscule]
+opt-level = 2
+[profile.dev.package.ruzstd]
+opt-level = 2
+[profile.dev.package.mp3lame-sys]
+opt-level = 2
+[profile.dev.package.mp3lame-encoder]
+opt-level = 2
+[profile.dev.package.windowfunctions]
+opt-level = 2
+[profile.dev.package.audioadapter]
+opt-level = 2
+[profile.dev.package.audioadapter-buffers]
+opt-level = 2
+[profile.dev.package.num-complex]
+opt-level = 2
+[profile.dev.package.num-integer]
+opt-level = 2
+[profile.dev.package.num-traits]
+opt-level = 2
+[profile.dev.package.symphonia]
+opt-level = 2
+[profile.dev.package.symphonia-core]
+opt-level = 2
+[profile.dev.package.symphonia-bundle-flac]
+opt-level = 2
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 2
+[profile.dev.package.symphonia-codec-aac]
+opt-level = 2
+[profile.dev.package.symphonia-codec-alac]
+opt-level = 2
+[profile.dev.package.symphonia-codec-pcm]
+opt-level = 2
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 2
+[profile.dev.package.symphonia-format-caf]
+opt-level = 2
+[profile.dev.package.symphonia-format-isomp4]
+opt-level = 2
+[profile.dev.package.symphonia-format-ogg]
+opt-level = 2
+[profile.dev.package.symphonia-format-riff]
+opt-level = 2
+[profile.dev.package.symphonia-metadata]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+[profile.dev.package.crc32fast]
+opt-level = 2
 
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
 strip = true
+
+# Keep single-CGU optimisation on the DSP engine while letting the GUI shell
+# and third-party crates compile and ThinLTO in parallel across all cores.
+[profile.release.package.splitsound-core]
+codegen-units = 1

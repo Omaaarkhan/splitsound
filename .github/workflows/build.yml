@@ -28,10 +28,57 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-arm64
+            name: macOS (Apple silicon)
+            os: macos-15
+          - id: linux-x64
+            name: Linux (x64)
+            os: ubuntu-22.04
+          - id: windows-x64
+            name: Windows (x64)
+            os: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libasound2-dev lld
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: inputs.cache
+        with:
+          shared-key: test-${{ matrix.id }}
+
+      - name: Stand in for the built interface
+        # The shell embeds the interface at compile time; an empty page is enough to compile and test.
+        run: mkdir -p dist && echo '<!doctype html><title>SplitSound</title>' > dist/index.html
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +116,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
+          cache: npm
 
       - name: Install system libraries (Linux)
         if: runner.os == 'Linux'
@@ -76,23 +124,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libxdo-dev libssl-dev libasound2-dev patchelf libfuse2 file
+            libasound2-dev patchelf libfuse2 file
 
       - name: Add Rust targets
         if: matrix.rust-targets != ''
         run: rustup target add ${{ matrix.rust-targets }}
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: inputs.cache
+        with:
+          shared-key: release-${{ matrix.id }}
+
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: inputs.cache
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: bundle-${{ matrix.id }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            bundle-${{ matrix.id }}-${{ hashFiles('rust-toolchain.toml') }}-
+          path: vendor/onnxruntime/${{ matrix.onnxruntime }}
+          key: onnxruntime-${{ matrix.onnxruntime }}-${{ hashFiles('scripts/fetch-onnxruntime.mjs') }}
 
       - run: npm ci
 
@@ -104,12 +151,6 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: node scripts/set-version.mjs "$VERSION"
-
-      - name: Build the interface
-        run: npm run build
-
-      - name: Test
-        run: cargo test --workspace --locked --no-fail-fast
 
       - name: Build installers
         run: |
