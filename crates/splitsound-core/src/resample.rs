@@ -79,6 +79,13 @@ impl Inner {
             Inner::Sinc(r) => r.process_into_buffer(input, output, Some(indexing)),
         }
     }
+
+    fn reset(&mut self) {
+        match self {
+            Inner::Fft(r) => r.reset(),
+            Inner::Sinc(r) => r.reset(),
+        }
+    }
 }
 
 /// Incremental resampler for `channels` planar channels.
@@ -87,8 +94,10 @@ pub struct StreamResampler {
     channels: usize,
     from: u32,
     to: u32,
-    /// Input frames not yet consumed (planar).
+    /// Input frames buffered per channel; valid unconsumed frames start at `pending_pos`.
     pending: Vec<Vec<f32>>,
+    /// Read cursor (in frames) into each `pending` channel buffer.
+    pending_pos: usize,
     /// Scratch output for one chunk.
     chunk_out: Vec<Vec<f32>>,
     /// Output frames still to drop to remove the start-up delay.
@@ -151,6 +160,7 @@ impl StreamResampler {
             from,
             to,
             pending: vec![Vec::new(); channels],
+            pending_pos: 0,
             chunk_out,
             to_trim,
             frames_in: 0,
@@ -242,21 +252,47 @@ impl StreamResampler {
         self.frames_out
     }
 
+    /// Resets internal resampler state so this instance can be reused on a new
+    /// clip with the same `from`/`to`/`channels` configuration without
+    /// rebuilding the FFT/Sinc filter tables.
+    pub fn reset(&mut self) {
+        if let Some(r) = self.inner.as_mut() {
+            r.reset();
+            self.to_trim = r.output_delay();
+        } else {
+            self.to_trim = 0;
+        }
+        for p in &mut self.pending {
+            p.clear();
+        }
+        self.pending_pos = 0;
+        self.frames_in = 0;
+        self.frames_out = 0;
+    }
+
     fn drain(&mut self, out: &mut [Vec<f32>], flush: bool) -> Result<()> {
         loop {
             let need = match &self.inner {
                 Some(r) => r.input_frames_next(),
                 None => return Ok(()),
             };
-            let have = self.pending[0].len();
+            let have = self.pending[0].len() - self.pending_pos;
             if have >= need {
                 self.process_chunk(out, None)?;
             } else if flush && have > 0 {
                 self.process_chunk(out, Some(have))?;
             } else {
-                return Ok(());
+                break;
             }
         }
+        if self.pending_pos > 0 {
+            let consumed = self.pending_pos;
+            for p in self.pending.iter_mut() {
+                p.drain(..consumed);
+            }
+            self.pending_pos = 0;
+        }
+        Ok(())
     }
 
     /// Runs one resampler chunk. `partial` is the number of valid pending
@@ -267,20 +303,22 @@ impl StreamResampler {
         };
         let need = r.input_frames_next();
         let valid = partial.unwrap_or(need);
-        // The adapter needs `need` frames to exist even for a partial chunk.
+        let req_len = self.pending_pos + need;
+        // The adapter needs `need` frames from `pending_pos` even for a partial chunk.
         for p in self.pending.iter_mut() {
-            if p.len() < need {
-                p.resize(need, 0.0);
+            if p.len() < req_len {
+                p.resize(req_len, 0.0);
             }
         }
         let out_cap = self.chunk_out[0].len();
+        let avail = self.pending[0].len();
         let input =
-            SequentialSliceOfVecs::new(&self.pending, self.channels, need).map_err(rubato_err)?;
+            SequentialSliceOfVecs::new(&self.pending, self.channels, avail).map_err(rubato_err)?;
         let mut output =
             SequentialSliceOfVecs::new_mut(&mut self.chunk_out, self.channels, out_cap)
                 .map_err(rubato_err)?;
         let indexing = Indexing {
-            input_offset: 0,
+            input_offset: self.pending_pos,
             output_offset: 0,
             partial_len: partial,
             active_channels_mask: None,
@@ -293,12 +331,13 @@ impl StreamResampler {
         } else {
             used
         };
-        for p in self.pending.iter_mut() {
-            let n = consumed.min(p.len());
-            p.drain(..n);
-            if partial.is_some() {
+        if partial.is_some() {
+            for p in self.pending.iter_mut() {
                 p.clear();
             }
+            self.pending_pos = 0;
+        } else {
+            self.pending_pos += consumed.min(self.pending[0].len() - self.pending_pos);
         }
         let skip = self.to_trim.min(produced);
         self.to_trim -= skip;
@@ -506,6 +545,7 @@ mod tests {
             from: 48_000,
             to: 44_100,
             pending: vec![Vec::new()],
+            pending_pos: 0,
             chunk_out: vec![vec![0f32; max_out]],
             to_trim: delay,
             frames_in: 0,

@@ -1,4 +1,10 @@
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import type { CommandName, Commands, EventName, Events, SourceId, SplitProgress } from "./contract";
+
+declare const __ENABLE_MOCK__: boolean | undefined;
+
+const ENABLE_MOCK = typeof __ENABLE_MOCK__ !== "undefined" ? __ENABLE_MOCK__ : true;
 
 export type UnlistenFn = () => void;
 
@@ -18,13 +24,8 @@ export function isTauriRuntime(): boolean {
 
 let transportPromise: Promise<IpcTransport> | null = null;
 
-async function createTauriTransport(): Promise<IpcTransport> {
-  const [{ invoke: tauriInvoke }, { listen: tauriListen }] = await Promise.all([
-    import("@tauri-apps/api/core"),
-    import("@tauri-apps/api/event"),
-  ]);
-
-  return {
+function createTauriTransport(): Promise<IpcTransport> {
+  return Promise.resolve({
     invoke: (command, args) => tauriInvoke(command, args as Record<string, unknown>),
     listen: async (event, handler) => {
       const unlisten = await tauriListen(event, (ev) => {
@@ -32,10 +33,13 @@ async function createTauriTransport(): Promise<IpcTransport> {
       });
       return unlisten;
     },
-  };
+  });
 }
 
 async function createMockTransport(): Promise<IpcTransport> {
+  if (!ENABLE_MOCK) {
+    throw new Error("Tauri IPC runtime unavailable");
+  }
   const mod = await import("./mock/index");
   return mod.getMockBackend();
 }

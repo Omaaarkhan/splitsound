@@ -56,7 +56,7 @@ fn analyze_core(
     channels: usize,
     sample_rate: u32,
     stem: Window<'_>,
-    mix: Option<Window<'_>>,
+    mix_rms: Option<&[f32]>,
 ) -> StemStats {
     if frames == 0 {
         return StemStats {
@@ -68,8 +68,17 @@ fn analyze_core(
         };
     }
     let rms_of = |sum_sq: f64, count: usize| (sum_sq / count.max(1) as f64).sqrt() as f32;
+    let bin_bounds = |b: usize| -> (usize, usize) {
+        let s = ((b as u128 * frames as u128 / ACTIVITY_BINS as u128) as usize).min(frames - 1);
+        let mut e = ((b as u128 + 1) * frames as u128 / ACTIVITY_BINS as u128) as usize;
+        if e <= s {
+            e = s + 1;
+        }
+        (s, e)
+    };
 
-    // Audible windows, and the overall level and peak along the way.
+    // Single pass over the stem combining 100 ms active-window gating and 240
+    // activity-envelope bins cleanly at overlapping interval boundaries.
     let window = (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
     let floor = crate::audio::db_to_gain(ACTIVE_FLOOR_DB);
     let rel = crate::audio::db_to_gain(-ACTIVE_BELOW_MIX_DB);
@@ -77,39 +86,58 @@ fn analyze_core(
     let mut active = 0usize;
     let mut total_sq = 0f64;
     let mut peak = 0f32;
-    let mut start = 0usize;
-    while start < frames {
-        let end = (start + window).min(frames);
-        let (sum_sq, window_peak) = stem(start, end);
-        total_sq += sum_sq;
-        peak = peak.max(window_peak);
-        let w = rms_of(sum_sq, (end - start) * channels);
-        let mut is_active = w > floor;
-        if is_active && let Some(mix) = mix {
-            let m = rms_of(mix(start, end).0, (end - start) * channels);
-            is_active = w > m * rel;
+
+    let mut activity = vec![0.0f32; ACTIVITY_BINS];
+    let mut w_start = 0usize;
+    let mut w_end = window.min(frames);
+    let mut w_sq = 0f64;
+    let mut b_idx = 0usize;
+    let (mut b_start, mut b_end) = bin_bounds(0);
+    let mut b_sq = 0f64;
+
+    let mut pos = 0usize;
+    while pos < frames {
+        let next = w_end.min(b_end);
+        let (seg_sq, seg_peak) = stem(pos, next);
+        total_sq += seg_sq;
+        peak = peak.max(seg_peak);
+        w_sq += seg_sq;
+        b_sq += seg_sq;
+        pos = next;
+
+        if pos == w_end {
+            let w = rms_of(w_sq, (w_end - w_start) * channels);
+            let mut is_active = w > floor;
+            if is_active && let Some(mix_vals) = mix_rms {
+                let m = mix_vals.get(windows).copied().unwrap_or(0.0);
+                is_active = w > m * rel;
+            }
+            windows += 1;
+            if is_active {
+                active += 1;
+            }
+            w_start = w_end;
+            w_end = (w_start + window).min(frames);
+            w_sq = 0.0;
         }
-        windows += 1;
-        if is_active {
-            active += 1;
+
+        while b_idx < ACTIVITY_BINS && pos >= b_end {
+            let db = crate::audio::amplitude_to_db(rms_of(b_sq, (b_end - b_start) * channels));
+            activity[b_idx] = ((db - ENVELOPE_FLOOR_DB) / -ENVELOPE_FLOOR_DB).clamp(0.0, 1.0);
+            b_idx += 1;
+            b_sq = 0.0;
+            if b_idx < ACTIVITY_BINS {
+                (b_start, b_end) = bin_bounds(b_idx);
+                if b_start < pos {
+                    // Sub-frame tail when `frames < ACTIVITY_BINS`: exact slice fallback.
+                    let (sub_sq, _) = stem(b_start, b_end);
+                    b_sq = sub_sq;
+                }
+            }
         }
-        start = end;
     }
     let active_fraction = active as f32 / windows.max(1) as f32;
     let active_sec = active as f32 * window as f32 / sample_rate.max(1) as f32;
-
-    // Envelope.
-    let mut activity = Vec::with_capacity(ACTIVITY_BINS);
-    for b in 0..ACTIVITY_BINS {
-        let s = (b as u128 * frames as u128 / ACTIVITY_BINS as u128) as usize;
-        let mut e = ((b as u128 + 1) * frames as u128 / ACTIVITY_BINS as u128) as usize;
-        let s = s.min(frames - 1);
-        if e <= s {
-            e = s + 1;
-        }
-        let db = crate::audio::amplitude_to_db(rms_of(stem(s, e).0, (e - s) * channels));
-        activity.push(((db - ENVELOPE_FLOOR_DB) / -ENVELOPE_FLOOR_DB).clamp(0.0, 1.0));
-    }
 
     let rms_db = crate::audio::amplitude_to_db(rms_of(total_sq, frames * channels));
     let present = rms_db > PRESENT_MIN_RMS_DB
@@ -134,6 +162,27 @@ fn slice_window(samples: &[f32]) -> (f64, f32) {
     (sum, peak)
 }
 
+/// Precomputes the per-window RMS of planar stereo `mix` once so analyzing all
+/// stems against it does not rescan `mix` 6 times.
+pub fn precompute_mix_rms(mix: &crate::audio::Stereo, sample_rate: u32) -> Vec<f32> {
+    let frames = mix.len();
+    if frames == 0 {
+        return Vec::new();
+    }
+    let window = (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
+    let mut out = Vec::with_capacity(frames.div_ceil(window));
+    let mut start = 0usize;
+    while start < frames {
+        let end = (start + window).min(frames);
+        let (l, _) = slice_window(&mix.left[start..end]);
+        let (r, _) = slice_window(&mix.right[start..end]);
+        let count = (end - start) * 2;
+        out.push(((l + r) / count.max(1) as f64).sqrt() as f32);
+        start = end;
+    }
+    out
+}
+
 /// Measures a stem.
 ///
 /// `stem` is interleaved with `channels` channels at `sample_rate`. `mix`,
@@ -149,19 +198,44 @@ pub fn analyze_stem(
     let channels = channels.max(1);
     let frames = stem.len() / channels;
     let stem_window = |s: usize, e: usize| slice_window(&stem[s * channels..e * channels]);
-    // A mix shorter than the stem cannot be compared window by window.
     let mix = mix.filter(|m| m.len() >= frames * channels);
-    let mix_window = |s: usize, e: usize| match mix {
-        Some(m) => slice_window(&m[s * channels..e * channels]),
-        None => (0.0, 0.0),
-    };
+    let mix_rms = mix.map(|m| {
+        let window =
+            (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
+        let mut out = Vec::with_capacity(frames.div_ceil(window));
+        let mut start = 0usize;
+        while start < frames {
+            let end = (start + window).min(frames);
+            let (sq, _) = slice_window(&m[start * channels..end * channels]);
+            let count = (end - start) * channels;
+            out.push((sq / count.max(1) as f64).sqrt() as f32);
+            start = end;
+        }
+        out
+    });
     analyze_core(
         frames,
         channels,
         sample_rate,
         &stem_window,
-        mix.is_some().then_some(&mix_window as Window<'_>),
+        mix_rms.as_deref(),
     )
+}
+
+/// [`analyze_stem`] for planar stereo, using a precomputed `mix_rms` slice
+/// from [`precompute_mix_rms`].
+pub fn analyze_stereo_with_mix_rms(
+    stem: &crate::audio::Stereo,
+    mix_rms: Option<&[f32]>,
+    sample_rate: u32,
+) -> StemStats {
+    let frames = stem.len();
+    let stem_window = |s: usize, e: usize| {
+        let (l, lp) = slice_window(&stem.left[s..e]);
+        let (r, rp) = slice_window(&stem.right[s..e]);
+        (l + r, lp.max(rp))
+    };
+    analyze_core(frames, 2, sample_rate, &stem_window, mix_rms)
 }
 
 /// [`analyze_stem`] for planar stereo, without copying anything.
@@ -171,24 +245,10 @@ pub fn analyze_stereo(
     sample_rate: u32,
 ) -> StemStats {
     let frames = stem.len();
-    let planar = |a: &crate::audio::Stereo, s: usize, e: usize| {
-        let (l, lp) = slice_window(&a.left[s..e]);
-        let (r, rp) = slice_window(&a.right[s..e]);
-        (l + r, lp.max(rp))
-    };
-    let stem_window = |s: usize, e: usize| planar(stem, s, e);
-    let mix = mix.filter(|m| m.len() >= frames);
-    let mix_window = |s: usize, e: usize| match mix {
-        Some(m) => planar(m, s, e),
-        None => (0.0, 0.0),
-    };
-    analyze_core(
-        frames,
-        2,
-        sample_rate,
-        &stem_window,
-        mix.is_some().then_some(&mix_window as Window<'_>),
-    )
+    let mix_rms = mix
+        .filter(|m| m.len() >= frames)
+        .map(|m| precompute_mix_rms(m, sample_rate));
+    analyze_stereo_with_mix_rms(stem, mix_rms.as_deref(), sample_rate)
 }
 
 #[cfg(test)]

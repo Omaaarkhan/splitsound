@@ -18,7 +18,50 @@ const initialLibraryState = (): LibraryState => ({
 
 export const libraryStore = createStore<LibraryState>(initialLibraryState);
 
+const ARTWORK_CONCURRENCY = 4;
 const pendingArtwork = new Set<string>();
+const artworkQueue: string[] = [];
+const queuedArtworkBatch = new Map<string, string | null>();
+let activeArtworkFetches = 0;
+let batchFlushScheduled = false;
+
+function scheduleArtworkBatchFlush(): void {
+  if (batchFlushScheduled) return;
+  batchFlushScheduled = true;
+  queueMicrotask(() => {
+    batchFlushScheduled = false;
+    if (queuedArtworkBatch.size === 0) return;
+    const entries = Array.from(queuedArtworkBatch.entries());
+    queuedArtworkBatch.clear();
+    libraryStore.setState((prev) => {
+      const nextMap = { ...prev.artworkById };
+      for (const [id, dataUrl] of entries) {
+        nextMap[id] = dataUrl;
+      }
+      return { ...prev, artworkById: nextMap };
+    });
+  });
+}
+
+function drainArtworkQueue(): void {
+  while (activeArtworkFetches < ARTWORK_CONCURRENCY && artworkQueue.length > 0) {
+    const sessionId = artworkQueue.shift()!;
+    activeArtworkFetches++;
+    void (async () => {
+      try {
+        const dataUrl = await invoke("get_artwork", { sessionId });
+        queuedArtworkBatch.set(sessionId, dataUrl);
+      } catch {
+        queuedArtworkBatch.set(sessionId, null);
+      } finally {
+        pendingArtwork.delete(sessionId);
+        activeArtworkFetches--;
+        scheduleArtworkBatchFlush();
+        drainArtworkQueue();
+      }
+    })();
+  }
+}
 
 export async function refreshLibrary(): Promise<SessionSummary[]> {
   const sessions = await invoke("list_sessions");
@@ -75,30 +118,16 @@ export function seedLibraryProgress(map: Record<string, SplitProgress>): void {
 
 export async function loadSessionArtwork(sessionId: string): Promise<void> {
   const state = libraryStore.getState();
-  if (sessionId in state.artworkById || pendingArtwork.has(sessionId)) {
+  if (
+    sessionId in state.artworkById ||
+    pendingArtwork.has(sessionId) ||
+    queuedArtworkBatch.has(sessionId)
+  ) {
     return;
   }
   pendingArtwork.add(sessionId);
-  try {
-    const dataUrl = await invoke("get_artwork", { sessionId });
-    libraryStore.setState((prev) => ({
-      ...prev,
-      artworkById: {
-        ...prev.artworkById,
-        [sessionId]: dataUrl,
-      },
-    }));
-  } catch {
-    libraryStore.setState((prev) => ({
-      ...prev,
-      artworkById: {
-        ...prev.artworkById,
-        [sessionId]: null,
-      },
-    }));
-  } finally {
-    pendingArtwork.delete(sessionId);
-  }
+  artworkQueue.push(sessionId);
+  drainArtworkQueue();
 }
 
 export async function deleteLibrarySession(sessionId: string): Promise<void> {

@@ -293,7 +293,7 @@ impl WavWriter {
             ));
         }
         let (tmp, file) = create_temp_sibling(path).map_err(|e| Error::from_write(&e, path))?;
-        let mut out = BufWriter::with_capacity(1 << 16, file);
+        let mut out = BufWriter::with_capacity(1 << 18, file);
         let header = out.write_all(&float_header(channels, sample_rate, 0));
         let writer = WavWriter {
             out: Some(out),
@@ -312,37 +312,59 @@ impl WavWriter {
         let Some(out) = self.out.as_mut() else {
             return Err(Error::internal("write after finish"));
         };
-        let mut buf = [0u8; 4096];
-        for chunk in samples.chunks(1024) {
-            for (i, s) in chunk.iter().enumerate() {
-                buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
-            }
-            out.write_all(&buf[..chunk.len() * 4])
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: every bit pattern is valid u8, and we only read the initialized
+            // slice of `f32` bytes for writing out little-endian samples.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    samples.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(samples),
+                )
+            };
+            out.write_all(bytes)
                 .map_err(|e| Error::from_write(&e, &self.dst))?;
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = [0u8; 8192];
+            for chunk in samples.chunks(2048) {
+                for (i, s) in chunk.iter().enumerate() {
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
+                }
+                out.write_all(&buf[..chunk.len() * 4])
+                    .map_err(|e| Error::from_write(&e, &self.dst))?;
+            }
         }
         self.data_bytes += samples.len() as u64 * 4;
         Ok(())
     }
 
-    /// Appends planar stereo frames.
+    /// Appends planar stereo frames directly into the writer buffer.
     pub fn write_planar(&mut self, left: &[f32], right: &[f32]) -> Result<()> {
-        let mut inter = [0f32; 2048];
+        let Some(out) = self.out.as_mut() else {
+            return Err(Error::internal("write after finish"));
+        };
         let n = left.len().min(right.len());
+        let mut buf = [0u8; 8192];
         let mut pos = 0;
         while pos < n {
             let take = (n - pos).min(1024);
+            let lslice = &left[pos..pos + take];
+            let rslice = &right[pos..pos + take];
             for i in 0..take {
-                inter[2 * i] = left[pos + i];
-                inter[2 * i + 1] = right[pos + i];
+                buf[i * 8..i * 8 + 4].copy_from_slice(&lslice[i].to_le_bytes());
+                buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&rslice[i].to_le_bytes());
             }
-            self.write_interleaved(&inter[..take * 2])?;
+            out.write_all(&buf[..take * 8])
+                .map_err(|e| Error::from_write(&e, &self.dst))?;
             pos += take;
         }
+        self.data_bytes += n as u64 * 8;
         Ok(())
     }
 
-    /// Patches the header, syncs and moves the file into place.
-    pub fn finish(mut self) -> Result<()> {
+    fn finish_inner(mut self, sync: bool) -> Result<()> {
         let Some(out) = self.out.take() else {
             return Ok(());
         };
@@ -356,12 +378,25 @@ impl WavWriter {
             self.data_bytes,
         ))
         .map_err(werr)?;
-        file.sync_all().map_err(werr)?;
+        if sync {
+            file.sync_all().map_err(werr)?;
+        }
         drop(file);
         if let Some(tmp) = self.tmp.take() {
             tmp.persist(&self.dst).map_err(werr)?;
         }
         Ok(())
+    }
+
+    /// Patches the header, syncs and moves the file into place.
+    pub fn finish(self) -> Result<()> {
+        self.finish_inner(true)
+    }
+
+    /// Patches the header and moves the file into place without `fsync`.
+    /// Intended for staging directories where an outer commit handles durability.
+    pub fn finish_nosync(self) -> Result<()> {
+        self.finish_inner(false)
     }
 }
 
@@ -378,6 +413,13 @@ pub fn write_wav_f32(path: &Path, audio: &Stereo, sample_rate: u32) -> Result<()
     let mut w = WavWriter::create(path, sample_rate)?;
     w.write_planar(&audio.left, &audio.right)?;
     w.finish()
+}
+
+/// Writes `audio` as a 32-bit float stereo WAV without `fsync` (for staging).
+pub fn write_wav_f32_nosync(path: &Path, audio: &Stereo, sample_rate: u32) -> Result<()> {
+    let mut w = WavWriter::create(path, sample_rate)?;
+    w.write_planar(&audio.left, &audio.right)?;
+    w.finish_nosync()
 }
 
 fn rd_u16(b: &[u8], at: usize) -> u16 {
@@ -678,6 +720,14 @@ impl MappedWav {
     /// Whether the samples come straight from a memory map.
     pub fn is_mapped(&self) -> bool {
         matches!(self.backing, Backing::Mapped(_))
+    }
+
+    /// Hints the OS page cache that this mapping will be read sequentially.
+    pub fn advise_sequential(&self) {
+        #[cfg(unix)]
+        if let Backing::Mapped(map) = &self.backing {
+            let _ = map.advise(memmap2::Advice::Sequential);
+        }
     }
 
     /// Copies the file into a planar [`Stereo`] (mono is duplicated).

@@ -45,6 +45,8 @@ struct Stored {
     /// queued or running (restored on cancel or failure).
     #[serde(default)]
     previous_split: Option<SplitSummary>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
 }
 
 struct Entry {
@@ -121,10 +123,12 @@ impl Library {
                 Ok((mut entry, repaired)) => {
                     if repaired {
                         report.repaired.push(name.clone());
+                        entry.size = util::dir_size(&path);
                         let stored = Stored {
                             format: STORE_FORMAT,
                             session: entry.session.clone(),
                             previous_split: entry.previous_split.clone(),
+                            size_bytes: Some(entry.size),
                         };
                         if let Err(e) = write_stored(&path, &stored) {
                             log::warn!("library: can't save repaired session {name}: {e}");
@@ -133,7 +137,6 @@ impl Library {
                     if entry.session.analysis == AnalysisStatus::Pending {
                         report.pending_scans.push(name.clone());
                     }
-                    entry.size = util::dir_size(&path);
                     entries.insert(name, entry);
                 }
                 Err(e) => {
@@ -203,11 +206,12 @@ impl Library {
                 Some("This song's audio is missing. Delete it and import the file again.".into());
             repaired = true;
         }
+        let size = stored.size_bytes.unwrap_or_else(|| util::dir_size(dir));
         Ok((
             Entry {
                 session: s,
                 previous_split: prev,
-                size: 0,
+                size,
             },
             repaired,
         ))
@@ -287,14 +291,15 @@ impl Library {
     /// Moves a finished import from its staging folder into the library.
     pub fn insert(&self, session: Session, staging: &Path) -> IpcResult<()> {
         let dir = self.dir(&session.id)?;
+        let size = util::dir_size(staging);
         let stored = Stored {
             format: STORE_FORMAT,
             session: session.clone(),
             previous_split: None,
+            size_bytes: Some(size),
         };
         write_stored(staging, &stored).map_err(|e| IpcError::io("save the song", &e))?;
         util::rename_retry(staging, &dir).map_err(|e| IpcError::io("save the song", &e))?;
-        let size = util::dir_size(&dir);
         lock(&self.entries).insert(
             session.id.clone(),
             Entry {
@@ -323,6 +328,7 @@ impl Library {
             format: STORE_FORMAT,
             session: session.clone(),
             previous_split: prev.clone(),
+            size_bytes: Some(entry.size),
         };
         write_stored(&dir, &stored).map_err(|e| IpcError::io("save the song", &e))?;
         entry.session = session.clone();
@@ -334,9 +340,20 @@ impl Library {
     pub fn refresh_size(&self, id: &str) {
         let Ok(dir) = self.dir(id) else { return };
         let size = util::dir_size(&dir);
-        if let Some(e) = lock(&self.entries).get_mut(id) {
+        let stored = {
+            let mut entries = lock(&self.entries);
+            let Some(e) = entries.get_mut(id) else {
+                return;
+            };
             e.size = size;
-        }
+            Stored {
+                format: STORE_FORMAT,
+                session: e.session.clone(),
+                previous_split: e.previous_split.clone(),
+                size_bytes: Some(size),
+            }
+        };
+        let _ = write_stored(&dir, &stored);
     }
 
     /// Deletes a session folder. The folder is first renamed out of the way
@@ -372,7 +389,7 @@ impl Library {
 }
 
 fn write_stored(dir: &Path, stored: &Stored) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(stored).map_err(io::Error::other)?;
+    let bytes = serde_json::to_vec(stored).map_err(io::Error::other)?;
     util::write_atomic(&dir.join(SESSION_FILE), &bytes)
 }
 

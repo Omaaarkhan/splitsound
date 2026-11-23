@@ -25,6 +25,7 @@ const COMMANDS: &[&str] = &[
     "clear_library",
     "get_artwork",
     "get_peaks",
+    "get_session_peaks",
     "estimate_split",
     "start_split",
     "cancel_split",
@@ -98,6 +99,12 @@ fn main() {
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS))
+            .plugin(
+                "dialog",
+                tauri_build::InlinedPlugin::new()
+                    .commands(&["open"])
+                    .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
+            )
             .plugin(
                 "drag",
                 tauri_build::InlinedPlugin::new()

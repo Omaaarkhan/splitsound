@@ -156,7 +156,7 @@ trait PcmSink {
     fn write(&mut self, interleaved: &[f32]) -> Result<()>;
 }
 
-/// Downmixes to stereo and resamples as packets arrive.
+/// Downmixes and resamples packets as they arrive.
 struct StereoSink {
     target_rate: u32,
     channels: usize,
@@ -165,6 +165,54 @@ struct StereoSink {
     out: [Vec<f32>; 2],
     tmp_l: Vec<f32>,
     tmp_r: Vec<f32>,
+}
+
+fn downmix_into(
+    channels: usize,
+    matrix: &[(f32, f32)],
+    interleaved: &[f32],
+    tmp_l: &mut Vec<f32>,
+    tmp_r: &mut Vec<f32>,
+) {
+    let frames = interleaved.len() / channels.max(1);
+    tmp_l.clear();
+    tmp_r.clear();
+    tmp_l.reserve(frames);
+    tmp_r.reserve(frames);
+    if channels == 1 {
+        let (gl, gr) = matrix[0];
+        for &s in interleaved {
+            tmp_l.push(s * gl);
+            tmp_r.push(s * gr);
+        }
+        return;
+    }
+    if channels == 2 && matrix[0].1 == 0.0 && matrix[1].0 == 0.0 {
+        let (gl, gr) = (matrix[0].0, matrix[1].1);
+        let (pairs, _) = interleaved.as_chunks::<2>();
+        if (gl - 1.0).abs() < 1e-6 && (gr - 1.0).abs() < 1e-6 {
+            for &[l, r] in pairs {
+                tmp_l.push(l);
+                tmp_r.push(r);
+            }
+        } else {
+            for &[l, r] in pairs {
+                tmp_l.push(l * gl);
+                tmp_r.push(r * gr);
+            }
+        }
+        return;
+    }
+    for frame in interleaved.chunks_exact(channels.max(1)) {
+        let mut l = 0f32;
+        let mut r = 0f32;
+        for (s, g) in frame.iter().zip(matrix) {
+            l += s * g.0;
+            r += s * g.1;
+        }
+        tmp_l.push(l);
+        tmp_r.push(r);
+    }
 }
 
 impl PcmSink for StereoSink {
@@ -188,20 +236,6 @@ impl PcmSink for StereoSink {
 
     fn write(&mut self, interleaved: &[f32]) -> Result<()> {
         let frames = interleaved.len() / self.channels.max(1);
-        self.tmp_l.clear();
-        self.tmp_r.clear();
-        self.tmp_l.reserve(frames);
-        self.tmp_r.reserve(frames);
-        for frame in interleaved.chunks_exact(self.channels.max(1)) {
-            let mut l = 0f32;
-            let mut r = 0f32;
-            for (s, g) in frame.iter().zip(&self.matrix) {
-                l += s * g.0;
-                r += s * g.1;
-            }
-            self.tmp_l.push(l);
-            self.tmp_r.push(r);
-        }
         let Some(rs) = self.resampler.as_mut() else {
             return Err(Error::internal("sink used before begin"));
         };
@@ -209,8 +243,154 @@ impl PcmSink for StereoSink {
         for v in self.out.iter_mut() {
             v.try_reserve(reserve).map_err(|_| Error::out_of_memory())?;
         }
+        if self.channels == 1
+            && (self.matrix[0].0 - 1.0).abs() < 1e-6
+            && (self.matrix[0].1 - 1.0).abs() < 1e-6
+        {
+            return rs.push(&[interleaved, interleaved], &mut self.out);
+        }
+        downmix_into(
+            self.channels,
+            &self.matrix,
+            interleaved,
+            &mut self.tmp_l,
+            &mut self.tmp_r,
+        );
         rs.push(&[&self.tmp_l, &self.tmp_r], &mut self.out)
     }
+}
+
+/// Decoded file metadata after streaming directly to a working WAV.
+#[derive(Debug, Clone)]
+pub struct DecodedWav {
+    /// Output stereo frames written at `sample_rate`.
+    pub frames: u64,
+    /// Output sample rate in Hz.
+    pub sample_rate: u32,
+    /// Facts about the source.
+    pub info: SourceInfo,
+    /// Cover art, if any.
+    pub artwork: Option<Artwork>,
+}
+
+/// Streams downmixed and resampled stereo packets straight into a `WavWriter`
+/// using O(packet) RAM regardless of track duration.
+struct StreamingWavSink {
+    target_rate: u32,
+    channels: usize,
+    matrix: Vec<(f32, f32)>,
+    resampler: Option<StreamResampler>,
+    writer: Option<crate::wav::WavWriter>,
+    dst: std::path::PathBuf,
+    chunk_buf: [Vec<f32>; 2],
+    tmp_l: Vec<f32>,
+    tmp_r: Vec<f32>,
+}
+
+impl PcmSink for StreamingWavSink {
+    fn begin(
+        &mut self,
+        rate: u32,
+        channels: usize,
+        matrix: Vec<(f32, f32)>,
+        _hint_frames: u64,
+    ) -> Result<()> {
+        self.channels = channels;
+        self.matrix = matrix;
+        self.resampler = Some(StreamResampler::new(rate, self.target_rate, 2)?);
+        self.writer = Some(crate::wav::WavWriter::create(&self.dst, self.target_rate)?);
+        Ok(())
+    }
+
+    fn write(&mut self, interleaved: &[f32]) -> Result<()> {
+        let Some(rs) = self.resampler.as_mut() else {
+            return Err(Error::internal("sink used before begin"));
+        };
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(Error::internal("sink used before begin"));
+        };
+        for c in &mut self.chunk_buf {
+            c.clear();
+        }
+        if self.channels == 1
+            && (self.matrix[0].0 - 1.0).abs() < 1e-6
+            && (self.matrix[0].1 - 1.0).abs() < 1e-6
+        {
+            rs.push(&[interleaved, interleaved], &mut self.chunk_buf)?;
+        } else {
+            downmix_into(
+                self.channels,
+                &self.matrix,
+                interleaved,
+                &mut self.tmp_l,
+                &mut self.tmp_r,
+            );
+            rs.push(&[&self.tmp_l, &self.tmp_r], &mut self.chunk_buf)?;
+        }
+        if !self.chunk_buf[0].is_empty() {
+            writer.write_planar(&self.chunk_buf[0], &self.chunk_buf[1])?;
+        }
+        Ok(())
+    }
+}
+
+/// Decodes `path` straight to a stereo float WAV at `out_wav` (`target_rate` Hz)
+/// in streaming constant memory.
+pub fn decode_to_wav(
+    path: &Path,
+    out_wav: &Path,
+    target_rate: u32,
+    limits: &DecodeLimits,
+    sync: bool,
+    progress: &dyn Progress,
+) -> Result<DecodedWav> {
+    guarded(|| {
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&target_rate) {
+            return Err(Error::internal("bad target sample rate"));
+        }
+        let mut sink = StreamingWavSink {
+            target_rate,
+            channels: 0,
+            matrix: Vec::new(),
+            resampler: None,
+            writer: None,
+            dst: out_wav.to_path_buf(),
+            chunk_buf: [Vec::new(), Vec::new()],
+            tmp_l: Vec::new(),
+            tmp_r: Vec::new(),
+        };
+        let (mut info, artwork) = decode_inner(path, limits, progress, &mut sink)?;
+        let Some(mut rs) = sink.resampler.take() else {
+            return Err(damaged().with_detail("no audio could be decoded"));
+        };
+        let Some(mut writer) = sink.writer.take() else {
+            return Err(damaged().with_detail("no audio could be decoded"));
+        };
+        for c in &mut sink.chunk_buf {
+            c.clear();
+        }
+        rs.finish(&mut sink.chunk_buf)?;
+        if !sink.chunk_buf[0].is_empty() {
+            writer.write_planar(&sink.chunk_buf[0], &sink.chunk_buf[1])?;
+        }
+        let frames = rs.frames_out();
+        if frames == 0 {
+            return Err(damaged().with_detail("no audio could be decoded"));
+        }
+        if sync {
+            writer.finish()?;
+        } else {
+            writer.finish_nosync()?;
+        }
+        info.duration_sec = frames as f64 / f64::from(target_rate);
+        info.bitrate_kbps = bitrate_kbps(info.file_size_bytes, info.duration_sec);
+        Ok(DecodedWav {
+            frames,
+            sample_rate: target_rate,
+            info,
+            artwork,
+        })
+    })
 }
 
 /// Keeps the packets as they are.

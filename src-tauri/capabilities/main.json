@@ -20,6 +20,7 @@
     "allow-clear-library",
     "allow-get-artwork",
     "allow-get-peaks",
+    "allow-get-session-peaks",
     "allow-estimate-split",
     "allow-start-split",
     "allow-cancel-split",

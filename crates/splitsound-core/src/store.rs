@@ -19,15 +19,16 @@
 //!   passes `accept_restricted = true`.
 //! * Files imported by hand go through the same checks.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::checkpoint::{convert_checkpoint_bytes, hex};
+use crate::checkpoint::{convert_verified_checkpoint_bytes, hex};
 use crate::error::{Error, ErrorCode, Result};
 use crate::manifest::{
     Manifest, ModelEntry, PinnedFile, UPSTREAM_HOSTS, is_safe_file_name, parse_https_url,
@@ -365,7 +366,7 @@ impl ModelStore {
                 },
                 observer,
             )?;
-            convert_checkpoint_bytes(
+            convert_verified_checkpoint_bytes(
                 &bytes,
                 &table,
                 &self.path_of(&weights.file),
@@ -429,17 +430,32 @@ impl ModelStore {
     /// reference exactly its own weights file and nothing else; for a
     /// self-contained model, to reference no external file at all.
     pub fn load(&self, id: &str) -> Result<VerifiedModel> {
+        type VerifiedLocationsCache = OnceLock<Mutex<HashSet<(String, String, Option<String>)>>>;
+        static VERIFIED_LOCATIONS: VerifiedLocationsCache = OnceLock::new();
         let entry = self.manifest.get(id)?;
         let _guard = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         let graph = self.read_verified(entry, &entry.file)?;
+        let expected_ext = entry.weights.as_ref().map(|w| w.file.name.as_str());
+        let cache_key = (
+            entry.file.name.clone(),
+            entry.file.sha256.clone(),
+            expected_ext.map(str::to_string),
+        );
+        let cache = VERIFIED_LOCATIONS.get_or_init(|| Mutex::new(HashSet::new()));
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&cache_key);
+        if !cached {
+            check_external_locations(&graph, expected_ext).map_err(|e| damaged(entry, e))?;
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(cache_key);
+        }
         let external = match &entry.weights {
-            None => {
-                check_external_locations(&graph, None).map_err(|e| damaged(entry, e))?;
-                None
-            }
+            None => None,
             Some(w) => {
-                check_external_locations(&graph, Some(&w.file.name))
-                    .map_err(|e| damaged(entry, e))?;
                 let bytes = self.read_verified(entry, &w.file)?;
                 Some((w.file.name.clone(), Arc::<[u8]>::from(bytes)))
             }
@@ -476,12 +492,25 @@ impl ModelStore {
         let mut data = Vec::new();
         data.try_reserve_exact(len as usize)
             .map_err(|_| Error::out_of_memory())?;
-        // `take` so a file that grows underneath us cannot outrun the size.
-        (&mut f)
-            .take(len + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| Error::from_read(&e, &path))?;
-        if data.len() as u64 != file.size_bytes || hex(&Sha256::digest(&data)) != file.sha256 {
+        // Single-pass 512 KiB buffered read + SHA-256 while data is L2-resident.
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 19];
+        let mut total = 0u64;
+        loop {
+            let n = match (&mut f).take(len.saturating_add(1) - total).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::from_read(&e, &path)),
+            };
+            total += n as u64;
+            if total > file.size_bytes {
+                return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name)));
+            }
+            hasher.update(&buf[..n]);
+            data.extend_from_slice(&buf[..n]);
+        }
+        if total != file.size_bytes || hex(&hasher.finalize()) != file.sha256 {
             return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name)));
         }
         Ok(data)
@@ -567,7 +596,7 @@ impl ModelStore {
                 if w.upstream.size_bytes == len && w.upstream.sha256 == digest {
                     gate()?;
                     let table = tensor_table_for(entry)?;
-                    convert_checkpoint_bytes(
+                    convert_verified_checkpoint_bytes(
                         &data,
                         &table,
                         &self.path_of(&w.file),
@@ -605,15 +634,15 @@ impl ModelStore {
         observer: &dyn DownloadObserver,
     ) -> Result<()> {
         let dst = self.path_of(target);
-        let mut input = std::io::BufReader::with_capacity(1 << 16, compressed);
+        let mut input = std::io::BufReader::with_capacity(1 << 19, compressed);
         let (tmp, out) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
-        let mut out = std::io::BufWriter::with_capacity(1 << 16, out);
+        let mut out = std::io::BufWriter::with_capacity(1 << 19, out);
         let mut hasher = Sha256::new();
         let mut written = 0u64;
         {
             let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut input)
                 .map_err(|e| download_failed(format!("zstd: {e}")))?;
-            let mut buf = vec![0u8; 1 << 16];
+            let mut buf = vec![0u8; 1 << 19];
             loop {
                 if observer.is_cancelled() {
                     return Err(Error::cancelled());
@@ -676,7 +705,6 @@ impl ModelStore {
         let dst = self.path_of(file);
         let (tmp, mut out) = create_temp_sibling(&dst).map_err(|e| Error::from_write(&e, &dst))?;
         fetch_from_reader(reader, length, file, &mut out, &dst, on_bytes, observer)?;
-        out.sync_all().map_err(|e| Error::from_write(&e, &dst))?;
         out.seek(SeekFrom::Start(0))
             .map_err(|e| Error::from_read(&e, tmp.path()))?;
         Ok((tmp, out))
@@ -763,7 +791,7 @@ fn fetch_from_reader<W: Write>(
     let mut reader = reader;
     let mut hasher = Sha256::new();
     let mut received = 0u64;
-    let mut buf = vec![0u8; 1 << 16];
+    let mut buf = vec![0u8; 1 << 19];
     let mut last_report = std::time::Instant::now();
     loop {
         if observer.is_cancelled() {
@@ -806,6 +834,24 @@ fn fetch_from_reader<W: Write>(
     Ok(())
 }
 
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .https_only(true)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .http_status_as_error(false)
+            .timeout_resolve(Some(Duration::from_secs(20)))
+            .timeout_connect(Some(Duration::from_secs(20)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .timeout_per_read(Some(Duration::from_secs(60)))
+            .user_agent("SplitSound")
+            .build()
+            .into()
+    })
+}
+
 /// GETs `url` over HTTPS, following at most [`MAX_REDIRECTS`] redirects by
 /// hand so every hop can be checked: HTTPS only, host on `allowed_hosts`.
 /// Returns the body (hard-capped at `max_bytes`) and its announced length.
@@ -814,18 +860,7 @@ fn http_get(
     allowed_hosts: &[&str],
     max_bytes: u64,
 ) -> Result<(Box<dyn Read>, Option<u64>)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .https_only(true)
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        .http_status_as_error(false)
-        .timeout_resolve(Some(Duration::from_secs(20)))
-        .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_per_read(Some(Duration::from_secs(60)))
-        .user_agent("SplitSound")
-        .build()
-        .into();
+    let agent = http_agent();
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let Some((host, _)) = parse_https_url(&current) else {
@@ -918,7 +953,18 @@ pub fn check_external_locations(
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    let (&first, rest) = needle.split_first()?;
+    let mut offset = 0usize;
+    while haystack.len().saturating_sub(offset) >= needle.len() {
+        let search = &haystack[offset..haystack.len() - rest.len()];
+        let rel = search.iter().position(|&b| b == first)?;
+        let pos = offset + rel;
+        if &haystack[pos + 1..pos + needle.len()] == rest {
+            return Some(pos);
+        }
+        offset = pos + 1;
+    }
+    None
 }
 
 #[cfg(test)]

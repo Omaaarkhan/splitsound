@@ -180,7 +180,14 @@ pub fn separate_track(
     for &shift in &amounts {
         // This pass sees `shift` zeros followed by the normalised mix.
         let plen = len + shift;
-        let sum_w = weight_sum(plen, n, stride, &weight);
+        let inv_w: Vec<f32> = if passes > 1 {
+            weight_sum(plen, n, stride, &weight)
+                .into_iter()
+                .map(|w| 1.0 / w)
+                .collect()
+        } else {
+            Vec::new()
+        };
         for o in chunk_offsets(plen, stride) {
             let chunk_len = n.min(plen - o);
             // 1.2: a short (last) chunk is centred in its segment and the
@@ -188,50 +195,116 @@ pub fn separate_track(
             // track has any, zeros outside the track.
             let delta = n - chunk_len;
             let start = o as isize - (delta / 2) as isize;
-            for i in 0..n {
-                // Position in the padded track, then in the real mix.
-                let p = start + i as isize;
-                let m = p - shift as isize;
-                if p >= 0 && (p as usize) < plen && m >= 0 {
-                    let m = m as usize;
-                    seg_l[i] = (mix.left[m] - mean) * inv_std;
-                    seg_r[i] = (mix.right[m] - mean) * inv_std;
+            // Contiguous split: leading zeros, mix copy/normalise, trailing zeros.
+            let m_first = start - shift as isize;
+            let valid_start = if start < 0 {
+                ((-start) as usize).min(n)
+            } else {
+                0
+            }
+            .max(if m_first < 0 {
+                ((-m_first) as usize).min(n)
+            } else {
+                0
+            });
+            let max_end_plen = if start < plen as isize {
+                ((plen as isize - start) as usize).min(n)
+            } else {
+                0
+            };
+            let max_end_mix = if m_first < len as isize {
+                ((len as isize - m_first) as usize).min(n)
+            } else {
+                0
+            };
+            let valid_end = max_end_plen.min(max_end_mix).max(valid_start);
+            if valid_start > 0 {
+                seg_l[..valid_start].fill(0.0);
+                seg_r[..valid_start].fill(0.0);
+            }
+            if valid_end > valid_start {
+                let mix_off = (m_first + valid_start as isize) as usize;
+                let count = valid_end - valid_start;
+                if mean == 0.0 && inv_std == 1.0 {
+                    seg_l[valid_start..valid_end]
+                        .copy_from_slice(&mix.left[mix_off..mix_off + count]);
+                    seg_r[valid_start..valid_end]
+                        .copy_from_slice(&mix.right[mix_off..mix_off + count]);
                 } else {
-                    seg_l[i] = 0.0;
-                    seg_r[i] = 0.0;
+                    for ((dl, dr), (&ml, &mr)) in seg_l[valid_start..valid_end]
+                        .iter_mut()
+                        .zip(&mut seg_r[valid_start..valid_end])
+                        .zip(
+                            mix.left[mix_off..mix_off + count]
+                                .iter()
+                                .zip(&mix.right[mix_off..mix_off + count]),
+                        )
+                    {
+                        *dl = (ml - mean) * inv_std;
+                        *dr = (mr - mean) * inv_std;
+                    }
                 }
             }
+            if valid_end < n {
+                seg_l[valid_end..].fill(0.0);
+                seg_r[valid_end..].fill(0.0);
+            }
+
             model.run_segment(&seg_l, &seg_r, wanted, &mut out)?;
             calls += 1;
 
             // Overlap-add the centre `chunk_len` samples with the FIRST
-            // `chunk_len` weights, already divided by the weight sum. The
-            // first `shift` samples of the padded track are dropped.
+            // `chunk_len` weights; the first `shift` samples of the padded track
+            // are dropped.
             let trim = delta / 2;
-            for (stem, est) in acc.iter_mut().zip(&out) {
-                for (c, est_c) in est.iter().enumerate() {
-                    if est_c.len() != n {
-                        return Err(Error::internal("separate: model returned a wrong size"));
-                    }
-                    let dst = stem.channel_mut(c);
-                    for i in 0..chunk_len {
-                        let p = o + i;
-                        if p < shift {
-                            continue;
+            let i0 = shift.saturating_sub(o);
+            let dst_start = o + i0 - shift;
+            if i0 < chunk_len {
+                for (stem, est) in acc.iter_mut().zip(&out) {
+                    for (c, est_c) in est.iter().enumerate() {
+                        if est_c.len() != n {
+                            return Err(Error::internal("separate: model returned a wrong size"));
                         }
-                        dst[p - shift] += weight[i] * est_c[trim + i] / sum_w[p];
+                        let dst = &mut stem.channel_mut(c)[dst_start..];
+                        let w_slice = &weight[i0..chunk_len];
+                        let e_slice = &est_c[trim + i0..trim + chunk_len];
+                        if passes == 1 {
+                            for ((d, &w), &s) in dst.iter_mut().zip(w_slice).zip(e_slice) {
+                                *d += w * s;
+                            }
+                        } else {
+                            let inv_slice = &inv_w[o + i0..o + chunk_len];
+                            for (((d, &w), &s), &iw) in
+                                dst.iter_mut().zip(w_slice).zip(e_slice).zip(inv_slice)
+                            {
+                                *d += w * s * iw;
+                            }
+                        }
                     }
                 }
             }
             on_segment(calls, total_calls)?;
         }
+        if passes == 1 {
+            let sum_w = weight_sum(plen, n, stride, &weight);
+            for stem in acc.iter_mut() {
+                for (d, &sw) in stem.left.iter_mut().zip(&sum_w[shift..]) {
+                    *d = *d * (std / sw) + mean;
+                }
+                for (d, &sw) in stem.right.iter_mut().zip(&sum_w[shift..]) {
+                    *d = *d * (std / sw) + mean;
+                }
+            }
+        }
     }
 
-    // Average the passes and undo the normalisation.
-    let scale = std / passes as f32;
-    for stem in acc.iter_mut() {
-        for v in stem.left.iter_mut().chain(stem.right.iter_mut()) {
-            *v = *v * scale + mean;
+    if passes > 1 {
+        // Average the passes and undo the normalisation.
+        let scale = std / passes as f32;
+        for stem in acc.iter_mut() {
+            for v in stem.left.iter_mut().chain(stem.right.iter_mut()) {
+                *v = *v * scale + mean;
+            }
         }
     }
     Ok(acc)

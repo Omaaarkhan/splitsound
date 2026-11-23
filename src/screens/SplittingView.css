@@ -38,10 +38,13 @@
 }
 
 .splitting-strip__fill {
+  width: 100%;
   height: 100%;
-  width: var(--progress, 0%);
   background: var(--lamp);
-  transition: width var(--dur-move) var(--ease-out);
+  transform-origin: left;
+  transform: scaleX(var(--progress, 0));
+  transition: transform var(--dur-move) var(--ease-out);
+  will-change: transform;
 }
 
 .splitting-strip__eta {

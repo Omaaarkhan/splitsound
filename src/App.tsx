@@ -1,7 +1,7 @@
 import { useCallback, useEffect } from "react";
 import { invoke } from "./ipc/client";
 import { pickAudioFiles, subscribeWindowFileDrop } from "./ipc/platform";
-import { useStore } from "./stores/createStore";
+import { useShallowStore } from "./stores/createStore";
 import {
   bootstrapApp,
   goHome,
@@ -54,9 +54,18 @@ function isSliderOrInteractiveRole(target: EventTarget | null): boolean {
 }
 
 export default function App() {
-  const { current: session, splitOptions } = useStore(sessionStore);
-  const { appInfo } = useStore(settingsStore);
-  const { panel, notice, draggingFiles } = useStore(uiStore);
+  const { session, splitOptions } = useShallowStore(sessionStore, (s) => ({
+    session: s.current,
+    splitOptions: s.splitOptions,
+  }));
+  const { platform } = useShallowStore(settingsStore, (s) => ({
+    platform: s.appInfo.platform,
+  }));
+  const { panel, notice, draggingFiles } = useShallowStore(uiStore, (s) => ({
+    panel: s.panel,
+    notice: s.notice,
+    draggingFiles: s.draggingFiles,
+  }));
 
   useEffect(() => {
     let disposed = false;
@@ -93,16 +102,52 @@ export default function App() {
     }
   }, []);
 
+  const triggerChooseFile = useCallback(() => {
+    void handleChooseFile();
+  }, [handleChooseFile]);
+
+  const handleGoHome = useCallback(() => {
+    void goHome();
+  }, []);
+
+  const handleOpenSettings = useCallback(() => {
+    openPanel({ type: "settings" });
+  }, []);
+
+  const handleOpenExport = useCallback(() => {
+    openPanel({ type: "export" });
+  }, []);
+
+  const handleOpenSession = useCallback((id: string) => {
+    void openSongById(id);
+  }, []);
+
+  const handleRequestRemove = useCallback((sessionId: string, title: string) => {
+    openPanel({ type: "confirm-remove", sessionId, title });
+  }, []);
+
+  const handleStartSplit = useCallback(() => {
+    const { current: cur, splitOptions: opts } = sessionStore.getState();
+    if (cur) {
+      void requestStartSplit(cur.id, opts);
+    }
+  }, []);
+
   const handleCancelSplit = useCallback(async () => {
-    if (!session) return;
+    const cur = sessionStore.getState().current;
+    if (!cur) return;
     markUserCancelledDownloads();
     try {
-      await invoke("cancel_split", { sessionId: session.id });
+      await invoke("cancel_split", { sessionId: cur.id });
       showNotice(COPY.splitCancelled);
     } catch (err) {
       showNotice(formatIpcError(err), { tone: "error" });
     }
-  }, [session]);
+  }, []);
+
+  const triggerCancelSplit = useCallback(() => {
+    void handleCancelSplit();
+  }, [handleCancelSplit]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -192,39 +237,36 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleChooseFile]);
 
+  void splitOptions;
+
   const showTransport = session !== null;
 
   return (
     <div className={showTransport ? "app-shell app-shell--with-transport" : "app-shell"}>
       <TopBar
-        platform={appInfo.platform}
+        platform={platform}
         session={session}
-        onGoHome={() => void goHome()}
-        onOpenSettings={() => openPanel({ type: "settings" })}
+        onGoHome={handleGoHome}
+        onOpenSettings={handleOpenSettings}
       />
 
       {session === null ? (
         <HomeView
           draggingFiles={draggingFiles}
-          onChooseFile={() => void handleChooseFile()}
-          onOpenSession={(id) => void openSongById(id)}
-          onRequestRemove={(sessionId, title) =>
-            openPanel({ type: "confirm-remove", sessionId, title })
-          }
+          onChooseFile={triggerChooseFile}
+          onOpenSession={handleOpenSession}
+          onRequestRemove={handleRequestRemove}
         />
       ) : session.status === "ready" ? (
         <StemsView session={session} />
       ) : session.status === "splitting" || session.status === "queued" ? (
-        <SplittingView session={session} onCancel={() => void handleCancelSplit()} />
+        <SplittingView session={session} onCancel={triggerCancelSplit} />
       ) : (
-        <PreSplitView
-          session={session}
-          onStartSplit={() => void requestStartSplit(session.id, splitOptions)}
-        />
+        <PreSplitView session={session} onStartSplit={handleStartSplit} />
       )}
 
       {showTransport ? (
-        <TransportBar session={session} onOpenExport={() => openPanel({ type: "export" })} />
+        <TransportBar session={session} onOpenExport={handleOpenExport} />
       ) : null}
 
       {notice ? <NoticeBar notice={notice} aboveTransport={showTransport} /> : null}

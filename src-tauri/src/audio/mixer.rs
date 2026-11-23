@@ -19,7 +19,7 @@
 /// Mixer sample rate (every working file is 44.1 kHz stereo).
 pub const RATE: u32 = 44_100;
 pub const MIN_GAIN_DB: f64 = -60.0;
-pub const MAX_GAIN_DB: f64 = 6.0;
+pub const MAX_GAIN_DB: f64 = 10.0;
 /// Play/pause fade length (10 ms).
 pub const TRANSPORT_FADE_FRAMES: u32 = 441;
 /// Crossfade length for seeks and loop wraps (10 ms).
@@ -342,9 +342,13 @@ impl MixerCore {
         let (mut sl, mut sr) = (0.0, 0.0);
         if self.xfade < 1.0 {
             for (c, stem) in src.stems.iter().enumerate().take(self.params.len()) {
+                let g = self.gain[c];
+                if g == 0.0 {
+                    continue;
+                }
                 let (l, r) = frame(stem, pos);
-                sl += finite(l) * self.gain[c];
-                sr += finite(r) * self.gain[c];
+                sl += finite(l) * g;
+                sr += finite(r) * g;
             }
         }
         let (ml, mr) = if self.xfade > 0.0 {
@@ -414,8 +418,12 @@ impl MixerCore {
             if x < 1.0 {
                 let meter_scale = (1.0 - x) * tr;
                 for (c, stem) in src.stems.iter().enumerate().take(n) {
+                    let g = self.gain[c];
+                    if g == 0.0 {
+                        continue;
+                    }
                     let (l, r) = frame(stem, self.pos);
-                    let (l, r) = (finite(l) * self.gain[c], finite(r) * self.gain[c]);
+                    let (l, r) = (finite(l) * g, finite(r) * g);
                     sl += l;
                     sr += r;
                     let m = l.abs().max(r.abs()) * meter_scale;
@@ -551,8 +559,8 @@ mod tests {
             vec![unity, db_to_gain(-6.0), 0.0]
         );
         // Gains are clamped; -60 dB and below is silence.
-        assert!((db_to_gain(20.0) - db_to_gain(6.0)).abs() < 1e-6);
-        assert!((db_to_gain(6.0) - 1.995_262).abs() < 1e-5);
+        assert!((db_to_gain(20.0) - db_to_gain(MAX_GAIN_DB)).abs() < 1e-6);
+        assert!((db_to_gain(10.0) - 3.162_278).abs() < 1e-5);
         assert_eq!(db_to_gain(-60.0), 0.0);
         assert_eq!(db_to_gain(-200.0), 0.0);
         assert!(db_to_gain(-59.9) > 0.0);

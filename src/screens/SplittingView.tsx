@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import type { Session } from "../ipc/contract";
 import { STEMS_BY_MODE } from "../ipc/contract";
-import { useStore } from "../stores/createStore";
+import { useShallowStore } from "../stores/createStore";
 import { playbackStore, seekPlayback, setLoopRegion } from "../stores/playbackStore";
 import { sessionStore } from "../stores/sessionStore";
 import { formatEta } from "../utils/format";
@@ -19,9 +19,19 @@ interface SplittingViewProps {
   onCancel: () => void;
 }
 
-export function SplittingView({ session, onCancel }: SplittingViewProps) {
-  const { peaks, splitProgress } = useStore(sessionStore);
-  const { playback } = useStore(playbackStore);
+export const SplittingView = memo(function SplittingView({
+  session,
+  onCancel,
+}: SplittingViewProps) {
+  const { peaks, splitProgress } = useShallowStore(sessionStore, (s) => ({
+    peaks: s.peaks,
+    splitProgress: s.splitProgress,
+  }));
+  const { playing, playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
+    playing: s.playback.playing,
+    playbackDurationSec: s.playback.durationSec,
+    loop: s.playback.loop,
+  }));
   const fillRef = useRef<HTMLDivElement | null>(null);
 
   const isQueued = session.status === "queued";
@@ -42,14 +52,13 @@ export function SplittingView({ session, onCancel }: SplittingViewProps) {
 
   const splitOverlay = useMemo(
     () => ({
-      fraction,
       stemIds,
       animate: !isStaticScene && !isQueued,
     }),
-    [fraction, stemIds, isStaticScene, isQueued],
+    [stemIds, isStaticScene, isQueued],
   );
 
-  const durationSec = playback.durationSec || session.track.durationSec;
+  const durationSec = playbackDurationSec || session.track.durationSec;
   const seekHandlers = useWellSeekHandlers(durationSec, true, (pos) => {
     void seekPlayback(pos);
   });
@@ -57,7 +66,7 @@ export function SplittingView({ session, onCancel }: SplittingViewProps) {
   useEffect(() => {
     const el = fillRef.current;
     if (el) {
-      el.style.setProperty("--progress", `${(fraction * 100).toFixed(2)}%`);
+      el.style.setProperty("--progress", fraction.toFixed(4));
     }
   }, [fraction]);
 
@@ -98,23 +107,24 @@ export function SplittingView({ session, onCancel }: SplittingViewProps) {
       >
         <TimeRuler
           durationSec={durationSec}
-          loop={playback.loop}
+          loop={loop}
           onSeek={(pos) => void seekPlayback(pos)}
-          onChangeLoop={(loop) => void setLoopRegion(loop)}
+          onChangeLoop={(l) => void setLoopRegion(l)}
         />
-        <LoopWash loop={playback.loop} durationSec={durationSec} />
+        <LoopWash loop={loop} durationSec={durationSec} />
         <div className="lane">
           <WaveformCanvas
             source="mix"
             peaks={peaks.mix}
             audible
             durationSec={durationSec}
-            playing={playback.playing}
+            playing={playing}
             splitOverlay={splitOverlay}
+            splitFraction={fraction}
           />
         </div>
-        <PlayheadLine durationSec={durationSec} playing={playback.playing} />
+        <PlayheadLine durationSec={durationSec} playing={playing} />
       </section>
     </main>
   );
-}
+});

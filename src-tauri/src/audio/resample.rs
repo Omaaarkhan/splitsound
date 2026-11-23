@@ -7,7 +7,8 @@
 //! 19 kHz and images/aliases are attenuated by roughly 80 dB, which is
 //! inaudible for monitoring. Equal rates bypass the filter entirely.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const TAPS: usize = 64;
 const HALF: usize = TAPS / 2;
@@ -17,6 +18,22 @@ const KAISER_BETA: f64 = 9.0;
 const CUTOFF: f64 = 0.90;
 /// Input frames pulled from the source per refill.
 const PULL_FRAMES: usize = 256;
+
+fn cached_table(in_rate: u32, out_rate: u32) -> Arc<[f32]> {
+    static TABLES: OnceLock<Mutex<HashMap<u64, Arc<[f32]>>>> = OnceLock::new();
+    let cache = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (u64::from(in_rate) << 32) | u64::from(out_rate);
+    {
+        let guard = crate::util::lock(cache);
+        if let Some(existing) = guard.get(&key) {
+            return Arc::clone(existing);
+        }
+    }
+    let built: Arc<[f32]> =
+        build_table(CUTOFF * (out_rate as f64 / in_rate as f64).min(1.0)).into();
+    let mut guard = crate::util::lock(cache);
+    Arc::clone(guard.entry(key).or_insert(built))
+}
 
 /// Converts interleaved stereo audio from `in_rate` to `out_rate`, pulling
 /// input from a callback as it needs it.
@@ -40,7 +57,7 @@ impl Resampler {
         let table: Arc<[f32]> = if passthrough {
             Arc::from(Vec::new())
         } else {
-            build_table(CUTOFF * (out_rate as f64 / in_rate as f64).min(1.0)).into()
+            cached_table(in_rate, out_rate)
         };
         let mut r = Resampler {
             in_rate,

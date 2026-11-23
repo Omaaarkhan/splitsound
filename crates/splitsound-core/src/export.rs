@@ -103,28 +103,37 @@ fn sanitize(v: f32) -> f32 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-fn write_wav_pcm(
+fn write_wav_pcm_header(
     out: &mut impl Write,
-    samples: &[f32],
+    bits: u16,
     channels: u16,
     sample_rate: u32,
-    bits: u16,
-    progress: &dyn Progress,
-) -> std::io::Result<Result<()>> {
-    let bytes_per = usize::from(bits / 8);
+    total_samples: u64,
+) -> std::io::Result<()> {
+    let bytes_per = u64::from(bits / 8);
     out.write_all(&pcm_header(
         bits,
         channels,
         sample_rate,
-        (samples.len() * bytes_per) as u64,
-    ))?;
-    let mut dither = Dither(0x2545_F491_4F6C_DD1D);
-    let mut buf = Vec::with_capacity(8192 * bytes_per);
+        total_samples * bytes_per,
+    ))
+}
+
+fn write_wav_pcm_samples(
+    out: &mut impl Write,
+    samples: &[f32],
+    bits: u16,
+    dither: &mut Dither,
+    buf: &mut Vec<u8>,
+    progress: &dyn Progress,
+) -> std::io::Result<Result<()>> {
+    let bytes_per = usize::from(bits / 8);
     for chunk in samples.chunks(8192) {
         if progress.is_cancelled() {
             return Ok(Err(Error::cancelled()));
         }
         buf.clear();
+        buf.reserve(chunk.len() * bytes_per);
         for &s in chunk {
             let s = sanitize(s);
             if bits == 16 {
@@ -141,9 +150,23 @@ fn write_wav_pcm(
                 buf.extend_from_slice(&v.to_le_bytes()[..3]);
             }
         }
-        out.write_all(&buf)?;
+        out.write_all(buf)?;
     }
     Ok(Ok(()))
+}
+
+fn write_wav_pcm(
+    out: &mut impl Write,
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    bits: u16,
+    progress: &dyn Progress,
+) -> std::io::Result<Result<()>> {
+    write_wav_pcm_header(out, bits, channels, sample_rate, samples.len() as u64)?;
+    let mut dither = Dither(0x2545_F491_4F6C_DD1D);
+    let mut buf = Vec::with_capacity(8192 * usize::from(bits / 8));
+    write_wav_pcm_samples(out, samples, bits, &mut dither, &mut buf, progress)
 }
 
 /// Feeds `f32` samples to the FLAC encoder as 24-bit integers without
@@ -189,21 +212,64 @@ impl flacenc::source::Source for FlacSource<'_> {
     }
 }
 
-fn encode_flac(samples: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
+/// Mixes multiple interleaved stereo sources block-by-block straight into FLAC.
+struct MixFlacSource<'a> {
+    active: Vec<(&'a [f32], f32)>,
+    total_samples: usize,
+    sample_rate: usize,
+    pos: usize,
+    mix_buf: Vec<f32>,
+    scratch: Vec<i32>,
+}
+
+impl flacenc::source::Source for MixFlacSource<'_> {
+    fn channels(&self) -> usize {
+        2
+    }
+    fn bits_per_sample(&self) -> usize {
+        24
+    }
+    fn sample_rate(&self) -> usize {
+        self.sample_rate
+    }
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> std::result::Result<usize, flacenc::error::SourceError> {
+        let want = block_size * 2;
+        let end = (self.pos + want).min(self.total_samples);
+        let len = end - self.pos;
+        fill_mix_chunk(&self.active, self.pos, len, &mut self.mix_buf);
+        self.scratch.clear();
+        self.scratch.extend(self.mix_buf.iter().map(|s| {
+            (f64::from(sanitize(*s)) * 8_388_608.0)
+                .round()
+                .clamp(-8_388_608.0, 8_388_607.0) as i32
+        }));
+        dest.fill_interleaved(&self.scratch)?;
+        self.pos = end;
+        Ok(self.scratch.len() / 2)
+    }
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.total_samples / 2)
+    }
+}
+
+fn finish_flac_source<S: flacenc::source::Source>(
+    source: S,
+    frames: usize,
+    dst: &Path,
+    progress: &dyn Progress,
+) -> Result<()> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
     let config = flacenc::config::Encoder::default()
         .into_verified()
         .map_err(|(_, e)| Error::internal(format!("flac config: {e}")))?;
-    let source = FlacSource {
-        samples,
-        channels: usize::from(channels),
-        sample_rate: sample_rate as usize,
-        pos: 0,
-        scratch: Vec::new(),
-    };
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|e| Error::internal(format!("flac encode: {e}")))?;
+    check_cancelled(progress)?;
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream
         .write(&mut sink)
@@ -214,22 +280,30 @@ fn encode_flac(samples: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u
     // (RFC 9639, section 8.2); with min != max a decoder takes the stream
     // for variable-blocksize, and Symphonia then fails to read it. Every
     // block but the last has the fixed size, so set min = max.
-    let frames = samples.len() / usize::from(channels);
     let is_streaminfo_first = bytes.len() >= 12 && &bytes[0..4] == b"fLaC" && bytes[4] & 0x7F == 0;
     if is_streaminfo_first && frames > config.block_size {
         let (min, max) = bytes[8..12].split_at_mut(2);
         min.copy_from_slice(max);
     }
-    Ok(bytes)
+    check_cancelled(progress)?;
+    let werr = |e: std::io::Error| Error::from_write(&e, dst);
+    let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+    let mut out = BufWriter::with_capacity(1 << 18, file);
+    out.write_all(&bytes).map_err(werr)?;
+    let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
+    file.sync_all().map_err(werr)?;
+    drop(file);
+    tmp.persist(dst).map_err(werr)
 }
 
 #[cfg(feature = "mp3")]
-fn encode_mp3(
-    samples: &[f32],
+fn stream_mp3_chunks(
     channels: u16,
     sample_rate: u32,
+    dst: &Path,
     progress: &dyn Progress,
-) -> Result<Vec<u8>> {
+    mut feed: impl FnMut(&mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()>,
+) -> Result<()> {
     use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
     let err = |e: &dyn std::fmt::Display| Error::internal(format!("mp3 encoder: {e}"));
     let mut builder = Builder::new().ok_or_else(Error::out_of_memory)?;
@@ -242,37 +316,60 @@ fn encode_mp3(
         .set_quality(Quality::NearBest)
         .map_err(|e| err(&e))?;
     let mut encoder = builder.build().map_err(|e| err(&e))?;
-    let mut out: Vec<u8> = Vec::new();
+    let werr = |e: std::io::Error| Error::from_write(&e, dst);
+    let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+    let mut out = BufWriter::with_capacity(1 << 18, file);
+    let mut enc_buf: Vec<u8> = Vec::new();
     let mut clipped: Vec<f32> = Vec::new();
-    // About one second per call.
-    let chunk_len = sample_rate as usize * usize::from(channels);
-    for chunk in samples.chunks(chunk_len.max(usize::from(channels))) {
+
+    feed(&mut |chunk| -> Result<()> {
         check_cancelled(progress)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
         clipped.clear();
         clipped.extend(chunk.iter().map(|s| sanitize(*s).clamp(-1.0, 1.0)));
         let frames = clipped.len() / usize::from(channels);
-        out.try_reserve(mp3lame_encoder::max_required_buffer_size(frames))
+        enc_buf.clear();
+        enc_buf
+            .try_reserve(mp3lame_encoder::max_required_buffer_size(frames))
             .map_err(|_| Error::out_of_memory())?;
         if channels == 1 {
             encoder
-                .encode_to_vec(MonoPcm(&clipped[..]), &mut out)
+                .encode_to_vec(MonoPcm(&clipped[..]), &mut enc_buf)
                 .map_err(|e| err(&e))?;
         } else {
             encoder
-                .encode_to_vec(InterleavedPcm(&clipped[..]), &mut out)
+                .encode_to_vec(InterleavedPcm(&clipped[..]), &mut enc_buf)
                 .map_err(|e| err(&e))?;
         }
-    }
-    out.try_reserve(mp3lame_encoder::max_required_buffer_size(1152))
+        out.write_all(&enc_buf).map_err(werr)?;
+        Ok(())
+    })?;
+
+    check_cancelled(progress)?;
+    enc_buf.clear();
+    enc_buf
+        .try_reserve(mp3lame_encoder::max_required_buffer_size(1152))
         .map_err(|_| Error::out_of_memory())?;
     encoder
-        .flush_to_vec::<FlushNoGap>(&mut out)
+        .flush_to_vec::<FlushNoGap>(&mut enc_buf)
         .map_err(|e| err(&e))?;
-    Ok(out)
+    out.write_all(&enc_buf).map_err(werr)?;
+    let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
+    file.sync_all().map_err(werr)?;
+    drop(file);
+    tmp.persist(dst).map_err(werr)
 }
 
 #[cfg(not(feature = "mp3"))]
-fn encode_mp3(_: &[f32], _: u16, _: u32, _: &dyn Progress) -> Result<Vec<u8>> {
+fn stream_mp3_chunks(
+    _: u16,
+    _: u32,
+    _: &Path,
+    _: &dyn Progress,
+    _: impl FnMut(&mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()>,
+) -> Result<()> {
     Err(Error::new(
         ErrorCode::UnsupportedFormat,
         "MP3 export is not included in this build of SplitSound",
@@ -321,7 +418,7 @@ pub fn export_audio(
                 24
             };
             let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
-            let mut out = BufWriter::with_capacity(1 << 16, file);
+            let mut out = BufWriter::with_capacity(1 << 18, file);
             write_wav_pcm(&mut out, samples, channels, sample_rate, bits, progress)
                 .map_err(werr)??;
             let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
@@ -329,18 +426,138 @@ pub fn export_audio(
             drop(file);
             tmp.persist(dst).map_err(werr)
         }
-        ExportFormat::Flac | ExportFormat::Mp3 => {
-            let bytes = if format == ExportFormat::Flac {
-                encode_flac(samples, channels, sample_rate)?
-            } else {
-                encode_mp3(samples, channels, sample_rate, progress)?
+        ExportFormat::Flac => {
+            let frames = samples.len() / usize::from(channels);
+            let source = FlacSource {
+                samples,
+                channels: usize::from(channels),
+                sample_rate: sample_rate as usize,
+                pos: 0,
+                scratch: Vec::new(),
             };
-            check_cancelled(progress)?;
-            let (tmp, mut file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
-            file.write_all(&bytes).map_err(werr)?;
+            finish_flac_source(source, frames, dst, progress)
+        }
+        ExportFormat::Mp3 => {
+            let chunk_len =
+                (sample_rate as usize * usize::from(channels)).max(usize::from(channels));
+            stream_mp3_chunks(channels, sample_rate, dst, progress, |emit| {
+                for chunk in samples.chunks(chunk_len) {
+                    emit(chunk)?;
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+fn fill_mix_chunk(active: &[(&[f32], f32)], start: usize, len: usize, buf: &mut Vec<f32>) {
+    buf.clear();
+    buf.resize(len, 0.0);
+    for (samples, gain) in active {
+        if start >= samples.len() {
+            continue;
+        }
+        let take = (samples.len() - start).min(len);
+        for (o, s) in buf[..take].iter_mut().zip(&samples[start..start + take]) {
+            *o += s * *gain;
+        }
+    }
+}
+
+/// Streams a mixdown of several interleaved stereo sources directly to `dst`
+/// in `format`, without materializing a full-track mix buffer in memory.
+pub fn export_mixdown_streaming(
+    sources: &[(&[f32], f32)],
+    sample_rate: u32,
+    format: ExportFormat,
+    dst: &Path,
+    progress: &dyn Progress,
+) -> Result<()> {
+    check_cancelled(progress)?;
+    let werr = |e: std::io::Error| Error::from_write(&e, dst);
+    if std::fs::metadata(dst).is_ok_and(|m| m.is_dir()) {
+        return Err(werr(std::io::Error::from(std::io::ErrorKind::IsADirectory)));
+    }
+    let total_samples = sources.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+    if !total_samples.is_multiple_of(2) {
+        return Err(Error::new(
+            ErrorCode::UnsupportedFormat,
+            "Only mono and stereo audio can be exported",
+        ));
+    }
+    let active: Vec<(&[f32], f32)> = sources
+        .iter()
+        .filter_map(|(s, g)| {
+            let gain = db_to_gain(*g);
+            (gain > 0.0).then_some((*s, gain))
+        })
+        .collect();
+    // 16,384 stereo frames per chunk stays well within L2 cache.
+    const CHUNK_SAMPLES: usize = 32_768;
+    let mut chunk_buf = Vec::new();
+    match format {
+        ExportFormat::Wav32f => {
+            let mut w = crate::wav::WavWriter::create_with_channels(dst, sample_rate, 2)?;
+            for start in (0..total_samples).step_by(CHUNK_SAMPLES) {
+                check_cancelled(progress)?;
+                let len = (total_samples - start).min(CHUNK_SAMPLES);
+                fill_mix_chunk(&active, start, len, &mut chunk_buf);
+                w.write_interleaved(&chunk_buf)?;
+            }
+            w.finish()
+        }
+        ExportFormat::Wav16 | ExportFormat::Wav24 => {
+            let bits = if format == ExportFormat::Wav16 {
+                16
+            } else {
+                24
+            };
+            let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
+            let mut out = BufWriter::with_capacity(1 << 18, file);
+            write_wav_pcm_header(&mut out, bits, 2, sample_rate, total_samples as u64)
+                .map_err(werr)?;
+            let mut dither = Dither(0x2545_F491_4F6C_DD1D);
+            let mut pcm_buf = Vec::with_capacity(8192 * usize::from(bits / 8));
+            for start in (0..total_samples).step_by(CHUNK_SAMPLES) {
+                let len = (total_samples - start).min(CHUNK_SAMPLES);
+                fill_mix_chunk(&active, start, len, &mut chunk_buf);
+                write_wav_pcm_samples(
+                    &mut out,
+                    &chunk_buf,
+                    bits,
+                    &mut dither,
+                    &mut pcm_buf,
+                    progress,
+                )
+                .map_err(werr)??;
+            }
+            let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
             file.sync_all().map_err(werr)?;
             drop(file);
             tmp.persist(dst).map_err(werr)
+        }
+        ExportFormat::Flac => {
+            let frames = total_samples / 2;
+            let source = MixFlacSource {
+                active,
+                total_samples,
+                sample_rate: sample_rate as usize,
+                pos: 0,
+                mix_buf: Vec::new(),
+                scratch: Vec::new(),
+            };
+            finish_flac_source(source, frames, dst, progress)
+        }
+        ExportFormat::Mp3 => {
+            let chunk_len = (sample_rate as usize * 2).max(2);
+            stream_mp3_chunks(2, sample_rate, dst, progress, |emit| {
+                for start in (0..total_samples).step_by(chunk_len) {
+                    let len = (total_samples - start).min(chunk_len);
+                    fill_mix_chunk(&active, start, len, &mut chunk_buf);
+                    emit(&chunk_buf)?;
+                }
+                Ok(())
+            })
         }
     }
 }

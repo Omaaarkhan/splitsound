@@ -393,6 +393,11 @@ export interface Commands {
     args: { sessionId: string; source: SourceId; buckets: number };
     result: Peaks;
   };
+  /** Packed binary peak frame: [count: u8][for each: id_len: u8, id_utf8, buckets: u32 LE, 2*buckets i8] */
+  get_session_peaks: {
+    args: { sessionId: string; sources: SourceId[]; buckets: number };
+    result: ArrayBuffer;
+  };
 
   /* Splitting */
   estimate_split: {

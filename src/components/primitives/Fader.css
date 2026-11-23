@@ -19,10 +19,26 @@
   box-shadow: var(--edge-seam);
 }
 
+.fader__rail {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 10px;
+  pointer-events: none;
+}
+
+.fader__glide {
+  position: absolute;
+  inset: 0;
+  transform: translate3d(calc(var(--pos, 0.68) * 100%), 0, 0);
+  will-change: transform;
+}
+
 .fader__cap {
   position: absolute;
   top: 3px;
-  left: calc(var(--pos, 0.68) * (100% - 10px));
+  left: 0;
   width: 10px;
   height: 17px;
   border-radius: var(--radius-key);

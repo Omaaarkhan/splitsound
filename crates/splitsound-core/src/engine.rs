@@ -10,21 +10,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
-use crate::analyze::{StemStats, analyze_stem, analyze_stereo};
+use crate::analyze::{StemStats, analyze_stereo, analyze_stereo_with_mix_rms, precompute_mix_rms};
 use crate::audio::{SAMPLE_RATE, Stereo, TAGGER_SAMPLE_RATE};
 use crate::decode::{Artwork, DecodeLimits, SourceInfo, decode_file};
 use crate::error::{Error, ErrorCode, Result};
-use crate::export::{ExportFormat, export_audio, mixdown};
+use crate::export::{ExportFormat, export_audio, export_mixdown_streaming};
 use crate::manifest::ModelKind;
 use crate::peaks::{Peaks, compute_peaks};
 use crate::progress::{PlannedStep, Progress, Stage, Tracker, check_cancelled};
+use crate::resample::StreamResampler;
 use crate::runtime::{Acceleration, Provider, Runtime, RuntimeConfig, SessionConfig};
 use crate::separate::chunk::{SegmentModel, count_segments, separate_track};
 use crate::separate::models::{SeparatorKind, open_segment_model};
 use crate::separate::pipeline::{Pass, PassInput, SplitOptions, passes, remainder_stem};
 use crate::store::{DownloadObserver, ModelSource, ModelStatus, ModelStore};
 use crate::tagger::{Detection, InstrumentMap, SplitMode, StemId, Tagger, suggest_mode};
-use crate::wav::{MappedWav, write_wav_f32};
+use crate::wav::{MappedWav, write_wav_f32, write_wav_f32_nosync};
 
 /// Id of the tagger model in the manifest.
 pub const TAGGER_MODEL: &str = "efficientat_mn10_as";
@@ -211,6 +212,12 @@ struct LoadedSeparator {
     model: Box<dyn SegmentModel + Send>,
 }
 
+struct TaggerSlot {
+    tagger: Tagger,
+    resampler: StreamResampler,
+    resampled: Vec<f32>,
+}
+
 /// The engine. See the module docs.
 pub struct Engine {
     store: ModelStore,
@@ -219,7 +226,7 @@ pub struct Engine {
     /// The most recently used separator. Holding this lock is also what
     /// makes "one split at a time" true.
     separator: Mutex<Option<LoadedSeparator>>,
-    tagger: Mutex<Option<Tagger>>,
+    tagger: Mutex<Option<TaggerSlot>>,
 }
 
 /// Compute seconds per second of audio on an Apple M4 with four threads
@@ -262,26 +269,10 @@ fn energy(audio: &Stereo) -> f64 {
         .sum()
 }
 
-/// Where the preview listens: up to three segments of `n` samples around
-/// 25 %, 50 % and 75 % of the track (fewer for short tracks), each moved by
-/// up to one segment either way to the loudest spot nearby, skipping spots
-/// that are near-silent and spots that overlap one already chosen.
-pub(crate) fn preview_starts(mix: &Stereo, n: usize) -> Vec<usize> {
-    let len = mix.len();
+fn preview_starts_by_rms(len: usize, n: usize, rms_db: impl Fn(usize, usize) -> f32) -> Vec<usize> {
     if len == 0 || n == 0 {
         return Vec::new();
     }
-    // Loudness on every 16th sample is plenty for choosing a spot.
-    let rms_db = |start: usize, end: usize| {
-        let mut sum = 0f64;
-        let mut count = 0usize;
-        for i in (start..end).step_by(16) {
-            let m = 0.5 * (f64::from(mix.left[i]) + f64::from(mix.right[i]));
-            sum += m * m;
-            count += 1;
-        }
-        crate::audio::amplitude_to_db((sum / count.max(1) as f64).sqrt() as f32)
-    };
     if len <= n {
         return if rms_db(0, len) > PREVIEW_MIN_RMS_DB {
             vec![0]
@@ -317,6 +308,52 @@ pub(crate) fn preview_starts(mix: &Stereo, n: usize) -> Vec<usize> {
     }
     chosen.sort_unstable();
     chosen
+}
+
+/// Where the preview listens: up to three segments of `n` samples around
+/// 25 %, 50 % and 75 % of the track (fewer for short tracks), each moved by
+/// up to one segment either way to the loudest spot nearby, skipping spots
+/// that are near-silent and spots that overlap one already chosen.
+pub(crate) fn preview_starts(mix: &Stereo, n: usize) -> Vec<usize> {
+    // Loudness on every 16th sample is plenty for choosing a spot.
+    preview_starts_by_rms(mix.len(), n, |start, end| {
+        let mut sum = 0f64;
+        let mut count = 0usize;
+        for i in (start..end).step_by(16) {
+            let m = 0.5 * (f64::from(mix.left[i]) + f64::from(mix.right[i]));
+            sum += m * m;
+            count += 1;
+        }
+        crate::audio::amplitude_to_db((sum / count.max(1) as f64).sqrt() as f32)
+    })
+}
+
+fn preview_starts_mapped(mix: &MappedWav, n: usize) -> Result<Vec<usize>> {
+    let ch = usize::from(mix.channels());
+    if ch != 1 && ch != 2 {
+        return Err(Error::unsupported(
+            "This WAV file has more than two channels",
+        ));
+    }
+    let samples = mix.samples();
+    Ok(preview_starts_by_rms(mix.frames(), n, |start, end| {
+        let mut sum = 0f64;
+        let mut count = 0usize;
+        if ch == 2 {
+            for i in (start..end).step_by(16) {
+                let m = 0.5 * (f64::from(samples[2 * i]) + f64::from(samples[2 * i + 1]));
+                sum += m * m;
+                count += 1;
+            }
+        } else {
+            for i in (start..end).step_by(16) {
+                let m = f64::from(samples[i]);
+                sum += m * m;
+                count += 1;
+            }
+        }
+        crate::audio::amplitude_to_db((sum / count.max(1) as f64).sqrt() as f32)
+    }))
 }
 
 /// Confidence in `0..=1` from a stem's level relative to the mix.
@@ -515,14 +552,24 @@ impl Engine {
         })
     }
 
-    fn with_tagger<T>(&self, work: impl FnOnce(&mut Tagger) -> Result<T>) -> Result<T> {
+    fn with_tagger<T>(&self, work: impl FnOnce(&mut TaggerSlot) -> Result<T>) -> Result<T> {
         let mut slot = self.tagger.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
             let verified = self.store.load(TAGGER_MODEL)?;
-            let (session, _) = self
-                .runtime()?
-                .session_from_verified(&verified.graph, None)?;
-            *slot = Some(Tagger::new(session));
+            let (session, _) = self.runtime()?.session_from_verified_with(
+                &verified.graph,
+                None,
+                SessionConfig {
+                    allow_gpu: false,
+                    memory_pattern: true,
+                },
+            )?;
+            let resampler = StreamResampler::new(SAMPLE_RATE, TAGGER_SAMPLE_RATE, 1)?;
+            *slot = Some(TaggerSlot {
+                tagger: Tagger::new(session),
+                resampler,
+                resampled: Vec::new(),
+            });
         }
         match slot.as_mut() {
             Some(t) => work(t),
@@ -534,12 +581,20 @@ impl Engine {
     /// windows.
     fn tag_scores(&self, audio: &Stereo, hop: usize, progress: &dyn Progress) -> Result<Vec<f32>> {
         let mono = audio.to_mono();
-        let mut resampled = crate::resample::resample(&[mono], SAMPLE_RATE, TAGGER_SAMPLE_RATE)?;
-        let mono_32k = resampled.pop().unwrap_or_default();
-        self.with_tagger(|tagger| {
-            let scores =
-                tagger.score_with_hop(&mono_32k, hop, &mut |_, _| check_cancelled(progress))?;
-            Ok(scores.max)
+        self.with_tagger(|slot| {
+            slot.resampler.reset();
+            slot.resampled.clear();
+            let reserve = slot.resampler.max_output_for(mono.len()) + 64;
+            slot.resampled.reserve(reserve);
+            let mut out = [std::mem::take(&mut slot.resampled)];
+            slot.resampler.push(&[&mono], &mut out)?;
+            slot.resampler.finish(&mut out)?;
+            let mono_32k = out.into_iter().next().unwrap_or_default();
+            let res = slot
+                .tagger
+                .score_with_hop(&mono_32k, hop, &mut |_, _| check_cancelled(progress));
+            slot.resampled = mono_32k;
+            Ok(res?.max)
         })
     }
 
@@ -564,6 +619,42 @@ impl Engine {
     /// # Errors
     /// `busy` (a split is running; try again afterwards), `cancelled`.
     pub fn detect(&self, mix: &Stereo, progress: &dyn Progress) -> Result<DetectOutcome> {
+        self.detect_segments(
+            progress,
+            |n| Ok(preview_starts(mix, n)),
+            |start, end| {
+                Ok(Stereo::from_channels(
+                    mix.left[start..end].to_vec(),
+                    mix.right[start..end].to_vec(),
+                ))
+            },
+        )
+    }
+
+    /// Streaming zero-full-copy variant of [`Engine::detect`] operating
+    /// directly on a memory-mapped working WAV file.
+    pub fn detect_mapped(&self, mix: &MappedWav, progress: &dyn Progress) -> Result<DetectOutcome> {
+        let ch = mix.channels();
+        let samples = mix.samples();
+        self.detect_segments(
+            progress,
+            |n| preview_starts_mapped(mix, n),
+            |start, end| match ch {
+                1 => Ok(Stereo::from_mono(samples[start..end].to_vec())),
+                2 => Ok(Stereo::from_interleaved(&samples[start * 2..end * 2])),
+                _ => Err(Error::unsupported(
+                    "This WAV file has more than two channels",
+                )),
+            },
+        )
+    }
+
+    fn detect_segments(
+        &self,
+        progress: &dyn Progress,
+        choose_starts: impl FnOnce(usize) -> Result<Vec<usize>>,
+        slice_excerpt: impl Fn(usize, usize) -> Result<Stereo>,
+    ) -> Result<DetectOutcome> {
         let missing: Vec<String> = [PREVIEW_MODEL, TAGGER_MODEL]
             .into_iter()
             .filter(|id| !self.store.is_installed(id))
@@ -583,7 +674,7 @@ impl Engine {
                     .ok_or_else(|| Error::internal("preview model lacks a source"))?,
             );
         }
-        let starts = preview_starts(mix, n);
+        let starts = choose_starts(n)?;
         // Per stem: best level relative to the mix, tagger maxima.
         let mut evidence: Vec<(StemId, f32, Option<Vec<f32>>)> = named
             .into_iter()
@@ -597,11 +688,7 @@ impl Engine {
         }
         for &start in &starts {
             check_cancelled(progress)?;
-            let end = (start + n).min(mix.len());
-            let excerpt = Stereo::from_channels(
-                mix.left[start..end].to_vec(),
-                mix.right[start..end].to_vec(),
-            );
+            let excerpt = slice_excerpt(start, start + n)?;
             let Some(loaded) = slot.as_mut() else {
                 return Err(Error::internal("separator slot empty"));
             };
@@ -733,7 +820,7 @@ impl Engine {
             .as_ref()
             .map(|(n, b)| (n.as_str(), b.clone()));
         let session_cfg = SessionConfig {
-            allow_gpu: kind != SeparatorKind::MelbandRoformer,
+            allow_gpu: kind == SeparatorKind::Htdemucs,
             memory_pattern: kind != SeparatorKind::MelbandRoformer,
         };
         let (session, _provider) =
@@ -899,6 +986,19 @@ impl Engine {
         out_dir: &Path,
         progress: &dyn Progress,
     ) -> Result<SplitResult> {
+        self.split_to_dir_with_sync(mix, request, out_dir, true, progress)
+    }
+
+    /// Staging-aware variant of [`Engine::split_to_dir`]. Passing `sync = false`
+    /// skips per-stem `fsync` calls inside an uncommitted staging folder.
+    pub fn split_to_dir_with_sync(
+        &self,
+        mix: &Stereo,
+        request: SplitRequest,
+        out_dir: &Path,
+        sync: bool,
+        progress: &dyn Progress,
+    ) -> Result<SplitResult> {
         let started = Instant::now();
         let options = request.options;
         let plan = passes(options);
@@ -974,6 +1074,7 @@ impl Engine {
         // Stages 2 to 4: separate; measure, name and save each stem as it
         // arrives, then let go of it.
         std::fs::create_dir_all(out_dir).map_err(|e| Error::from_write(&e, out_dir))?;
+        let mix_rms = precompute_mix_rms(mix, SAMPLE_RATE);
         let remainder = remainder_stem(options.mode);
         let tag = request.tag_stems && self.store.is_installed(TAGGER_MODEL);
         let mut results: Vec<StemResult> = Vec::new();
@@ -987,7 +1088,7 @@ impl Engine {
                 if id == remainder {
                     tracker.begin(analyze_step)?;
                 }
-                let stats = analyze_stereo(&audio, Some(mix), SAMPLE_RATE);
+                let stats = analyze_stereo_with_mix_rms(&audio, Some(&mix_rms), SAMPLE_RATE);
                 let contains = if tag && stats.present {
                     self.detect_in_stem(&audio, id, options.mode, progress)?
                 } else {
@@ -997,7 +1098,11 @@ impl Engine {
                     tracker.begin(analyze_step + 1)?;
                 }
                 let path = out_dir.join(format!("{}.wav", id.as_str()));
-                write_wav_f32(&path, &audio, SAMPLE_RATE)?;
+                if sync {
+                    write_wav_f32(&path, &audio, SAMPLE_RATE)?;
+                } else {
+                    write_wav_f32_nosync(&path, &audio, SAMPLE_RATE)?;
+                }
                 results.push(StemResult {
                     id,
                     path,
@@ -1020,15 +1125,14 @@ impl Engine {
     /// Measures one stem (see [`analyze_stem`]); `mix` sharpens the
     /// "audible" decision and should be passed when available.
     pub fn analyze(&self, stem: &Stereo, mix: Option<&Stereo>) -> StemStats {
-        let s = stem.to_interleaved();
-        let m = mix.map(Stereo::to_interleaved);
-        analyze_stem(&s, m.as_deref(), 2, SAMPLE_RATE)
+        analyze_stereo(stem, mix, SAMPLE_RATE)
     }
 }
 
 /// Waveform overview of a working file, straight from a memory map.
 pub fn peaks_for_file(path: &Path, buckets: usize) -> Result<Peaks> {
     let wav = MappedWav::open(path)?;
+    wav.advise_sequential();
     Ok(compute_peaks(
         wav.samples(),
         usize::from(wav.channels()),
@@ -1044,6 +1148,7 @@ pub fn export_file(
     progress: &dyn Progress,
 ) -> Result<()> {
     let wav = MappedWav::open(src)?;
+    wav.advise_sequential();
     export_audio(
         wav.samples(),
         wav.channels(),
@@ -1065,7 +1170,9 @@ pub fn export_mixdown(
 ) -> Result<()> {
     let mut maps = Vec::with_capacity(sources.len());
     for (path, _) in sources {
-        maps.push(MappedWav::open(path)?);
+        let m = MappedWav::open(path)?;
+        m.advise_sequential();
+        maps.push(m);
     }
     let Some(first) = maps.first() else {
         return Err(Error::new(
@@ -1086,8 +1193,7 @@ pub fn export_mixdown(
         .zip(sources)
         .map(|(m, (_, g))| (m.samples(), *g))
         .collect();
-    let mixed = mixdown(&inputs)?;
-    export_audio(&mixed, 2, rate, format, dst, progress)
+    export_mixdown_streaming(&inputs, rate, format, dst, progress)
 }
 
 /// Which provider a session would use is an implementation detail of the

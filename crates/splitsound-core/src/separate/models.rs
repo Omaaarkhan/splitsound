@@ -60,10 +60,95 @@ fn check_output(shape: &[i64], data_len: usize, expected: &[usize], what: &str) 
     }
 }
 
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 12)
+}
+
+fn make_workers<S>(first: &S, clone: impl Fn(&S) -> S) -> Vec<S> {
+    let n = worker_count().saturating_sub(1);
+    (0..n).map(|_| clone(first)).collect()
+}
+
+fn par_forward<S: Send>(
+    primary: &mut S,
+    workers: &mut [S],
+    f_l: impl FnOnce(&mut S) -> Result<()> + Send,
+    f_r: impl FnOnce(&mut S) -> Result<()> + Send,
+) -> Result<()> {
+    if let Some((w, _)) = workers.split_first_mut() {
+        let (rl, rr) = std::thread::scope(|scope| {
+            let h = scope.spawn(move || f_r(w));
+            let rl = f_l(primary);
+            let rr = h
+                .join()
+                .unwrap_or_else(|_| Err(Error::internal("stft worker panicked")));
+            (rl, rr)
+        });
+        rl?;
+        rr
+    } else {
+        f_l(primary)?;
+        f_r(primary)
+    }
+}
+
+struct InvTask<'a> {
+    dst: &'a mut Vec<f32>,
+    re: &'a [f32],
+    im: &'a [f32],
+    wave: Option<&'a [f32]>,
+}
+
+fn par_inverse<S: Send>(
+    primary: &mut S,
+    workers: &mut [S],
+    tasks: &mut [InvTask<'_>],
+    op: impl Fn(&mut S, &mut InvTask<'_>) -> Result<()> + Sync,
+) -> Result<()> {
+    if workers.is_empty() || tasks.len() <= 1 {
+        for task in tasks.iter_mut() {
+            op(primary, task)?;
+        }
+        return Ok(());
+    }
+    let active = (1 + workers.len()).min(tasks.len());
+    let per = tasks.len().div_ceil(active);
+    let mut stfts: Vec<&mut S> = std::iter::once(primary)
+        .chain(workers.iter_mut())
+        .take(active)
+        .collect();
+    std::thread::scope(|scope| {
+        let mut chunks: Vec<&mut [InvTask<'_>]> = tasks.chunks_mut(per).collect();
+        let first_chunk = chunks.remove(0);
+        let first_stft = stfts.remove(0);
+        let mut handles = Vec::with_capacity(chunks.len());
+        let op_ref = &op;
+        for (stft, chunk) in stfts.into_iter().zip(chunks) {
+            handles.push(scope.spawn(move || -> Result<()> {
+                for task in chunk.iter_mut() {
+                    op_ref(stft, task)?;
+                }
+                Ok(())
+            }));
+        }
+        for task in first_chunk.iter_mut() {
+            op_ref(first_stft, task)?;
+        }
+        for h in handles {
+            h.join()
+                .unwrap_or_else(|_| Err(Error::internal("stft worker panicked")))?;
+        }
+        Ok(())
+    })
+}
+
 /// SCNet (contract section 3).
 pub struct ScnetModel {
     session: Session,
     stft: ScnetStft,
+    workers: Vec<ScnetStft>,
     sources: usize,
     /// `[1, 4, 2049, 476]`.
     spec: Vec<f32>,
@@ -72,9 +157,12 @@ pub struct ScnetModel {
 impl ScnetModel {
     /// Wraps a session of an SCNet graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        let stft = ScnetStft::new();
+        let workers = make_workers(&stft, ScnetStft::clone_worker);
         ScnetModel {
             session,
-            stft: ScnetStft::new(),
+            stft,
+            workers,
             sources,
             spec: vec![0.0; 4 * SC_PLANE],
         }
@@ -102,8 +190,12 @@ impl SegmentModel for ScnetModel {
             let (l, r) = self.spec.split_at_mut(2 * SC_PLANE);
             let (l_re, l_im) = l.split_at_mut(SC_PLANE);
             let (r_re, r_im) = r.split_at_mut(SC_PLANE);
-            self.stft.forward(left, l_re, l_im)?;
-            self.stft.forward(right, r_re, r_im)?;
+            par_forward(
+                &mut self.stft,
+                &mut self.workers,
+                |s| s.forward(left, l_re, l_im),
+                |s| s.forward(right, r_re, r_im),
+            )?;
         }
         let input = TensorRef::from_array_view(([1usize, 4, SC_BINS, SC_FRAMES], &self.spec[..]))
             .map_err(run_error)?;
@@ -121,19 +213,30 @@ impl SegmentModel for ScnetModel {
             &[1, self.sources, 4, SC_BINS, SC_FRAMES],
             "scnet",
         )?;
+        let mut tasks = Vec::with_capacity(wanted.len() * 2);
         for (dst, &s) in out.iter_mut().zip(wanted) {
             if s >= self.sources {
                 return Err(Error::internal("scnet: source index out of range"));
             }
             let base = s * 4 * SC_PLANE;
-            for (c, channel) in dst.iter_mut().enumerate() {
-                let re = &data[base + 2 * c * SC_PLANE..base + (2 * c + 1) * SC_PLANE];
-                let im = &data[base + (2 * c + 1) * SC_PLANE..base + (2 * c + 2) * SC_PLANE];
-                channel.resize(SC_SEGMENT, 0.0);
-                self.stft.inverse(re, im, channel)?;
-            }
+            let [dl, dr] = dst;
+            tasks.push(InvTask {
+                dst: dl,
+                re: &data[base..base + SC_PLANE],
+                im: &data[base + SC_PLANE..base + 2 * SC_PLANE],
+                wave: None,
+            });
+            tasks.push(InvTask {
+                dst: dr,
+                re: &data[base + 2 * SC_PLANE..base + 3 * SC_PLANE],
+                im: &data[base + 3 * SC_PLANE..base + 4 * SC_PLANE],
+                wave: None,
+            });
         }
-        Ok(())
+        par_inverse(&mut self.stft, &mut self.workers, &mut tasks, |s, t| {
+            t.dst.resize(SC_SEGMENT, 0.0);
+            s.inverse(t.re, t.im, t.dst)
+        })
     }
 }
 
@@ -141,6 +244,7 @@ impl SegmentModel for ScnetModel {
 pub struct HtdemucsModel {
     session: Session,
     stft: HtdemucsStft,
+    workers: Vec<HtdemucsStft>,
     sources: usize,
     /// `[1, 4, 2048, 336]`.
     spec: Vec<f32>,
@@ -151,9 +255,12 @@ pub struct HtdemucsModel {
 impl HtdemucsModel {
     /// Wraps a session of an HTDemucs graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        let stft = HtdemucsStft::new();
+        let workers = make_workers(&stft, HtdemucsStft::clone_worker);
         HtdemucsModel {
             session,
-            stft: HtdemucsStft::new(),
+            stft,
+            workers,
             sources,
             spec: vec![0.0; 4 * PLANE],
             mix: vec![0.0; 2 * SEGMENT],
@@ -184,8 +291,12 @@ impl SegmentModel for HtdemucsModel {
             let (l, r) = self.spec.split_at_mut(2 * PLANE);
             let (l_re, l_im) = l.split_at_mut(PLANE);
             let (r_re, r_im) = r.split_at_mut(PLANE);
-            self.stft.forward(left, l_re, l_im)?;
-            self.stft.forward(right, r_re, r_im)?;
+            par_forward(
+                &mut self.stft,
+                &mut self.workers,
+                |s| s.forward(left, l_re, l_im),
+                |s| s.forward(right, r_re, r_im),
+            )?;
         }
         self.mix[..SEGMENT].copy_from_slice(left);
         self.mix[SEGMENT..].copy_from_slice(right);
@@ -217,23 +328,32 @@ impl SegmentModel for HtdemucsModel {
             &[1, self.sources, 2, SEGMENT],
             "htdemucs wave",
         )?;
+        let mut tasks = Vec::with_capacity(wanted.len() * 2);
         for (dst, &s) in out.iter_mut().zip(wanted) {
             if s >= self.sources {
                 return Err(Error::internal("htdemucs: source index out of range"));
             }
             let sbase = s * 4 * PLANE;
             let wbase = s * 2 * SEGMENT;
-            for (c, channel) in dst.iter_mut().enumerate() {
-                // Start from the waveform branch, then add the inverse STFT
-                // of the spectrogram branch.
-                channel.clear();
-                channel.extend_from_slice(&wdata[wbase + c * SEGMENT..wbase + (c + 1) * SEGMENT]);
-                let re = &sdata[sbase + 2 * c * PLANE..sbase + (2 * c + 1) * PLANE];
-                let im = &sdata[sbase + (2 * c + 1) * PLANE..sbase + (2 * c + 2) * PLANE];
-                self.stft.inverse_add(re, im, channel)?;
-            }
+            let [dl, dr] = dst;
+            tasks.push(InvTask {
+                dst: dl,
+                re: &sdata[sbase..sbase + PLANE],
+                im: &sdata[sbase + PLANE..sbase + 2 * PLANE],
+                wave: Some(&wdata[wbase..wbase + SEGMENT]),
+            });
+            tasks.push(InvTask {
+                dst: dr,
+                re: &sdata[sbase + 2 * PLANE..sbase + 3 * PLANE],
+                im: &sdata[sbase + 3 * PLANE..sbase + 4 * PLANE],
+                wave: Some(&wdata[wbase + SEGMENT..wbase + 2 * SEGMENT]),
+            });
         }
-        Ok(())
+        par_inverse(&mut self.stft, &mut self.workers, &mut tasks, |s, t| {
+            t.dst.clear();
+            t.dst.extend_from_slice(t.wave.unwrap_or(&[]));
+            s.inverse_add(t.re, t.im, t.dst)
+        })
     }
 }
 
@@ -241,6 +361,7 @@ impl SegmentModel for HtdemucsModel {
 pub struct MelbandRoformerModel {
     session: Session,
     stft: MelbandRoformerStft,
+    workers: Vec<MelbandRoformerStft>,
     sources: usize,
     /// `[1, 4, 1025, 801]`.
     spec: Vec<f32>,
@@ -249,9 +370,12 @@ pub struct MelbandRoformerModel {
 impl MelbandRoformerModel {
     /// Wraps a session of a Mel-Band RoFormer graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        let stft = MelbandRoformerStft::new();
+        let workers = make_workers(&stft, MelbandRoformerStft::clone_worker);
         MelbandRoformerModel {
             session,
-            stft: MelbandRoformerStft::new(),
+            stft,
+            workers,
             sources,
             spec: vec![0.0; 4 * MB_PLANE],
         }
@@ -282,8 +406,12 @@ impl SegmentModel for MelbandRoformerModel {
             let (l, r) = self.spec.split_at_mut(2 * MB_PLANE);
             let (l_re, l_im) = l.split_at_mut(MB_PLANE);
             let (r_re, r_im) = r.split_at_mut(MB_PLANE);
-            self.stft.forward(left, l_re, l_im)?;
-            self.stft.forward(right, r_re, r_im)?;
+            par_forward(
+                &mut self.stft,
+                &mut self.workers,
+                |s| s.forward(left, l_re, l_im),
+                |s| s.forward(right, r_re, r_im),
+            )?;
         }
         let input = TensorRef::from_array_view(([1usize, 4, MB_BINS, MB_FRAMES], &self.spec[..]))
             .map_err(run_error)?;
@@ -301,6 +429,7 @@ impl SegmentModel for MelbandRoformerModel {
             &[1, self.sources, 4, MB_BINS, MB_FRAMES],
             "melband_roformer",
         )?;
+        let mut tasks = Vec::with_capacity(wanted.len() * 2);
         for (dst, &s) in out.iter_mut().zip(wanted) {
             if s >= self.sources {
                 return Err(Error::internal(
@@ -308,13 +437,23 @@ impl SegmentModel for MelbandRoformerModel {
                 ));
             }
             let base = s * 4 * MB_PLANE;
-            for (c, channel) in dst.iter_mut().enumerate() {
-                let re = &data[base + 2 * c * MB_PLANE..base + (2 * c + 1) * MB_PLANE];
-                let im = &data[base + (2 * c + 1) * MB_PLANE..base + (2 * c + 2) * MB_PLANE];
-                channel.resize(MB_SEGMENT, 0.0);
-                self.stft.inverse(re, im, channel)?;
-            }
+            let [dl, dr] = dst;
+            tasks.push(InvTask {
+                dst: dl,
+                re: &data[base..base + MB_PLANE],
+                im: &data[base + MB_PLANE..base + 2 * MB_PLANE],
+                wave: None,
+            });
+            tasks.push(InvTask {
+                dst: dr,
+                re: &data[base + 2 * MB_PLANE..base + 3 * MB_PLANE],
+                im: &data[base + 3 * MB_PLANE..base + 4 * MB_PLANE],
+                wave: None,
+            });
         }
-        Ok(())
+        par_inverse(&mut self.stft, &mut self.workers, &mut tasks, |s, t| {
+            t.dst.resize(MB_SEGMENT, 0.0);
+            s.inverse(t.re, t.im, t.dst)
+        })
     }
 }

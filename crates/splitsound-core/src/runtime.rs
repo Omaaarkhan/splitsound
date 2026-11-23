@@ -214,9 +214,8 @@ fn ort_err(context: &str, e: impl std::fmt::Display) -> Error {
 ///
 /// ONNX Runtime's own default counts every core. On machines with
 /// performance and efficiency cores (Apple Silicon, recent Intel) the slow
-/// cores drag a compute-bound job down, so on Apple Silicon this asks the
-/// OS for the number of performance cores. Elsewhere it uses the available
-/// parallelism, capped at 16: these models stop scaling well before that.
+/// cores drag a compute-bound job down, so ask the OS for performance
+/// (or physical non-SMT) cores, clamped so thread overhead stays bounded.
 pub fn auto_threads() -> usize {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -229,7 +228,99 @@ pub fn auto_threads() -> usize {
             return p.min(logical);
         }
     }
-    logical.clamp(1, 16)
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(p) = linux_physical_cores()
+            && p >= 2
+        {
+            return p.min(logical).clamp(1, 12);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(p) = windows_performance_cores()
+            && p >= 2
+        {
+            return p.min(logical).clamp(1, 12);
+        }
+    }
+    logical.clamp(1, 12)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_physical_cores() -> Option<usize> {
+    use std::collections::HashSet;
+    let mut cores = HashSet::new();
+    let entries = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let topo = entry.path().join("topology");
+        let Ok(pkg) = std::fs::read_to_string(topo.join("physical_package_id")) else {
+            continue;
+        };
+        let Ok(core) = std::fs::read_to_string(topo.join("core_id")) else {
+            continue;
+        };
+        cores.insert((pkg.trim().to_string(), core.trim().to_string()));
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
+#[cfg(windows)]
+fn windows_performance_cores() -> Option<usize> {
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(
+            relationship_type: u32,
+            buffer: *mut u8,
+            returned_length: *mut u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    let mut len: u32 = 0;
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len)
+    };
+    if ok != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let valid_len = (len as usize).min(buf.len());
+    let mut effs = Vec::new();
+    let mut offset = 0usize;
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX header: Relationship (u32 @ +0), Size (u32 @ +4),
+    // followed by PROCESSOR_RELATIONSHIP where Flags is u8 @ +8 and EfficiencyClass is u8 @ +9.
+    while offset + 10 <= valid_len {
+        let relationship = u32::from_ne_bytes(buf[offset..offset + 4].try_into().ok()?);
+        let size = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+        if size < 10 || offset + size > valid_len {
+            break;
+        }
+        if relationship == RELATION_PROCESSOR_CORE {
+            effs.push(buf[offset + 9]);
+        }
+        offset += size;
+    }
+    let max_eff = *effs.iter().max()?;
+    let p_cores = effs.iter().filter(|&&e| e == max_eff).count();
+    (p_cores > 0).then_some(p_cores)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -334,7 +425,8 @@ impl Runtime {
 
     /// The GPU execution path this build could use on this machine, if any.
     pub fn gpu_provider(&self) -> Option<Provider> {
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             use ort::ep::ExecutionProvider;
             if ort::ep::CoreML::is_available().unwrap_or(false) {
                 return Some(Provider::CoreMl);

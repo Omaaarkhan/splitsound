@@ -1,9 +1,13 @@
-import type { Peaks } from "../ipc/contract";
+import type { Peaks, SourceId } from "../ipc/contract";
 
 export interface DecodedPeaks {
   buckets: number;
   min: Float32Array;
   max: Float32Array;
+}
+
+export function isDecodedPeaks(value: Peaks | DecodedPeaks): value is DecodedPeaks {
+  return "min" in value && value.min instanceof Float32Array;
 }
 
 export function encodePeaks(min: Float32Array, max: Float32Array): Peaks {
@@ -18,20 +22,56 @@ export function encodePeaks(min: Float32Array, max: Float32Array): Peaks {
   return { buckets, data: uint8ToBase64(bytes) };
 }
 
-export function decodePeaks(peaks: Peaks): DecodedPeaks {
-  const bytes = base64ToUint8(peaks.data);
-  const buckets = Math.min(peaks.buckets, Math.floor(bytes.length / 2));
-  const min = new Float32Array(buckets);
-  const max = new Float32Array(buckets);
-  for (let i = 0; i < buckets; i++) {
-    const rawLo = bytes[i * 2];
-    const rawHi = bytes[i * 2 + 1];
+function decodePeakBytes(bytes: Uint8Array, offset: number, buckets: number): DecodedPeaks {
+  const safeBuckets = Math.min(buckets, Math.max(0, Math.floor((bytes.length - offset) / 2)));
+  const min = new Float32Array(safeBuckets);
+  const max = new Float32Array(safeBuckets);
+  for (let i = 0; i < safeBuckets; i++) {
+    const rawLo = bytes[offset + i * 2];
+    const rawHi = bytes[offset + i * 2 + 1];
     const signedLo = rawLo > 127 ? rawLo - 256 : rawLo;
     const signedHi = rawHi > 127 ? rawHi - 256 : rawHi;
     min[i] = signedLo / 127;
     max[i] = signedHi / 127;
   }
-  return { buckets, min, max };
+  return { buckets: safeBuckets, min, max };
+}
+
+export function decodePeaks(peaks: Peaks): DecodedPeaks {
+  const bytes = base64ToUint8(peaks.data);
+  return decodePeakBytes(bytes, 0, peaks.buckets);
+}
+
+/**
+ * Decodes the binary response from `get_session_peaks`:
+ * `[count: u8]` followed by `[id_len: u8][id_utf8][buckets: u32 LE][2 * buckets u8]` entries.
+ */
+export function decodeSessionPeaksBinary(
+  buffer: ArrayBuffer,
+): Partial<Record<SourceId, DecodedPeaks>> {
+  const bytes = new Uint8Array(buffer);
+  const out: Partial<Record<SourceId, DecodedPeaks>> = {};
+  if (bytes.length < 1) return out;
+
+  const view = new DataView(buffer);
+  const decoder = new TextDecoder();
+  const count = bytes[0];
+  let offset = 1;
+
+  for (let idx = 0; idx < count && offset < bytes.length; idx++) {
+    const idLen = bytes[offset++];
+    if (offset + idLen + 4 > bytes.length) break;
+    const id = decoder.decode(bytes.subarray(offset, offset + idLen)) as SourceId;
+    offset += idLen;
+    const buckets = view.getUint32(offset, true);
+    offset += 4;
+    const byteLen = buckets * 2;
+    if (offset + byteLen > bytes.length) break;
+    out[id] = decodePeakBytes(bytes, offset, buckets);
+    offset += byteLen;
+  }
+
+  return out;
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {

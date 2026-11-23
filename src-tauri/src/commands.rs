@@ -86,6 +86,20 @@ pub async fn get_peaks(
     blocking(&core, move |c| c.get_peaks(&session_id, source, buckets)).await
 }
 
+#[tauri::command]
+pub async fn get_session_peaks(
+    core: Core<'_>,
+    session_id: String,
+    sources: Vec<SourceId>,
+    buckets: u32,
+) -> IpcResult<tauri::ipc::Response> {
+    let bytes = blocking(&core, move |c| {
+        c.get_session_peaks_binary(&session_id, &sources, buckets)
+    })
+    .await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /* Splitting */
 
 #[tauri::command]
@@ -304,6 +318,7 @@ pub const NAMES: &[&str] = &[
     "clear_library",
     "get_artwork",
     "get_peaks",
+    "get_session_peaks",
     "estimate_split",
     "start_split",
     "cancel_split",
@@ -343,6 +358,7 @@ macro_rules! splitsound_handler {
             $crate::commands::clear_library,
             $crate::commands::get_artwork,
             $crate::commands::get_peaks,
+            $crate::commands::get_session_peaks,
             $crate::commands::estimate_split,
             $crate::commands::start_split,
             $crate::commands::cancel_split,

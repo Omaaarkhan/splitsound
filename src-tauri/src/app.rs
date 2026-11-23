@@ -82,10 +82,24 @@ impl AppPaths {
         )
     }
 
-    /// Creates the folders and empties the drag folder.
+    /// Creates the folders and empties the drag folder asynchronously.
     pub fn prepare(&self) -> io::Result<()> {
         if self.drag_dir.exists() {
-            util::remove_dir_all_retry(&self.drag_dir)?;
+            let trash = self
+                .drag_dir
+                .with_file_name(format!(".drag-trash-{}", &util::new_session_id()[..8]));
+            match util::rename_retry(&self.drag_dir, &trash) {
+                Ok(()) => {
+                    let _ = std::thread::Builder::new()
+                        .name("splitsound-drag-gc".into())
+                        .spawn(move || {
+                            let _ = util::remove_dir_all_retry(&trash);
+                        });
+                }
+                Err(_) => {
+                    util::remove_dir_all_retry(&self.drag_dir)?;
+                }
+            }
         }
         for d in [
             &self.data_dir,
@@ -491,13 +505,20 @@ impl AppCore {
         let staging = self.library.staging_dir(&id)?;
         fs::create_dir_all(&staging).map_err(|e| IpcError::io("import the song", &e))?;
         let result = (|| {
-            let decoded = engine.decode(&input, &staging.join("mix.wav"), &CancelToken::new())?;
+            let mix_wav = staging.join("mix.wav");
+            let decoded = engine.decode(&input, &mix_wav, &CancelToken::new())?;
+            if engine.name() == "core" {
+                let _ = crate::audio::peaks::cached_peak_bytes(&staging, &mix_wav, "mix", 960);
+            }
             let mut has_artwork = false;
             if let Some(bytes) = decoded.artwork.as_deref()
                 && let Some(kind) = artwork::sniff(bytes)
             {
                 let p = staging.join(format!("artwork.{}", kind.extension()));
                 has_artwork = util::write_atomic(&p, bytes).is_ok();
+                if has_artwork && let Some(thumb) = artwork::make_thumbnail(bytes) {
+                    let _ = util::write_atomic(&staging.join("artwork-thumb.jpg"), &thumb);
+                }
             }
             let file_name = input
                 .file_name()
@@ -622,15 +643,67 @@ impl AppCore {
             return Ok(None);
         }
         let dir = self.library.dir(id)?;
+        let thumb_path = dir.join("artwork-thumb.jpg");
+        if thumb_path.is_file()
+            && let Ok(bytes) = util::read_bounded(&thumb_path, artwork::MAX_ARTWORK_BYTES as u64)
+            && let Some(url) = artwork::data_url(&bytes)
+        {
+            return Ok(Some(url));
+        }
         for ext in ["png", "jpg"] {
             let p = dir.join(format!("artwork.{ext}"));
             if p.is_file() {
                 let bytes = util::read_bounded(&p, artwork::MAX_ARTWORK_BYTES as u64)
                     .map_err(|e| IpcError::io("read the cover art", &e))?;
+                if let Some(thumb) = artwork::make_thumbnail(&bytes) {
+                    let _ = util::write_atomic(&thumb_path, &thumb);
+                    if let Some(url) = artwork::data_url(&thumb) {
+                        return Ok(Some(url));
+                    }
+                }
                 return Ok(artwork::data_url(&bytes));
             }
         }
         Ok(None)
+    }
+
+    fn resolve_peak_source(
+        s: &Session,
+        dir: &Path,
+        source: SourceId,
+    ) -> IpcResult<(&'static str, PathBuf)> {
+        match source.stem() {
+            None => Ok(("mix", dir.join("mix.wav"))),
+            Some(stem) => {
+                if !s.stems.iter().any(|x| x.id == stem) {
+                    return Err(IpcError::not_found("This song doesn't have that stem."));
+                }
+                Ok((stem.as_str(), stem_path(dir, stem)))
+            }
+        }
+    }
+
+    fn peak_bytes_for(
+        engine: &dyn Engine,
+        dir: &Path,
+        source_key: &str,
+        wav_path: &Path,
+        buckets: u32,
+    ) -> IpcResult<Vec<u8>> {
+        if engine.name() == "core" {
+            crate::audio::peaks::cached_peak_bytes(dir, wav_path, source_key, buckets).map_err(
+                |e| {
+                    log::warn!("peaks of {}: {e}", wav_path.display());
+                    IpcError::io("read the audio waveform", &e)
+                },
+            )
+        } else {
+            let peaks = engine.peaks(wav_path, buckets)?;
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(&peaks.data)
+                .map_err(|e| IpcError::internal(format!("bad mock peaks: {e}")))
+        }
     }
 
     pub fn get_peaks(&self, id: &str, source: SourceId, buckets: u32) -> IpcResult<Peaks> {
@@ -643,16 +716,75 @@ impl AppCore {
         let _read = read_lock(&session_lock);
         let s = self.library.get(id)?;
         let dir = self.library.dir(id)?;
-        let path = match source.stem() {
-            None => dir.join("mix.wav"),
-            Some(stem) => {
-                if !s.stems.iter().any(|x| x.id == stem) {
-                    return Err(IpcError::not_found("This song doesn't have that stem."));
-                }
-                stem_path(&dir, stem)
-            }
+        let (key, path) = Self::resolve_peak_source(&s, &dir, source)?;
+        let engine = self.engine()?;
+        let bytes = Self::peak_bytes_for(engine, &dir, key, &path, buckets)?;
+        Ok(crate::audio::peaks::peaks_from_bytes(buckets, &bytes))
+    }
+
+    /// Computes or reads cached waveform peaks for multiple sources of one
+    /// session in parallel and packs them into one binary frame:
+    /// `[count: u8]` + per source `[id_len: u8][id_utf8][buckets: u32 LE][2 * buckets i8]`.
+    pub fn get_session_peaks_binary(
+        &self,
+        id: &str,
+        sources: &[SourceId],
+        buckets: u32,
+    ) -> IpcResult<Vec<u8>> {
+        if buckets == 0 || buckets > MAX_BUCKETS {
+            return Err(IpcError::internal(format!(
+                "The waveform needs between 1 and {MAX_BUCKETS} buckets."
+            )));
+        }
+        if sources.is_empty() || sources.len() > 8 {
+            return Err(IpcError::internal(
+                "Between 1 and 8 waveform sources are supported per batch.",
+            ));
+        }
+        let session_lock = self.session_locks.get(id);
+        let _read = read_lock(&session_lock);
+        let s = self.library.get(id)?;
+        let dir = self.library.dir(id)?;
+        let engine = self.engine()?;
+        let mut resolved = Vec::with_capacity(sources.len());
+        for &src in sources {
+            resolved.push(Self::resolve_peak_source(&s, &dir, src)?);
+        }
+        let chunk_vecs: Vec<IpcResult<Vec<u8>>> = if resolved.len() == 1 {
+            let (key, path) = &resolved[0];
+            vec![Self::peak_bytes_for(engine, &dir, key, path, buckets)]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = resolved
+                    .iter()
+                    .map(|(key, path)| {
+                        scope.spawn(|| Self::peak_bytes_for(engine, &dir, key, path, buckets))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(IpcError::internal("peak worker failed")))
+                    })
+                    .collect()
+            })
         };
-        Ok(self.engine()?.peaks(&path, buckets)?)
+        let total_bytes: usize = 1 + resolved
+            .iter()
+            .zip(&chunk_vecs)
+            .map(|((k, _), _)| 1 + k.len() + 4 + buckets as usize * 2)
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(total_bytes);
+        out.push(resolved.len() as u8);
+        for ((key, _), bytes_res) in resolved.iter().zip(chunk_vecs) {
+            let bytes = bytes_res?;
+            out.push(key.len() as u8);
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&buckets.to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
     }
 
     /* -------------------------------------------------------------- */
@@ -674,7 +806,6 @@ impl AppCore {
         });
         if let Ok((s, _)) = r {
             self.session_changed(&s);
-            self.library_changed();
         }
     }
 
@@ -1091,16 +1222,25 @@ impl AppCore {
                     return Err(e);
                 }
             };
-            let old = dir.join("stems.old");
-            if let Err(e) = util::remove_dir_all_retry(&old)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                log::warn!("couldn't remove old stems in {}: {e}", dir.display());
+            if let Ok(rd) = fs::read_dir(dir.join("peaks")) {
+                for entry in rd.flatten() {
+                    if let Some(name) = entry.file_name().to_str()
+                        && !name.starts_with("mix-")
+                    {
+                        let _ = util::remove_file_retry(&entry.path());
+                    }
+                }
             }
-            self.library.refresh_size(id);
             self.player.reattach(&session, &dir);
             session
         };
+        let old = dir.join("stems.old");
+        if let Err(e) = util::remove_dir_all_retry(&old)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            log::warn!("couldn't remove old stems in {}: {e}", dir.display());
+        }
+        self.library.refresh_size(id);
         rep.report(
             SplitStage::Writing,
             1.0,
@@ -1252,7 +1392,7 @@ impl AppCore {
                     }
             });
             if !fresh {
-                copy_file_atomic(&src, &target)
+                util::copy_file_fast(&src, &target)
                     .map_err(|e| IpcError::io("prepare the files", &e))?;
             }
             let c =
@@ -1482,34 +1622,6 @@ impl AppCore {
             library_bytes: self.library.total_bytes(),
         }
     }
-}
-
-/// Copies `src` to `dst` through an exclusive sibling temporary file so
-/// preexisting symlinks at predictable names are never followed or removed.
-fn copy_file_atomic(src: &Path, dst: &Path) -> io::Result<()> {
-    let dir = dst
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    let name = dst
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        name.to_string_lossy(),
-        &util::new_session_id()[..8]
-    ));
-    let mut reader = fs::File::open(src)?;
-    let mut writer = fs::File::create_new(&tmp)?;
-    let result = (|| {
-        io::copy(&mut reader, &mut writer)?;
-        drop(writer);
-        util::rename_retry(&tmp, dst)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = util::remove_file_retry(&tmp);
-    }
-    result
 }
 
 /// Keep the previous files until the new `session.json` commits the swap.

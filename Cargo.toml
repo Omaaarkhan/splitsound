@@ -79,12 +79,84 @@ opt-level = 2
 [profile.dev.package.crc32fast]
 opt-level = 2
 
+[profile.dev.build-override]
+debug = 0
+
 [profile.release]
-opt-level = 3
+# Shrink UI/IPC glue while keeping hot DSP, codec, crypto and image crates at -O3.
+opt-level = "s"
 lto = "thin"
+codegen-units = 16
 strip = true
 
 # Keep single-CGU optimisation on the DSP engine while letting the GUI shell
 # and third-party crates compile and ThinLTO in parallel across all cores.
 [profile.release.package.splitsound-core]
+opt-level = 3
 codegen-units = 1
+
+[profile.release.package.rustfft]
+opt-level = 3
+
+[profile.release.package.realfft]
+opt-level = 3
+
+[profile.release.package.ndarray]
+opt-level = 3
+
+[profile.release.package.matrixmultiply]
+opt-level = 3
+
+[profile.release.package.rubato]
+opt-level = 3
+
+[profile.release.package.symphonia-core]
+opt-level = 3
+
+[profile.release.package.symphonia-bundle-mp3]
+opt-level = 3
+
+[profile.release.package.symphonia-bundle-flac]
+opt-level = 3
+
+[profile.release.package.symphonia-codec-aac]
+opt-level = 3
+
+[profile.release.package.symphonia-codec-alac]
+opt-level = 3
+
+[profile.release.package.symphonia-codec-pcm]
+opt-level = 3
+
+[profile.release.package.symphonia-codec-vorbis]
+opt-level = 3
+
+[profile.release.package.flacenc]
+opt-level = 3
+
+[profile.release.package.mp3lame-encoder]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.mp3lame-sys]
+opt-level = 3
+
+[profile.release.package.opuscule]
+opt-level = 3
+
+[profile.release.package.transpose]
+opt-level = 3
+
+[profile.release.package.strength_reduce]
+opt-level = 3
+
+[profile.release.package.num-complex]
+opt-level = 3
+
+[profile.release.package.num-integer]
+opt-level = 3
+
+[profile.release.package.num-traits]
+opt-level = 3

@@ -55,10 +55,55 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Speed up Windows builds (Defender exclusion and lld-link)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dirs = @(
+            $env:GITHUB_WORKSPACE,
+            "$env:USERPROFILE\.cargo",
+            "$env:USERPROFILE\.rustup",
+            "$env:LOCALAPPDATA\tauri",
+            $env:RUNNER_TEMP
+          ) | Where-Object { $_ }
+          foreach ($dir in $dirs) {
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            try {
+              Add-MpPreference -ExclusionPath $dir -ErrorAction Stop
+            } catch {
+              Write-Host "Defender exclusion skipped for ${dir}: $($_.Exception.Message)"
+            }
+          }
+          $lld = Get-Command lld-link.exe -ErrorAction SilentlyContinue
+          $lldPath = if ($lld) { $lld.Source } else { $null }
+          if (-not $lldPath) {
+            foreach ($cand in @("C:\Program Files\LLVM\bin\lld-link.exe")) {
+              if (Test-Path $cand) { $lldPath = $cand; break }
+            }
+          }
+          if (-not $lldPath -and (Test-Path "C:\Program Files\Microsoft Visual Studio")) {
+            $found = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "lld-link.exe" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\(Hostx64\\x64|Llvm\\x64)\\' } |
+              Select-Object -First 1
+            if (-not $found) {
+              $found = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "lld-link.exe" -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
+            if ($found) { $lldPath = $found.FullName }
+          }
+          if ($lldPath) {
+            $lldDir = Split-Path -Parent $lldPath
+            $lldDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lldPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Using lld-link: $lldPath"
+          } else {
+            Write-Host "lld-link.exe not found; using default link.exe"
+          }
+
       - name: Install system libraries (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Languages=none update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libasound2-dev lld
           echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
@@ -89,7 +134,7 @@ jobs:
             os: macos-15
             onnxruntime: macos-arm64
             rust-targets: ""
-            tauri-args: --bundles app,dmg
+            tauri-args: --bundles app
             bundle-dir: target/release/bundle
           - id: linux-x64
             name: Linux (x64)
@@ -118,13 +163,59 @@ jobs:
           node-version-file: .node-version
           cache: npm
 
+      - name: Speed up Windows builds (Defender exclusion and lld-link)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dirs = @(
+            $env:GITHUB_WORKSPACE,
+            "$env:USERPROFILE\.cargo",
+            "$env:USERPROFILE\.rustup",
+            "$env:LOCALAPPDATA\tauri",
+            $env:RUNNER_TEMP
+          ) | Where-Object { $_ }
+          foreach ($dir in $dirs) {
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            try {
+              Add-MpPreference -ExclusionPath $dir -ErrorAction Stop
+            } catch {
+              Write-Host "Defender exclusion skipped for ${dir}: $($_.Exception.Message)"
+            }
+          }
+          $lld = Get-Command lld-link.exe -ErrorAction SilentlyContinue
+          $lldPath = if ($lld) { $lld.Source } else { $null }
+          if (-not $lldPath) {
+            foreach ($cand in @("C:\Program Files\LLVM\bin\lld-link.exe")) {
+              if (Test-Path $cand) { $lldPath = $cand; break }
+            }
+          }
+          if (-not $lldPath -and (Test-Path "C:\Program Files\Microsoft Visual Studio")) {
+            $found = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "lld-link.exe" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\(Hostx64\\x64|Llvm\\x64)\\' } |
+              Select-Object -First 1
+            if (-not $found) {
+              $found = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Filter "lld-link.exe" -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
+            if ($found) { $lldPath = $found.FullName }
+          }
+          if ($lldPath) {
+            $lldDir = Split-Path -Parent $lldPath
+            $lldDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lldPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Using lld-link: $lldPath"
+          } else {
+            Write-Host "lld-link.exe not found; using default link.exe"
+          }
+
       - name: Install system libraries (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Languages=none update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libasound2-dev patchelf libfuse2 file
+            libwebkit2gtk-4.1-dev librsvg2-dev \
+            libasound2-dev patchelf libfuse2 file lld
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
 
       - name: Add Rust targets
         if: matrix.rust-targets != ''
@@ -140,6 +231,22 @@ jobs:
         with:
           path: vendor/onnxruntime/${{ matrix.onnxruntime }}
           key: onnxruntime-${{ matrix.onnxruntime }}-${{ hashFiles('scripts/fetch-onnxruntime.mjs') }}
+
+      - name: Cache Tauri bundler tools (Windows)
+        if: inputs.cache && runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/tauri
+          key: tauri-bundler-windows-v1-${{ hashFiles('package-lock.json') }}
+          restore-keys: tauri-bundler-windows-v1-
+
+      - name: Cache Tauri bundler tools (Linux)
+        if: inputs.cache && runner.os == 'Linux'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/tauri
+          key: tauri-bundler-linux-v1-${{ hashFiles('package-lock.json') }}
+          restore-keys: tauri-bundler-linux-v1-
 
       - run: npm ci
 

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import type { Quality, Session, SplitMode } from "../ipc/contract";
 import { STEMS_BY_MODE } from "../ipc/contract";
-import { useStore } from "../stores/createStore";
+import { useShallowStore } from "../stores/createStore";
 import { retryInstrumentScan } from "../stores/index";
 import { modelsStore } from "../stores/modelsStore";
 import { playbackStore, seekPlayback, setLoopRegion } from "../stores/playbackStore";
@@ -61,13 +61,28 @@ interface PreSplitViewProps {
   onStartSplit: () => void;
 }
 
-export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
-  const { peaks, splitOptions, estimate } = useStore(sessionStore);
-  const { playback } = useStore(playbackStore);
-  const { models, progressById, scanBatchIds } = useStore(modelsStore);
+export const PreSplitView = memo(function PreSplitView({
+  session,
+  onStartSplit,
+}: PreSplitViewProps) {
+  const { peaks, splitOptions, estimate } = useShallowStore(sessionStore, (s) => ({
+    peaks: s.peaks,
+    splitOptions: s.splitOptions,
+    estimate: s.estimate,
+  }));
+  const { playing, playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
+    playing: s.playback.playing,
+    playbackDurationSec: s.playback.durationSec,
+    loop: s.playback.loop,
+  }));
+  const { models, progressById, scanBatchIds } = useShallowStore(modelsStore, (s) => ({
+    models: s.models,
+    progressById: s.progressById,
+    scanBatchIds: s.scanBatchIds,
+  }));
   const scanFillRef = useRef<HTMLDivElement | null>(null);
 
-  const durationSec = playback.durationSec || session.track.durationSec;
+  const durationSec = playbackDurationSec || session.track.durationSec;
   const seekHandlers = useWellSeekHandlers(durationSec, true, (pos) => {
     void seekPlayback(pos);
   });
@@ -91,7 +106,7 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
   useEffect(() => {
     const el = scanFillRef.current;
     if (el) {
-      el.style.setProperty("--progress", `${scanDownloadPct}%`);
+      el.style.setProperty("--progress", (scanDownloadPct / 100).toFixed(4));
     }
   }, [scanDownloadPct, showScanDownloading]);
 
@@ -281,22 +296,22 @@ export function PreSplitView({ session, onStartSplit }: PreSplitViewProps) {
       >
         <TimeRuler
           durationSec={durationSec}
-          loop={playback.loop}
+          loop={loop}
           onSeek={(pos) => void seekPlayback(pos)}
-          onChangeLoop={(loop) => void setLoopRegion(loop)}
+          onChangeLoop={(l) => void setLoopRegion(l)}
         />
-        <LoopWash loop={playback.loop} durationSec={durationSec} />
+        <LoopWash loop={loop} durationSec={durationSec} />
         <div className="lane">
           <WaveformCanvas
             source="mix"
             peaks={peaks.mix}
             audible
             durationSec={durationSec}
-            playing={playback.playing}
+            playing={playing}
           />
         </div>
-        <PlayheadLine durationSec={durationSec} playing={playback.playing} />
+        <PlayheadLine durationSec={durationSec} playing={playing} />
       </section>
     </main>
   );
-}
+});

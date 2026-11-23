@@ -1,9 +1,20 @@
-import { useEffect, useMemo, useRef, type KeyboardEvent, type PointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, type KeyboardEvent, type PointerEvent } from "react";
 import type { Peaks, SourceId, StemId } from "../ipc/contract";
-import { getInterpolatedPositionSec, subscribePlaybackTicks } from "../stores/playbackStore";
+import {
+  acquirePlaybackAnimation,
+  getInterpolatedPositionSec,
+  subscribePlaybackFrame,
+} from "../stores/playbackStore";
 import { formatTime, rulerTickInterval } from "../utils/format";
 import { STEM_CSS_VAR } from "../utils/stems";
-import { decodePeaks, drawWaveform, drawWaveformRibbons, resolveCssColor } from "../utils/waveform";
+import {
+  type DecodedPeaks,
+  decodePeaks,
+  drawWaveform,
+  drawWaveformRibbons,
+  isDecodedPeaks,
+  resolveCssColor,
+} from "../utils/waveform";
 import { tip } from "./primitives/Tooltip";
 import "./WaveformWell.css";
 
@@ -22,8 +33,14 @@ interface TimeRulerProps {
 const MIN_LOOP_SEC = 1;
 const DRAG_THRESHOLD_PX = 5;
 
-export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRulerProps) {
+export const TimeRuler = memo(function TimeRuler({
+  durationSec,
+  loop,
+  onSeek,
+  onChangeLoop,
+}: TimeRulerProps) {
   const rulerRef = useRef<HTMLDivElement | null>(null);
+  const rulerRectRef = useRef<{ left: number; width: number }>({ left: 0, width: 1 });
   const loopRef = useRef<HTMLDivElement | null>(null);
   const startHandleRef = useRef<HTMLDivElement | null>(null);
   const endHandleRef = useRef<HTMLDivElement | null>(null);
@@ -83,10 +100,30 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
     }
   }, [loop, durationSec]);
 
-  const clientXToSec = (clientX: number): number => {
+  useEffect(() => {
     const el = rulerRef.current;
-    if (!el || durationSec <= 0) return 0;
-    const rect = el.getBoundingClientRect();
+    if (!el) return;
+    const syncRect = () => {
+      const r = el.getBoundingClientRect();
+      rulerRectRef.current = { left: r.left, width: r.width };
+    };
+    syncRect();
+    const ro = new ResizeObserver(syncRect);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const refreshRulerRect = () => {
+    const el = rulerRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      rulerRectRef.current = { left: r.left, width: r.width };
+    }
+  };
+
+  const clientXToSec = (clientX: number): number => {
+    if (durationSec <= 0) return 0;
+    const rect = rulerRectRef.current;
     const frac = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
     return frac * durationSec;
   };
@@ -95,6 +132,7 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
     if (e.button !== 0 || durationSec <= 0) return;
     e.preventDefault();
     e.stopPropagation();
+    refreshRulerRect();
     const sec = clientXToSec(e.clientX);
     dragRef.current = {
       mode: "create",
@@ -111,6 +149,7 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
     if (e.button !== 0 || !loop || durationSec <= 0) return;
     e.preventDefault();
     e.stopPropagation();
+    refreshRulerRect();
     dragRef.current = {
       mode: edge,
       anchorX: e.clientX,
@@ -272,9 +311,15 @@ export function TimeRuler({ durationSec, loop, onSeek, onChangeLoop }: TimeRuler
       ) : null}
     </div>
   );
-}
+});
 
-export function LoopWash({ loop, durationSec }: { loop: LoopRange | null; durationSec: number }) {
+export const LoopWash = memo(function LoopWash({
+  loop,
+  durationSec,
+}: {
+  loop: LoopRange | null;
+  durationSec: number;
+}) {
   const washRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -288,43 +333,72 @@ export function LoopWash({ loop, durationSec }: { loop: LoopRange | null; durati
 
   if (!loop) return null;
   return <div ref={washRef} className="well__loop-wash" aria-hidden="true" />;
-}
+});
 
 interface WaveformCanvasProps {
   source: SourceId;
-  peaks: Peaks | undefined;
+  peaks: Peaks | DecodedPeaks | undefined;
   audible: boolean;
   durationSec: number;
   playing: boolean;
-  /** Optional splitting cut line fraction (0..1) and bands to draw behind it. */
+  /** Optional splitting cut line bands to draw behind it. */
   splitOverlay?: {
-    fraction: number;
+    fraction?: number;
     stemIds: readonly StemId[];
     animate: boolean;
   };
+  /** Cut fraction passed cleanly outside `splitOverlay` so 10 Hz updates don't re-subscribe listeners. */
+  splitFraction?: number;
 }
 
-export function WaveformCanvas({
+interface WaveformCacheLayer {
+  w: number;
+  h: number;
+  dpr: number;
+  playedCanvas: HTMLCanvasElement;
+  aheadCanvas: HTMLCanvasElement;
+  ribbonsCanvas: HTMLCanvasElement | null;
+  lampColor: string;
+}
+
+function makeOffscreenCanvas(wPx: number, hPx: number): HTMLCanvasElement {
+  const off = document.createElement("canvas");
+  off.width = wPx;
+  off.height = hPx;
+  return off;
+}
+
+export const WaveformCanvas = memo(function WaveformCanvas({
   source,
   peaks,
   audible,
   durationSec,
-  playing,
+  playing: _playing,
   splitOverlay,
+  splitFraction,
 }: WaveformCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const decoded = useMemo(() => (peaks ? decodePeaks(peaks) : null), [peaks]);
-  const smoothCutRef = useRef<number>(splitOverlay?.fraction ?? 0);
-  const targetCutRef = useRef<number>(splitOverlay?.fraction ?? 0);
+  const decoded = useMemo(
+    () => (peaks ? (isDecodedPeaks(peaks) ? peaks : decodePeaks(peaks)) : null),
+    [peaks],
+  );
+  const initialCut = splitFraction ?? splitOverlay?.fraction ?? 0;
+  const smoothCutRef = useRef<number>(initialCut);
+  const targetCutRef = useRef<number>(initialCut);
+  const sizeRef = useRef<{ w: number; h: number; dpr: number }>({ w: 0, h: 0, dpr: 1 });
+  const cacheRef = useRef<WaveformCacheLayer | null>(null);
+  const paintRef = useRef<() => void>(() => {});
 
   useEffect(() => {
-    if (splitOverlay) {
-      targetCutRef.current = splitOverlay.fraction;
-      if (!splitOverlay.animate) {
-        smoothCutRef.current = splitOverlay.fraction;
+    const frac = splitFraction ?? splitOverlay?.fraction;
+    if (frac !== undefined) {
+      targetCutRef.current = frac;
+      if (!splitOverlay?.animate) {
+        smoothCutRef.current = frac;
+        paintRef.current();
       }
     }
-  }, [splitOverlay]);
+  }, [splitFraction, splitOverlay]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -336,14 +410,128 @@ export function WaveformCanvas({
     const stemColors = splitOverlay
       ? splitOverlay.stemIds.map((id) => resolveCssColor(STEM_CSS_VAR[id]))
       : [];
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const animateSplit = Boolean(splitOverlay?.animate) && !reducedMotion;
+
+    const rebuildCache = (w: number, h: number, dpr: number): WaveformCacheLayer => {
+      const targetW = Math.max(1, Math.round(w * dpr));
+      const targetH = Math.max(1, Math.round(h * dpr));
+      const isMix = source === "mix" || Boolean(splitOverlay);
+      const padY = isMix ? h * 0.15 : 7;
+
+      const playedCanvas = makeOffscreenCanvas(targetW, targetH);
+      const aheadCanvas = makeOffscreenCanvas(targetW, targetH);
+      let ribbonsCanvas: HTMLCanvasElement | null = null;
+
+      if (decoded) {
+        const playedCtx = playedCanvas.getContext("2d");
+        if (playedCtx) {
+          playedCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          drawWaveform(playedCtx, {
+            peaks: decoded,
+            color,
+            unplayedColor: isMix ? ink3Color : undefined,
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            playFraction: 1,
+            audible: splitOverlay ? true : audible,
+            paddingY: padY,
+            filledPlayedAlpha: 1,
+            filledAheadAlpha: isMix ? 1 : 0.55,
+          });
+        }
+
+        const aheadCtx = aheadCanvas.getContext("2d");
+        if (aheadCtx) {
+          aheadCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          drawWaveform(aheadCtx, {
+            peaks: decoded,
+            color,
+            unplayedColor: isMix ? ink3Color : undefined,
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+            playFraction: 0,
+            audible: splitOverlay ? true : audible,
+            paddingY: padY,
+            filledPlayedAlpha: 1,
+            filledAheadAlpha: isMix ? 1 : 0.55,
+          });
+        }
+
+        if (splitOverlay && stemColors.length > 0) {
+          ribbonsCanvas = makeOffscreenCanvas(targetW, targetH);
+          const ribCtx = ribbonsCanvas.getContext("2d");
+          if (ribCtx) {
+            ribCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            drawWaveformRibbons(ribCtx, {
+              peaks: decoded,
+              colors: stemColors,
+              x: 0,
+              y: 0,
+              width: w,
+              height: h,
+              paddingY: padY,
+              gapPx: 2,
+            });
+          }
+        }
+      }
+
+      const built: WaveformCacheLayer = {
+        w,
+        h,
+        dpr,
+        playedCanvas,
+        aheadCanvas,
+        ribbonsCanvas,
+        lampColor,
+      };
+      cacheRef.current = built;
+      return built;
+    };
+
+    const drawPlayheadSplit = (
+      ctx: CanvasRenderingContext2D,
+      cache: WaveformCacheLayer,
+      w: number,
+      h: number,
+      playFrac: number,
+    ) => {
+      const playX = w * playFrac;
+      if (playX > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, playX, h);
+        ctx.clip();
+        ctx.drawImage(cache.playedCanvas, 0, 0, w, h);
+        ctx.restore();
+      }
+      if (playX < w) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(playX, 0, w - playX, h);
+        ctx.clip();
+        ctx.drawImage(cache.aheadCanvas, 0, 0, w, h);
+        ctx.restore();
+      }
+    };
 
     const paint = () => {
-      const rect = canvas.getBoundingClientRect();
-      const w = rect.width;
-      const h = rect.height;
+      if (animateSplit) {
+        const diff = targetCutRef.current - smoothCutRef.current;
+        smoothCutRef.current =
+          Math.abs(diff) < 0.0005 ? targetCutRef.current : smoothCutRef.current + diff * 0.12;
+      }
+
+      const { w, h, dpr } = sizeRef.current;
       if (w <= 0 || h <= 0) return;
 
-      const dpr = Math.min(3, window.devicePixelRatio || 1);
       const targetW = Math.round(w * dpr);
       const targetH = Math.round(h * dpr);
       if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -353,6 +541,12 @@ export function WaveformCanvas({
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
+
+      let cache = cacheRef.current;
+      if (!cache || cache.w !== w || cache.h !== h || cache.dpr !== dpr) {
+        cache = rebuildCache(w, h, dpr);
+      }
+
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
@@ -361,19 +555,14 @@ export function WaveformCanvas({
         durationSec > 0 ? Math.max(0, Math.min(1, getInterpolatedPositionSec() / durationSec)) : 0;
 
       if (splitOverlay) {
-        // 45-degree diagonal cut (leaning forward slash `/` across full lane height)
         const cutFrac = Math.max(0, Math.min(1, smoothCutRef.current));
         const cx = cutFrac * w;
         const dx = h * 0.5;
         const topX = cx + dx;
         const botX = cx - dx;
-        // Cap original mix waveform amplitude at ~70% of lane height
-        const mixPadY = h * 0.15;
 
         if (decoded) {
-          // Passed side of the 45-degree cut: ribbons that follow the waveform's own height
-          // at every x, split into N equal stem colours with 2px gaps of well colour.
-          if (stemColors.length > 0 && topX > 0) {
+          if (cache.ribbonsCanvas && topX > 0) {
             ctx.save();
             ctx.beginPath();
             ctx.moveTo(0, 0);
@@ -382,21 +571,10 @@ export function WaveformCanvas({
             ctx.lineTo(0, h);
             ctx.closePath();
             ctx.clip();
-
-            drawWaveformRibbons(ctx, {
-              peaks: decoded,
-              colors: stemColors,
-              x: 0,
-              y: 0,
-              width: w,
-              height: h,
-              paddingY: mixPadY,
-              gapPx: 2,
-            });
+            ctx.drawImage(cache.ribbonsCanvas, 0, 0, w, h);
             ctx.restore();
           }
 
-          // Ahead side of the 45-degree cut: plain original waveform (--ink played, --ink-3 unplayed, full opacity)
           ctx.save();
           ctx.beginPath();
           ctx.moveTo(topX, 0);
@@ -405,26 +583,12 @@ export function WaveformCanvas({
           ctx.lineTo(botX, h);
           ctx.closePath();
           ctx.clip();
-          drawWaveform(ctx, {
-            peaks: decoded,
-            color,
-            unplayedColor: ink3Color,
-            x: 0,
-            y: 0,
-            width: w,
-            height: h,
-            playFraction: playFrac,
-            audible: true,
-            paddingY: mixPadY,
-            filledPlayedAlpha: 1,
-            filledAheadAlpha: 1,
-          });
+          drawPlayheadSplit(ctx, cache, w, h, playFrac);
           ctx.restore();
         }
 
-        // 45-degree lamp cut line
         ctx.save();
-        ctx.strokeStyle = lampColor;
+        ctx.strokeStyle = cache.lampColor;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(botX, h);
@@ -432,97 +596,84 @@ export function WaveformCanvas({
         ctx.stroke();
         ctx.restore();
       } else if (decoded) {
-        const isMix = source === "mix";
-        drawWaveform(ctx, {
-          peaks: decoded,
-          color,
-          unplayedColor: isMix ? ink3Color : undefined,
-          x: 0,
-          y: 0,
-          width: w,
-          height: h,
-          playFraction: playFrac,
-          audible,
-          paddingY: isMix ? h * 0.15 : 7,
-          filledPlayedAlpha: 1,
-          filledAheadAlpha: isMix ? 1 : 0.55,
-        });
+        drawPlayheadSplit(ctx, cache, w, h, playFrac);
       }
 
       ctx.restore();
     };
 
-    paint();
+    paintRef.current = paint;
 
-    const ro = new ResizeObserver(paint);
-    ro.observe(canvas);
-    const unsubTicks = subscribePlaybackTicks(paint);
+    const syncSizeAndPaint = () => {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = Math.min(3, window.devicePixelRatio || 1);
+      sizeRef.current = { w: rect.width, h: rect.height, dpr };
+      paint();
+    };
 
-    let rafId = 0;
-    const reducedMotion =
-      typeof window !== "undefined" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const shouldAnimate = playing || (Boolean(splitOverlay?.animate) && !reducedMotion);
+    syncSizeAndPaint();
 
-    if (shouldAnimate) {
-      const loop = () => {
-        if (splitOverlay?.animate) {
-          const diff = targetCutRef.current - smoothCutRef.current;
-          smoothCutRef.current =
-            Math.abs(diff) < 0.0005 ? targetCutRef.current : smoothCutRef.current + diff * 0.12;
-        }
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const dpr = Math.min(3, window.devicePixelRatio || 1);
+      if (entry) {
+        sizeRef.current = {
+          w: entry.contentRect.width,
+          h: entry.contentRect.height,
+          dpr,
+        };
         paint();
-        rafId = requestAnimationFrame(loop);
-      };
-      rafId = requestAnimationFrame(loop);
-    }
+      } else {
+        syncSizeAndPaint();
+      }
+    });
+    ro.observe(canvas);
+
+    const unsubFrame = subscribePlaybackFrame(paint);
+    const releaseAnim = animateSplit ? acquirePlaybackAnimation() : null;
 
     return () => {
+      paintRef.current = () => {};
       ro.disconnect();
-      unsubTicks();
-      if (rafId) cancelAnimationFrame(rafId);
+      unsubFrame();
+      releaseAnim?.();
     };
-  }, [source, decoded, audible, durationSec, playing, splitOverlay]);
+  }, [source, decoded, audible, durationSec, splitOverlay]);
 
   return <canvas ref={canvasRef} className="lane__canvas" aria-hidden="true" />;
-}
+});
 
 interface PlayheadLineProps {
   durationSec: number;
-  playing: boolean;
+  playing?: boolean;
 }
 
-export function PlayheadLine({ durationSec, playing }: PlayheadLineProps) {
-  const lineRef = useRef<HTMLDivElement | null>(null);
+export const PlayheadLine = memo(function PlayheadLine({ durationSec }: PlayheadLineProps) {
+  const laneRef = useRef<HTMLDivElement | null>(null);
+  const lastValRef = useRef<string>("");
 
   useEffect(() => {
     const update = () => {
-      const el = lineRef.current;
+      const el = laneRef.current;
       if (!el) return;
       const frac =
         durationSec > 0 ? Math.max(0, Math.min(1, getInterpolatedPositionSec() / durationSec)) : 0;
-      el.style.setProperty("--playhead", `${(frac * 100).toFixed(4)}%`);
+      const next = frac.toFixed(5);
+      if (next !== lastValRef.current) {
+        lastValRef.current = next;
+        el.style.setProperty("--playhead", next);
+      }
     };
     update();
-    const unsub = subscribePlaybackTicks(update);
+    return subscribePlaybackFrame(update);
+  }, [durationSec]);
 
-    if (!playing) return unsub;
-
-    let rafId = 0;
-    const loop = () => {
-      update();
-      rafId = requestAnimationFrame(loop);
-    };
-    rafId = requestAnimationFrame(loop);
-
-    return () => {
-      unsub();
-      cancelAnimationFrame(rafId);
-    };
-  }, [durationSec, playing]);
-
-  return <div ref={lineRef} className="playhead" aria-hidden="true" />;
-}
+  return (
+    <div ref={laneRef} className="playhead-lane" aria-hidden="true">
+      <div className="playhead" />
+    </div>
+  );
+});
 
 export function useWellSeekHandlers(
   durationSec: number,
@@ -530,39 +681,50 @@ export function useWellSeekHandlers(
   onSeek: (positionSec: number) => void,
 ) {
   const draggingRef = useRef(false);
+  const rectRef = useRef<{ left: number; width: number }>({ left: 0, width: 1 });
+  const paramsRef = useRef({ durationSec, enabled, onSeek });
 
-  const seekFromEvent = (e: PointerEvent<HTMLElement>) => {
-    if (!enabled || durationSec <= 0) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
-    onSeek(frac * durationSec);
-  };
+  useEffect(() => {
+    paramsRef.current = { durationSec, enabled, onSeek };
+  }, [durationSec, enabled, onSeek]);
 
-  return {
-    onPointerDown: (e: PointerEvent<HTMLElement>) => {
-      if (!enabled || e.button !== 0) return;
-      e.preventDefault();
-      draggingRef.current = true;
-      e.currentTarget.setPointerCapture(e.pointerId);
-      seekFromEvent(e);
-    },
-    onPointerMove: (e: PointerEvent<HTMLElement>) => {
-      if (!draggingRef.current) return;
-      seekFromEvent(e);
-    },
-    onPointerUp: (e: PointerEvent<HTMLElement>) => {
-      if (!draggingRef.current) return;
-      draggingRef.current = false;
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-    },
-    onPointerCancel: (e: PointerEvent<HTMLElement>) => {
-      if (!draggingRef.current) return;
-      draggingRef.current = false;
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-    },
-  };
+  return useMemo(() => {
+    const seekFromClientX = (clientX: number) => {
+      const { durationSec: dur, enabled: en, onSeek: cb } = paramsRef.current;
+      if (!en || dur <= 0) return;
+      const rect = rectRef.current;
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      cb(frac * dur);
+    };
+
+    return {
+      onPointerDown: (e: PointerEvent<HTMLElement>) => {
+        if (!paramsRef.current.enabled || e.button !== 0) return;
+        e.preventDefault();
+        draggingRef.current = true;
+        const r = e.currentTarget.getBoundingClientRect();
+        rectRef.current = { left: r.left, width: r.width };
+        e.currentTarget.setPointerCapture(e.pointerId);
+        seekFromClientX(e.clientX);
+      },
+      onPointerMove: (e: PointerEvent<HTMLElement>) => {
+        if (!draggingRef.current) return;
+        seekFromClientX(e.clientX);
+      },
+      onPointerUp: (e: PointerEvent<HTMLElement>) => {
+        if (!draggingRef.current) return;
+        draggingRef.current = false;
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+      },
+      onPointerCancel: (e: PointerEvent<HTMLElement>) => {
+        if (!draggingRef.current) return;
+        draggingRef.current = false;
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+      },
+    };
+  }, []);
 }

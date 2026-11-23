@@ -987,23 +987,15 @@ fn read_pinned_bytes(
 
 /// Converts already-read checkpoint `bytes` into the weights file at
 /// `out_path`, verifying both the pinned upstream digest and the pinned
-/// weights digest before renaming into place.
-pub(crate) fn convert_checkpoint_bytes(
+/// Converts checkpoint `bytes` whose upstream size and SHA-256 have already
+/// been checked against `table.upstream`.
+pub(crate) fn convert_verified_checkpoint_bytes(
     bytes: &[u8],
     table: &TensorTable,
     out_path: &Path,
     progress: &dyn Progress,
 ) -> Result<()> {
     check_cancelled(progress)?;
-    require(
-        bytes.len() as u64 == table.upstream.size_bytes,
-        "checkpoint size differs from the pinned size",
-    )?;
-    require(
-        hex(&Sha256::digest(bytes)) == table.upstream.sha256,
-        "checkpoint SHA-256 differs from the pinned value",
-    )?;
-
     let mut checkpoint = Checkpoint::open(std::io::Cursor::new(bytes), bytes.len() as u64)?;
     let by_key: HashMap<String, TensorLocation> = checkpoint
         .tensors()
@@ -1091,7 +1083,7 @@ pub fn convert_checkpoint(
         digest == table.upstream.sha256,
         "checkpoint SHA-256 differs from the pinned value",
     )?;
-    convert_checkpoint_bytes(&bytes, table, out_path, progress)
+    convert_verified_checkpoint_bytes(&bytes, table, out_path, progress)
 }
 
 #[cfg(test)]

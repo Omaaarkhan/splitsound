@@ -12,7 +12,18 @@
 //     --platform linux-x64 --out release-artifacts
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,15 +66,44 @@ function keep(source, name) {
 }
 
 if (args.platform === "macos-arm64") {
-  keep(only("dmg", ".dmg"), `${base}.dmg`);
   const app = only("macos", ".app");
+  const macosDir = join(bundleDir, "macos");
+  const appName = app.split("/").pop();
+
+  // Build compressed DMG directly via hdiutil ULFO (skips Finder AppleScript UI layout).
+  const dmg = join(outDir, `${base}.dmg`);
+  const stageDir = mkdtempSync(join(tmpdir(), "splitsound-dmg-"));
+  try {
+    try {
+      execFileSync("cp", ["-cR", app, join(stageDir, appName)], { stdio: "inherit" });
+    } catch {
+      execFileSync("cp", ["-R", app, join(stageDir, appName)], { stdio: "inherit" });
+    }
+    symlinkSync("/Applications", join(stageDir, "Applications"));
+    execFileSync(
+      "hdiutil",
+      ["create", "-ov", "-volname", "SplitSound", "-format", "ULFO", "-srcfolder", stageDir, dmg],
+      { stdio: "inherit" },
+    );
+  } finally {
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+  console.log(`${base}.dmg  ${(statSync(dmg).size / 1_048_576).toFixed(1)} MB`);
+
   const archive = join(outDir, `${base}.app.tar.gz`);
   // Plain tar of the .app, without macOS resource-fork entries, which would
   // otherwise land inside the bundle on extraction and break its signature.
-  execFileSync("tar", ["--no-xattrs", "-czf", archive, "-C", join(bundleDir, "macos"), app.split("/").pop()], {
-    stdio: "inherit",
-    env: { ...process.env, COPYFILE_DISABLE: "1" },
-  });
+  execFileSync(
+    "sh",
+    [
+      "-c",
+      'if command -v pigz >/dev/null 2>&1; then tar --no-xattrs -cf - -C "$SRC_DIR" "$APP_NAME" | pigz -9 > "$ARCHIVE"; else tar --no-xattrs -czf "$ARCHIVE" -C "$SRC_DIR" "$APP_NAME"; fi',
+    ],
+    {
+      stdio: "inherit",
+      env: { ...process.env, COPYFILE_DISABLE: "1", SRC_DIR: macosDir, APP_NAME: appName, ARCHIVE: archive },
+    },
+  );
   console.log(`${base}.app.tar.gz  ${(statSync(archive).size / 1_048_576).toFixed(1)} MB`);
 } else if (args.platform === "linux-x64") {
   keep(only("appimage", ".AppImage"), `${base}.AppImage`);

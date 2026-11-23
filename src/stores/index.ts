@@ -108,8 +108,10 @@ export async function checkForUpdatesManually(): Promise<
 export async function openSongById(sessionId: string): Promise<void> {
   try {
     const defaultQuality = settingsStore.getState().settings.defaultQuality;
-    const session = await openSession(sessionId, defaultQuality);
-    await loadPlaybackSession(session.id);
+    await Promise.all([
+      openSession(sessionId, defaultQuality),
+      loadPlaybackSession(sessionId),
+    ]);
   } catch (err) {
     showNotice(formatIpcError(err), { tone: "error" });
   }
@@ -235,10 +237,8 @@ export async function retryInstrumentScan(): Promise<void> {
 }
 
 export async function bootstrapApp(): Promise<UnlistenFn> {
-  const unlisteners: UnlistenFn[] = [];
-
-  unlisteners.push(
-    await listen("library:changed", (sessions) => {
+  const unlisteners = await Promise.all([
+    listen("library:changed", (sessions) => {
       applyLibraryChanged(sessions);
       const current = sessionStore.getState().current;
       if (current && !sessions.some((s) => s.id === current.id)) {
@@ -246,10 +246,7 @@ export async function bootstrapApp(): Promise<UnlistenFn> {
       }
       void refreshAppInfo();
     }),
-  );
-
-  unlisteners.push(
-    await listen("session:updated", (session) => {
+    listen("session:updated", (session) => {
       const prev = sessionStore.getState();
       const wasDownloadingSplit =
         prev.current?.id === session.id &&
@@ -260,29 +257,17 @@ export async function bootstrapApp(): Promise<UnlistenFn> {
         showNotice(COPY.modelDownloadFailed, { tone: "error" });
       }
     }),
-  );
-
-  unlisteners.push(
-    await listen("split:progress", (progress) => {
+    listen("split:progress", (progress) => {
       applyLibraryProgress(progress);
       applySessionSplitProgress(progress);
     }),
-  );
-
-  unlisteners.push(
-    await listen("playback:state", (state) => {
+    listen("playback:state", (state) => {
       applyPlaybackState(state);
     }),
-  );
-
-  unlisteners.push(
-    await listen("playback:tick", (tick) => {
+    listen("playback:tick", (tick) => {
       applyPlaybackTick(tick);
     }),
-  );
-
-  unlisteners.push(
-    await listen("models:changed", (models) => {
+    listen("models:changed", (models) => {
       const { failedModelIds } = applyModelsChanged(models);
       if (failedModelIds.length > 0) {
         showNotice(COPY.modelDownloadFailed, { tone: "error" });
@@ -292,28 +277,19 @@ export async function bootstrapApp(): Promise<UnlistenFn> {
         void refreshSplitEstimate(cur.id);
       }
     }),
-  );
-
-  unlisteners.push(
-    await listen("models:progress", (progress) => {
+    listen("models:progress", (progress) => {
       applyModelProgress(progress);
     }),
-  );
-
-  unlisteners.push(
-    await listen("app:open-files", ({ paths }) => {
+    listen("app:open-files", ({ paths }) => {
       void importAudioPaths(paths);
     }),
-  );
-
-  unlisteners.push(
-    await listen("update:progress", (progress) => {
+    listen("update:progress", (progress) => {
       showNotice(formatUpdateProgressNotice(progress), {
         autoDismissMs: null,
         dismissLabel: null,
       });
     }),
-  );
+  ]);
 
   await Promise.all([refreshSettingsAndInfo(), refreshModels(), refreshLibrary()]);
 

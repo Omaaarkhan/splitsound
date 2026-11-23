@@ -1,11 +1,11 @@
-import { useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef } from "react";
 import type { Session } from "../ipc/contract";
-import { useStore } from "../stores/createStore";
+import { useShallowStore } from "../stores/createStore";
 import {
   getInterpolatedPositionSec,
   playbackStore,
   setMasterGain,
-  subscribePlaybackTicks,
+  subscribePlaybackFrame,
   toggleHearOriginal,
   toggleLoop,
   togglePlayback,
@@ -21,59 +21,65 @@ interface TransportBarProps {
   onOpenExport: () => void;
 }
 
-export function TransportBar({ session, onOpenExport }: TransportBarProps) {
-  const { playback } = useStore(playbackStore);
-  const { appInfo } = useStore(settingsStore);
+export const TransportBar = memo(function TransportBar({
+  session,
+  onOpenExport,
+}: TransportBarProps) {
+  const { playing, sessionId, positionSec, playbackDurationSec, loop, source, masterGainDb } =
+    useShallowStore(playbackStore, (s) => ({
+      playing: s.playback.playing,
+      sessionId: s.playback.sessionId,
+      positionSec: s.playback.positionSec,
+      playbackDurationSec: s.playback.durationSec,
+      loop: s.playback.loop,
+      source: s.playback.source,
+      masterGainDb: s.playback.masterGainDb,
+    }));
+  const { platform } = useShallowStore(settingsStore, (s) => ({
+    platform: s.appInfo.platform,
+  }));
   const posRef = useRef<HTMLSpanElement | null>(null);
+  const lastTextRef = useRef<string>("");
 
   const isReady = session.status === "ready";
-  const durationSec = playback.durationSec || session.track.durationSec;
-  const masterTip = tip(`Master volume (${formatDb(playback.masterGainDb)} dB)`, {
+  const durationSec = playbackDurationSec || session.track.durationSec;
+  const masterTip = tip(`Master volume (${formatDb(masterGainDb)} dB)`, {
     detail:
       "Overall volume for listening and mixdown export. Double-click to reset to 0 dB. Individual stem exports keep their original level.",
     placement: "top",
   });
 
+  const handleMasterChange = useCallback((db: number) => {
+    void setMasterGain(db);
+  }, []);
+
   useEffect(() => {
     const syncText = () => {
-      if (posRef.current) {
-        posRef.current.textContent = formatTimeTenths(getInterpolatedPositionSec());
+      if (!posRef.current) return;
+      const next = formatTimeTenths(getInterpolatedPositionSec());
+      if (next !== lastTextRef.current) {
+        lastTextRef.current = next;
+        posRef.current.textContent = next;
       }
     };
     syncText();
-    const unsub = subscribePlaybackTicks(syncText);
-
-    if (!playback.playing) {
-      return unsub;
-    }
-
-    let rafId = 0;
-    const frame = () => {
-      syncText();
-      rafId = requestAnimationFrame(frame);
-    };
-    rafId = requestAnimationFrame(frame);
-
-    return () => {
-      unsub();
-      cancelAnimationFrame(rafId);
-    };
-  }, [playback.playing, playback.sessionId, playback.positionSec]);
+    return subscribePlaybackFrame(syncText);
+  }, [playing, sessionId, positionSec]);
 
   return (
     <footer className="transport" aria-label="Playback controls">
       <button
         type="button"
         className="transport__play"
-        aria-label={playback.playing ? "Pause" : "Play"}
+        aria-label={playing ? "Pause" : "Play"}
         onClick={() => void togglePlayback()}
-        {...tip(playback.playing ? "Pause" : "Play", {
+        {...tip(playing ? "Pause" : "Play", {
           detail: "Left and Right arrows jump 5 seconds. Home jumps to the start.",
           shortcut: "Space",
           placement: "top",
         })}
       >
-        {playback.playing ? (
+        {playing ? (
           <svg
             className="transport__play-glyph"
             width="14"
@@ -98,18 +104,18 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
       </button>
 
       <div className="transport__time" aria-label="Playback position">
-        <span ref={posRef}>{formatTimeTenths(playback.positionSec)}</span>
+        <span ref={posRef}>{formatTimeTenths(positionSec)}</span>
         <span className="transport__total">/ {formatTime(durationSec)}</span>
       </div>
 
       <button
         type="button"
-        className={playback.loop ? "console-key console-key--selected" : "console-key"}
-        aria-pressed={playback.loop !== null}
+        className={loop ? "console-key console-key--selected" : "console-key"}
+        aria-pressed={loop !== null}
         onClick={() => void toggleLoop()}
-        {...tip(playback.loop ? "Turn off loop" : "Loop playback", {
-          detail: playback.loop
-            ? `Looping ${formatTime(playback.loop.startSec)} to ${formatTime(playback.loop.endSec)}. Drag handles on the timeline to resize.`
+        {...tip(loop ? "Turn off loop" : "Loop playback", {
+          detail: loop
+            ? `Looping ${formatTime(loop.startSec)} to ${formatTime(loop.endSec)}. Drag handles on the timeline to resize.`
             : "Repeats the whole song, or drag across the timeline above to loop a section.",
           placement: "top",
         })}
@@ -120,14 +126,12 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
       {isReady ? (
         <button
           type="button"
-          className={
-            playback.source === "original" ? "console-key console-key--lit" : "console-key"
-          }
-          aria-pressed={playback.source === "original"}
+          className={source === "original" ? "console-key console-key--lit" : "console-key"}
+          aria-pressed={source === "original"}
           onClick={() => void toggleHearOriginal()}
-          {...tip(playback.source === "original" ? "Return to stems" : "Hear original", {
+          {...tip(source === "original" ? "Return to stems" : "Hear original", {
             detail:
-              playback.source === "original"
+              source === "original"
                 ? "Switch back from the original song to your separated stems."
                 : "Temporarily switch to the untouched song to compare against your stems.",
             placement: "top",
@@ -142,9 +146,9 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
       <div className="transport__master" {...masterTip}>
         <span>Master</span>
         <Fader
-          valueDb={playback.masterGainDb}
+          valueDb={masterGainDb}
           label="Master level"
-          onChange={(db) => void setMasterGain(db)}
+          onChange={handleMasterChange}
           tooltip={masterTip}
         />
       </div>
@@ -156,7 +160,7 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
           onClick={onOpenExport}
           {...tip("Export stems", {
             detail: "Save individual stems or a custom mixdown as WAV, FLAC, or MP3.",
-            shortcut: formatModShortcut(appInfo.platform, "E"),
+            shortcut: formatModShortcut(platform, "E"),
             placement: "top",
           })}
         >
@@ -165,4 +169,4 @@ export function TransportBar({ session, onOpenExport }: TransportBarProps) {
       ) : null}
     </footer>
   );
-}
+});

@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { AppInfo, Session } from "../ipc/contract";
 import { formatModShortcut, tip } from "./primitives/Tooltip";
 import "./TopBar.css";
@@ -9,7 +10,12 @@ interface TopBarProps {
   onOpenSettings: () => void;
 }
 
-export function TopBar({ platform, session, onGoHome, onOpenSettings }: TopBarProps) {
+export const TopBar = memo(function TopBar({
+  platform,
+  session,
+  onGoHome,
+  onOpenSettings,
+}: TopBarProps) {
   const isMac = platform === "macos";
   const dragProps = isMac ? { "data-tauri-drag-region": true } : {};
 
@@ -75,4 +81,4 @@ export function TopBar({ platform, session, onGoHome, onOpenSettings }: TopBarPr
       </nav>
     </header>
   );
-}
+});

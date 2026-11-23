@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import type { SessionSummary, SplitProgress, StemId } from "../ipc/contract";
-import { useStore } from "../stores/createStore";
+import { useShallowStore } from "../stores/createStore";
 import { libraryStore, loadSessionArtwork } from "../stores/libraryStore";
 import { modelsStore } from "../stores/modelsStore";
 import { settingsStore } from "../stores/settingsStore";
@@ -100,7 +100,11 @@ function makeIllustrationPeaks(seed: number, kind: StemId | "mix", buckets: numb
   return { buckets, min, max };
 }
 
-function HomeIllustration({ draggingFiles }: { draggingFiles: boolean }) {
+const HomeIllustration = memo(function HomeIllustration({
+  draggingFiles,
+}: {
+  draggingFiles: boolean;
+}) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const peaksMap = useMemo(() => {
@@ -237,38 +241,59 @@ function HomeIllustration({ draggingFiles }: { draggingFiles: boolean }) {
       <canvas ref={canvasRef} className="home-drop__canvas" />
     </div>
   );
-}
+});
 
 interface LibraryRowProps {
   session: SessionSummary;
   artworkUrl: string | null | undefined;
   progress: SplitProgress | undefined;
-  onOpen: () => void;
-  onRequestRemove: () => void;
+  onOpenSession: (sessionId: string) => void;
+  onRequestRemove: (sessionId: string, title: string) => void;
 }
 
-function LibraryRow({ session, artworkUrl, progress, onOpen, onRequestRemove }: LibraryRowProps) {
+const LibraryRow = memo(function LibraryRow({
+  session,
+  artworkUrl,
+  progress,
+  onOpenSession,
+  onRequestRemove,
+}: LibraryRowProps) {
+  const rowRef = useRef<HTMLLIElement | null>(null);
   const fillRef = useRef<HTMLDivElement | null>(null);
   const pct = progress ? Math.round(progress.fraction * 100) : 0;
 
   useEffect(() => {
-    if (session.hasArtwork && artworkUrl === undefined) {
+    if (!session.hasArtwork || artworkUrl !== undefined) return;
+    const el = rowRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
       void loadSessionArtwork(session.id);
+      return;
     }
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          io.disconnect();
+          void loadSessionArtwork(session.id);
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
   }, [session.id, session.hasArtwork, artworkUrl]);
 
   useEffect(() => {
     const el = fillRef.current;
     if (el) {
-      el.style.setProperty("--progress", `${pct}%`);
+      el.style.setProperty("--progress", (pct / 100).toFixed(4));
     }
   }, [pct]);
 
   const isSplitting = session.status === "splitting" || session.status === "queued";
 
   return (
-    <li className="library-row">
-      <button type="button" className="library-row__main" onClick={onOpen}>
+    <li ref={rowRef} className="library-row">
+      <button type="button" className="library-row__main" onClick={() => onOpenSession(session.id)}>
         <span className="library-row__art" aria-hidden="true">
           {artworkUrl ? <img src={artworkUrl} alt="" /> : null}
         </span>
@@ -316,7 +341,7 @@ function LibraryRow({ session, artworkUrl, progress, onOpen, onRequestRemove }: 
           type="button"
           className="console-key console-key--compact library-row__remove"
           aria-label={`Remove ${session.title}`}
-          onClick={onRequestRemove}
+          onClick={() => onRequestRemove(session.id, session.title)}
           {...tip("Remove from library", {
             detail:
               "Deletes this song's separated stems from SplitSound. Your original file is not touched.",
@@ -328,17 +353,25 @@ function LibraryRow({ session, artworkUrl, progress, onOpen, onRequestRemove }: 
       </div>
     </li>
   );
-}
+});
 
-export function HomeView({
+export const HomeView = memo(function HomeView({
   draggingFiles,
   onChooseFile,
   onOpenSession,
   onRequestRemove,
 }: HomeViewProps) {
-  const { sessions, artworkById, progressById, loaded } = useStore(libraryStore);
-  const { models, loaded: modelsLoaded } = useStore(modelsStore);
-  const { appInfo } = useStore(settingsStore);
+  const { sessions, artworkById, progressById, loaded } = useShallowStore(libraryStore, (s) => ({
+    sessions: s.sessions,
+    artworkById: s.artworkById,
+    progressById: s.progressById,
+    loaded: s.loaded,
+  }));
+  const { models, modelsLoaded } = useShallowStore(modelsStore, (s) => ({
+    models: s.models,
+    modelsLoaded: s.loaded,
+  }));
+  const platform = useShallowStore(settingsStore, (s) => s.appInfo.platform);
 
   const firstRunBytes = modelsLoaded ? computeFirstRunDownloadBytes(models) : 0;
 
@@ -368,7 +401,7 @@ export function HomeView({
               onClick={onChooseFile}
               {...tip("Open an audio file", {
                 detail: "Or drag and drop a song anywhere on this window.",
-                shortcut: formatModShortcut(appInfo.platform, "O"),
+                shortcut: formatModShortcut(platform, "O"),
                 placement: "bottom",
               })}
             >
@@ -402,8 +435,8 @@ export function HomeView({
                   session={s}
                   artworkUrl={artworkById[s.id]}
                   progress={progressById[s.id]}
-                  onOpen={() => onOpenSession(s.id)}
-                  onRequestRemove={() => onRequestRemove(s.id, s.title)}
+                  onOpenSession={onOpenSession}
+                  onRequestRemove={onRequestRemove}
                 />
               ))}
             </ul>
@@ -412,4 +445,4 @@ export function HomeView({
       </section>
     </main>
   );
-}
+});

@@ -17,7 +17,12 @@ import {
 } from "../src/utils/format";
 import { createInitialModels } from "../src/ipc/mock/fixtures";
 import { dbToFaderFraction, faderFractionToDb, snapDb } from "../src/utils/fader";
-import { decodePeaks, encodePeaks } from "../src/utils/waveform";
+import {
+  decodePeaks,
+  decodeSessionPeaksBinary,
+  encodePeaks,
+  isDecodedPeaks,
+} from "../src/utils/waveform";
 import { sortStemsForDisplay } from "../src/utils/stems";
 import { COPY, formatIpcError } from "../src/utils/errors";
 import { MOCK_NOW_MS } from "../src/utils/clock";
@@ -119,10 +124,28 @@ describe("fader taper and peaks encoding", () => {
     const max = new Float32Array([0.5, 1, 0, 0.75]);
     const encoded = encodePeaks(min, max);
     const decoded = decodePeaks(encoded);
+    expect(isDecodedPeaks(encoded)).toBe(false);
+    expect(isDecodedPeaks(decoded)).toBe(true);
     expect(decoded.buckets).toBe(4);
     expect(decoded.min[1]).toBeCloseTo(-1, 2);
     expect(decoded.max[1]).toBeCloseTo(1, 2);
     expect(decoded.max[3]).toBeCloseTo(0.75, 1);
+
+    const enc = new TextEncoder();
+    const id = enc.encode("vocals");
+    const raw = Uint8Array.from(atob(encoded.data), (c) => c.charCodeAt(0));
+    const packet = new Uint8Array(1 + 1 + id.length + 4 + raw.length);
+    const dv = new DataView(packet.buffer);
+    packet[0] = 1;
+    packet[1] = id.length;
+    packet.set(id, 2);
+    dv.setUint32(2 + id.length, encoded.buckets, true);
+    packet.set(raw, 2 + id.length + 4);
+
+    const parsed = decodeSessionPeaksBinary(packet.buffer);
+    expect(parsed.vocals?.buckets).toBe(4);
+    expect(parsed.vocals?.min[1]).toBeCloseTo(-1, 2);
+    expect(parsed.vocals?.max[3]).toBeCloseTo(0.75, 1);
   });
 
   it("places absent stems at the bottom while preserving canonical order", () => {

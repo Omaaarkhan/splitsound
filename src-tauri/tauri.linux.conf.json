@@ -3,6 +3,14 @@
   "bundle": {
     "resources": {
       "resources/onnxruntime/libonnxruntime.so": "onnxruntime/libonnxruntime.so"
+    },
+    "linux": {
+      "rpm": {
+        "compression": {
+          "type": "zstd",
+          "level": 3
+        }
+      }
     }
   }
 }

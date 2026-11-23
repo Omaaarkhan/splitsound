@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent, type PointerEvent } from "react";
+import { memo, useEffect, useRef, type KeyboardEvent, type PointerEvent } from "react";
 import {
   dbToFaderFraction,
   FADER_MAX_DB,
@@ -19,9 +19,16 @@ interface FaderProps {
   tooltip?: TooltipAttrs;
 }
 
-export function Fader({ valueDb, label, onChange, className, tooltip }: FaderProps) {
+export const Fader = memo(function Fader({
+  valueDb,
+  label,
+  onChange,
+  className,
+  tooltip,
+}: FaderProps) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
+  const rectRef = useRef<{ left: number; width: number }>({ left: 0, width: 1 });
 
   const fraction = dbToFaderFraction(valueDb);
 
@@ -32,12 +39,25 @@ export function Fader({ valueDb, label, onChange, className, tooltip }: FaderPro
     }
   }, [fraction]);
 
-  const updateFromClientX = (clientX: number) => {
+  const measureRect = () => {
     const el = trackRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const usable = Math.max(1, rect.width - 10);
-    const raw = (clientX - rect.left - 5) / usable;
+    rectRef.current = { left: rect.left, width: rect.width };
+  };
+
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measureRect);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const updateFromClientX = (clientX: number) => {
+    const { left, width } = rectRef.current;
+    const usable = Math.max(1, width - 10);
+    const raw = (clientX - left - 5) / usable;
     const nextDb = faderFractionToDb(raw);
     if (nextDb !== valueDb) {
       onChange(nextDb);
@@ -47,6 +67,7 @@ export function Fader({ valueDb, label, onChange, className, tooltip }: FaderPro
   const handlePointerDown = (e: PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.preventDefault();
+    measureRect();
     draggingRef.current = true;
     e.currentTarget.setPointerCapture(e.pointerId);
     e.currentTarget.focus();
@@ -125,7 +146,11 @@ export function Fader({ valueDb, label, onChange, className, tooltip }: FaderPro
       onKeyDown={handleKeyDown}
       {...tooltip}
     >
-      <span className="fader__cap" aria-hidden="true" />
+      <span className="fader__rail" aria-hidden="true">
+        <span className="fader__glide">
+          <span className="fader__cap" />
+        </span>
+      </span>
     </div>
   );
-}
+});

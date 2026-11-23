@@ -51,7 +51,6 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
     "std",
     "load-dynamic",
     "api-22",
-    "coreml",
 ] }
 
 # Model store
@@ -72,3 +71,6 @@ flacenc = { version = "0.5", default-features = false }
 mp3lame-encoder = { version = "0.3", optional = true }
 
 thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["coreml"] }

@@ -155,6 +155,31 @@ impl MappedWav {
             .sum()
     }
 
+    /// Hints the OS to page in audio around `frame_offset` ahead of playback.
+    pub fn prefetch(&self, frame_offset: u64, frames: u64) {
+        #[cfg(unix)]
+        if let Storage::Mapped { map, offset, len } = &self.storage {
+            let total_bytes = *len * std::mem::size_of::<f32>();
+            let byte_off = (frame_offset as usize).saturating_mul(8).min(total_bytes);
+            let byte_len = (frames as usize)
+                .saturating_mul(8)
+                .min(total_bytes - byte_off);
+            if byte_len > 0 {
+                let _ = map.advise_range(memmap2::Advice::WillNeed, *offset + byte_off, byte_len);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (frame_offset, frames);
+    }
+
+    /// Hints the OS page cache that this mapping will be read sequentially.
+    pub fn advise_sequential(&self) {
+        #[cfg(unix)]
+        if let Storage::Mapped { map, .. } = &self.storage {
+            let _ = map.advise(memmap2::Advice::Sequential);
+        }
+    }
+
     /// Wraps samples already in memory (tests, synthetic sources).
     pub fn from_samples(samples: Vec<f32>) -> Self {
         let frames = (samples.len() / 2) as u64;

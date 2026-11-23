@@ -1,10 +1,24 @@
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import { isTauriRuntime, type UnlistenFn } from "./client";
 import { AUDIO_EXTENSIONS } from "../utils/stems";
 
+interface DialogOpenOptions {
+  title?: string;
+  directory?: boolean;
+  multiple?: boolean;
+  defaultPath?: string;
+  canCreateDirectories?: boolean;
+  filters?: { name: string; extensions: string[] }[];
+}
+
+async function openNativeDialog(options: DialogOpenOptions): Promise<string | string[] | null> {
+  return tauriInvoke<string | string[] | null>("plugin:dialog|open", { options });
+}
+
 export async function pickAudioFiles(): Promise<string[]> {
   if (isTauriRuntime()) {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
+    const selected = await openNativeDialog({
       title: "Choose a song",
       multiple: true,
       filters: [{ name: "Audio", extensions: [...AUDIO_EXTENSIONS] }],
@@ -35,8 +49,7 @@ export async function pickAudioFiles(): Promise<string[]> {
 
 export async function pickDirectory(defaultPath?: string | null): Promise<string | null> {
   if (isTauriRuntime()) {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
+    const selected = await openNativeDialog({
       title: "Choose export folder",
       directory: true,
       multiple: false,
@@ -58,8 +71,7 @@ export async function pickDirectory(defaultPath?: string | null): Promise<string
 
 export async function pickAnyFiles(): Promise<string[]> {
   if (isTauriRuntime()) {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
+    const selected = await openNativeDialog({
       title: "Add model files",
       multiple: true,
     });
@@ -94,20 +106,23 @@ export interface FileDropHandlers {
 
 export async function subscribeWindowFileDrop(handlers: FileDropHandlers): Promise<UnlistenFn> {
   if (isTauriRuntime()) {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    return getCurrentWindow().onDragDropEvent((event) => {
-      const payload = event.payload;
-      if (payload.type === "enter" || payload.type === "over") {
-        handlers.onDragEnter();
-      } else if (payload.type === "leave") {
+    const unlisteners = await Promise.all([
+      tauriListen("tauri://drag-enter", () => handlers.onDragEnter()),
+      tauriListen("tauri://drag-over", () => handlers.onDragEnter()),
+      tauriListen("tauri://drag-leave", () => handlers.onDragLeave()),
+      tauriListen<{ paths?: string[] }>("tauri://drag-drop", (event) => {
         handlers.onDragLeave();
-      } else if (payload.type === "drop") {
-        handlers.onDragLeave();
-        if (payload.paths.length > 0) {
-          handlers.onDrop(payload.paths);
+        const paths = event.payload?.paths ?? [];
+        if (paths.length > 0) {
+          handlers.onDrop(paths);
         }
+      }),
+    ]);
+    return () => {
+      for (const unlisten of unlisteners) {
+        unlisten();
       }
-    });
+    };
   }
 
   let depth = 0;

@@ -5,11 +5,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rfd::FileDialog;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tauri::plugin::{Builder, Plugin, TauriPlugin};
+use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{Runtime, State, Window};
-use tauri_plugin_dialog::{DialogExt, FilePath};
 
 use crate::app::dunce_canonicalize;
 use crate::ipc::{ErrorCode, IpcError, IpcResult};
@@ -114,42 +114,71 @@ async fn open<R: Runtime>(
     picked: State<'_, PickedPaths>,
     options: Options,
 ) -> IpcResult<Value> {
-    let mut dialog = window.dialog().file();
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        dialog = dialog.set_parent(&window);
-    }
-    if let Some(title) = options.title {
-        dialog = dialog.set_title(title);
-    }
-    if let Some(path) = options.default_path
-        && let Ok(dir) = picked.check(&path, true)
-    {
-        dialog = dialog.set_directory(dir);
-    }
-    if let Some(can_create) = options.can_create_directories {
-        dialog = dialog.set_can_create_directories(can_create);
-    }
-    for filter in options.filters {
-        let extensions: Vec<_> = filter.extensions.iter().map(String::as_str).collect();
-        dialog = dialog.add_filter(filter.name, &extensions);
-    }
     let directory = options.directory;
     let multiple = options.multiple;
-    let selection = tauri::async_runtime::spawn_blocking(move || match (directory, multiple) {
-        (true, true) => dialog.blocking_pick_folders(),
-        (true, false) => dialog.blocking_pick_folder().map(|p| vec![p]),
-        (false, true) => dialog.blocking_pick_files(),
-        (false, false) => dialog.blocking_pick_file().map(|p| vec![p]),
-    })
-    .await
-    .map_err(|_| IpcError::internal("Couldn't open the file picker."))?;
+    let default_dir = options
+        .default_path
+        .as_deref()
+        .and_then(|p| picked.check(p, true).ok());
+    let title = options.title;
+    let can_create = options.can_create_directories;
+    let filters = options.filters;
+
+    let run_dialog = move |parent: &Window<R>| -> Option<Vec<PathBuf>> {
+        let mut dialog = FileDialog::new();
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            dialog = dialog.set_parent(parent);
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = parent;
+        if let Some(title) = title {
+            dialog = dialog.set_title(title);
+        }
+        if let Some(dir) = default_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(can_create) = can_create {
+            dialog = dialog.set_can_create_directories(can_create);
+        }
+        for filter in filters {
+            let extensions: Vec<_> = filter.extensions.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter(filter.name, &extensions);
+        }
+        match (directory, multiple) {
+            (true, true) => dialog.pick_folders(),
+            (true, false) => dialog.pick_folder().map(|p| vec![p]),
+            (false, true) => dialog.pick_files(),
+            (false, false) => dialog.pick_file().map(|p| vec![p]),
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let selection = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let win = window.clone();
+        window
+            .run_on_main_thread(move || {
+                let _ = tx.send(run_dialog(&win));
+            })
+            .map_err(|_| IpcError::internal("Couldn't open the file picker."))?;
+        tauri::async_runtime::spawn_blocking(move || rx.recv())
+            .await
+            .map_err(|_| IpcError::internal("Couldn't open the file picker."))?
+            .map_err(|_| IpcError::internal("Couldn't open the file picker."))?
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let selection = tauri::async_runtime::spawn_blocking(move || run_dialog(&window))
+        .await
+        .map_err(|_| IpcError::internal("Couldn't open the file picker."))?;
+
     let Some(selection) = selection else {
         return Ok(Value::Null);
     };
     let paths: Vec<_> = selection
         .into_iter()
-        .filter_map(|p: FilePath| picked.grant(&p.into_path().ok()?, directory))
+        .filter_map(|p| picked.grant(&p, directory))
         .collect();
     Ok(if multiple {
         json!(paths)
@@ -162,7 +191,6 @@ async fn open<R: Runtime>(
 /// paths returned by the native picker. No other dialog IPC is exposed.
 pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("dialog")
-        .setup(|app, _| tauri_plugin_dialog::init().initialize(app, Value::Null))
         .invoke_handler(tauri::generate_handler![open])
         .build()
 }

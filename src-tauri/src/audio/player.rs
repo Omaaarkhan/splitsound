@@ -35,9 +35,11 @@ use crate::ipc::{
 use crate::util::lock;
 
 /// Frames (at the device rate) rendered per block.
-const BLOCK: usize = 256;
+const BLOCK: usize = 128;
 /// How far ahead of the device the mixer renders.
-const AHEAD_MS: usize = 50;
+const AHEAD_MS: usize = 18;
+/// Window (~0.75 s at 44.1 kHz) prefetched ahead of active playback/seeks.
+const PREFETCH_FRAMES: u64 = 32_768;
 const TICK_EVERY: Duration = Duration::from_millis(33);
 const MAX_METERS: usize = mixer::MAX_CHANNELS + 1;
 /// How long synchronous unload/detach waits for the mixer thread to drop its
@@ -71,7 +73,7 @@ enum MixerCmd {
     Sync(Sender<()>),
     Play,
     Pause,
-    Seek(u64),
+    Seek(u64, u64),
     Channel(usize, ChannelParams),
     Master(f64),
     Original(bool),
@@ -96,6 +98,9 @@ struct Shared {
     state: Mutex<PlayerState>,
     /// Song position (44.1 kHz frames) of what the listener hears now.
     heard: AtomicU64,
+    /// Monotonic counter bumped on every seek so retiring pre-seek blocks
+    /// never snaps `heard` or emitted ticks backwards.
+    seek_epoch: AtomicU64,
     events: Arc<dyn EventSink>,
     activity: Arc<ActivityFlag>,
 }
@@ -118,8 +123,8 @@ impl Shared {
         s
     }
 
-    fn emit_state(&self, st: &PlaybackState) {
-        self.events.emit(AppEvent::PlaybackState(self.snapshot(st)));
+    fn emit_snapshot(&self, st: PlaybackState) {
+        self.events.emit(AppEvent::PlaybackState(st));
     }
 }
 
@@ -192,6 +197,7 @@ impl Player {
                 absent: Vec::new(),
             }),
             heard: AtomicU64::new(0),
+            seek_epoch: AtomicU64::new(0),
             events,
             activity: Arc::new(ActivityFlag::default()),
         });
@@ -276,55 +282,64 @@ impl Player {
     /// otherwise.
     pub fn load(&self, session: &Session, dir: &Path) -> IpcResult<PlaybackState> {
         let audio = Self::open_audio(session, dir)?;
+        audio.mix.prefetch(0, PREFETCH_FRAMES);
+        for (_, w) in &audio.stems {
+            w.prefetch(0, PREFETCH_FRAMES);
+        }
         let frames = audio.mix.frames();
-        let mut inner = lock(&self.shared.state);
-        let has_stems = !audio.stems.is_empty();
-        let mut new_absent = Vec::new();
-        let channels: Vec<ChannelState> = audio
-            .stems
-            .iter()
-            .map(|(id, _)| {
-                let sid = SourceId::from(*id);
-                let present = stem_is_present(session, *id);
-                if !present {
-                    new_absent.push(sid);
-                }
-                ChannelState {
-                    id: sid,
-                    gain_db: 0.0,
-                    muted: !present,
-                    solo: false,
-                }
-            })
-            .collect();
-        inner.auto_muted = new_absent.clone();
-        inner.absent = new_absent;
-        let next = PlaybackState {
-            session_id: Some(session.id.clone()),
-            playing: false,
-            position_sec: 0.0,
-            duration_sec: frames as f64 / RATE as f64,
-            source: if has_stems {
-                PlaybackSource::Stems
-            } else {
-                PlaybackSource::Original
-            },
-            loop_range: None,
-            master_gain_db: inner.playback.master_gain_db,
-            channels,
+        let snap = {
+            let mut inner = lock(&self.shared.state);
+            let has_stems = !audio.stems.is_empty();
+            let mut new_absent = Vec::new();
+            let channels: Vec<ChannelState> = audio
+                .stems
+                .iter()
+                .map(|(id, _)| {
+                    let sid = SourceId::from(*id);
+                    let present = stem_is_present(session, *id);
+                    if !present {
+                        new_absent.push(sid);
+                    }
+                    ChannelState {
+                        id: sid,
+                        gain_db: 0.0,
+                        muted: !present,
+                        solo: false,
+                    }
+                })
+                .collect();
+            inner.auto_muted = new_absent.clone();
+            inner.absent = new_absent;
+            let next = PlaybackState {
+                session_id: Some(session.id.clone()),
+                playing: false,
+                position_sec: 0.0,
+                duration_sec: frames as f64 / RATE as f64,
+                source: if has_stems {
+                    PlaybackSource::Stems
+                } else {
+                    PlaybackSource::Original
+                },
+                loop_range: None,
+                master_gain_db: inner.playback.master_gain_db,
+                channels,
+            };
+            let init = MixerInit {
+                channels: next.channels.iter().map(params_of).collect(),
+                master_db: next.master_gain_db,
+                original: !has_stems,
+                loop_frames: None,
+                position: 0,
+            };
+            inner.playback = next;
+            self.shared.heard.store(0, Ordering::Relaxed);
+            self.shared.seek_epoch.fetch_add(1, Ordering::Release);
+            let snap = self.shared.snapshot(&inner.playback);
+            self.send(MixerCmd::Load(Box::new(audio), init));
+            snap
         };
-        let init = MixerInit {
-            channels: next.channels.iter().map(params_of).collect(),
-            master_db: next.master_gain_db,
-            original: !has_stems,
-            loop_frames: None,
-            position: 0,
-        };
-        inner.playback = next;
-        self.shared.heard.store(0, Ordering::Relaxed);
-        self.send(MixerCmd::Load(Box::new(audio), init));
-        self.shared.emit_state(&inner.playback);
-        Ok(self.shared.snapshot(&inner.playback))
+        self.shared.emit_snapshot(snap.clone());
+        Ok(snap)
     }
 
     fn wait_ack(rx: Receiver<()>, timeout: Duration) -> IpcResult<()> {
@@ -341,20 +356,26 @@ impl Player {
 
     fn unload_with_timeout(&self, timeout: Duration) -> IpcResult<()> {
         let (tx, rx) = mpsc::channel();
-        {
+        let to_emit = {
             let mut inner = lock(&self.shared.state);
             if inner.playback.session_id.is_some() {
                 inner.playback = empty_state(inner.playback.master_gain_db);
                 inner.auto_muted.clear();
                 inner.absent.clear();
                 self.shared.heard.store(0, Ordering::Relaxed);
+                self.shared.seek_epoch.fetch_add(1, Ordering::Release);
+                let snap = self.shared.snapshot(&inner.playback);
                 self.send(MixerCmd::Unload(Some(tx)));
-                self.shared.emit_state(&inner.playback);
+                Some(snap)
             } else {
                 // Fence behind any earlier Load/Unload so no mapping is still
                 // being dropped on the mixer thread when we return.
                 self.send(MixerCmd::Sync(tx));
+                None
             }
+        };
+        if let Some(snap) = to_emit {
+            self.shared.emit_snapshot(snap);
         }
         // Wait (without holding the state lock) until the files are unmapped.
         Self::wait_ack(rx, timeout)
@@ -371,21 +392,27 @@ impl Player {
     /// are guaranteed to be dropped before this returns.
     pub fn unload_if(&self, session_id: &str) -> IpcResult<()> {
         let (tx, rx) = mpsc::channel();
-        {
+        let to_emit = {
             let mut inner = lock(&self.shared.state);
             if inner.playback.session_id.as_deref() == Some(session_id) {
                 inner.playback = empty_state(inner.playback.master_gain_db);
                 inner.auto_muted.clear();
                 inner.absent.clear();
                 self.shared.heard.store(0, Ordering::Relaxed);
+                self.shared.seek_epoch.fetch_add(1, Ordering::Release);
+                let snap = self.shared.snapshot(&inner.playback);
                 self.send(MixerCmd::Unload(Some(tx)));
-                self.shared.emit_state(&inner.playback);
+                Some(snap)
             } else {
                 // Another session may have just replaced `session_id` via
                 // `load`; wait for the mixer thread to apply that Load and
                 // drop `session_id`'s old `SessionAudio`.
                 self.send(MixerCmd::Sync(tx));
+                None
             }
+        };
+        if let Some(snap) = to_emit {
+            self.shared.emit_snapshot(snap);
         }
         Self::wait_ack(rx, UNLOAD_TIMEOUT)
     }
@@ -397,21 +424,26 @@ impl Player {
     /// [`Player::reattach`].
     pub fn detach(&self, session_id: &str) -> IpcResult<bool> {
         let (tx, rx) = mpsc::channel();
-        let was_loaded = {
+        let (was_loaded, to_emit) = {
             let mut inner = lock(&self.shared.state);
             let st = &mut inner.playback;
             if st.session_id.as_deref() == Some(session_id) {
                 self.send(MixerCmd::Unload(Some(tx)));
-                if st.playing {
+                let snap = if st.playing {
                     st.playing = false;
-                    self.shared.emit_state(st);
-                }
-                true
+                    Some(self.shared.snapshot(st))
+                } else {
+                    None
+                };
+                (true, snap)
             } else {
                 self.send(MixerCmd::Sync(tx));
-                false
+                (false, None)
             }
         };
+        if let Some(snap) = to_emit {
+            self.shared.emit_snapshot(snap);
+        }
         Self::wait_ack(rx, UNLOAD_TIMEOUT)?;
         Ok(was_loaded)
     }
@@ -429,93 +461,97 @@ impl Player {
                 return;
             }
         };
-        let mut inner = lock(&self.shared.state);
-        if inner.playback.session_id.as_deref() != Some(session.id.as_str()) {
-            return;
-        }
-        let prev_auto = std::mem::take(&mut inner.auto_muted);
-        let prev_absent = std::mem::take(&mut inner.absent);
-        let old = std::mem::take(&mut inner.playback.channels);
-        let mut new_auto = Vec::new();
-        let mut new_absent = Vec::new();
-        inner.playback.channels = audio
-            .stems
-            .iter()
-            .map(|(id, _)| {
-                let sid = SourceId::from(*id);
-                let present = stem_is_present(session, *id);
-                let prev = old.iter().find(|c| c.id == sid);
-                let was_auto = prev_auto.contains(&sid);
-                let was_absent = prev_absent.contains(&sid);
-                if !present {
-                    new_absent.push(sid);
-                    if was_absent && !was_auto {
-                        prev.cloned().unwrap_or(ChannelState {
-                            id: sid,
-                            gain_db: 0.0,
-                            muted: true,
-                            solo: false,
-                        })
-                    } else if !was_absent && prev.is_some_and(|p| p.muted) {
-                        // Keep a manual mute set while the stem was present so a
-                        // later re-split finding it present does not unmute it.
-                        ChannelState {
-                            id: sid,
-                            gain_db: prev.map_or(0.0, |c| c.gain_db),
-                            muted: true,
-                            solo: false,
+        let snap = {
+            let mut inner = lock(&self.shared.state);
+            if inner.playback.session_id.as_deref() != Some(session.id.as_str()) {
+                return;
+            }
+            let prev_auto = std::mem::take(&mut inner.auto_muted);
+            let prev_absent = std::mem::take(&mut inner.absent);
+            let old = std::mem::take(&mut inner.playback.channels);
+            let mut new_auto = Vec::new();
+            let mut new_absent = Vec::new();
+            inner.playback.channels = audio
+                .stems
+                .iter()
+                .map(|(id, _)| {
+                    let sid = SourceId::from(*id);
+                    let present = stem_is_present(session, *id);
+                    let prev = old.iter().find(|c| c.id == sid);
+                    let was_auto = prev_auto.contains(&sid);
+                    let was_absent = prev_absent.contains(&sid);
+                    if !present {
+                        new_absent.push(sid);
+                        if was_absent && !was_auto {
+                            prev.cloned().unwrap_or(ChannelState {
+                                id: sid,
+                                gain_db: 0.0,
+                                muted: true,
+                                solo: false,
+                            })
+                        } else if !was_absent && prev.is_some_and(|p| p.muted) {
+                            // Keep a manual mute set while the stem was present so a
+                            // later re-split finding it present does not unmute it.
+                            ChannelState {
+                                id: sid,
+                                gain_db: prev.map_or(0.0, |c| c.gain_db),
+                                muted: true,
+                                solo: false,
+                            }
+                        } else {
+                            new_auto.push(sid);
+                            ChannelState {
+                                id: sid,
+                                gain_db: prev.map_or(0.0, |c| c.gain_db),
+                                muted: true,
+                                solo: false,
+                            }
                         }
                     } else {
-                        new_auto.push(sid);
-                        ChannelState {
-                            id: sid,
-                            gain_db: prev.map_or(0.0, |c| c.gain_db),
-                            muted: true,
-                            solo: false,
-                        }
-                    }
-                } else {
-                    match prev {
-                        Some(p) => {
-                            let mut ch = p.clone();
-                            if was_auto {
-                                ch.muted = false;
+                        match prev {
+                            Some(p) => {
+                                let mut ch = p.clone();
+                                if was_auto {
+                                    ch.muted = false;
+                                }
+                                ch
                             }
-                            ch
+                            None => ChannelState {
+                                id: sid,
+                                gain_db: 0.0,
+                                muted: false,
+                                solo: false,
+                            },
                         }
-                        None => ChannelState {
-                            id: sid,
-                            gain_db: 0.0,
-                            muted: false,
-                            solo: false,
-                        },
                     }
-                }
-            })
-            .collect();
-        inner.auto_muted = new_auto;
-        inner.absent = new_absent;
-        let st = &mut inner.playback;
-        if st.channels.is_empty() {
-            st.source = PlaybackSource::Original;
-        } else if old.is_empty() {
-            // First split of a song that was loaded (whether paused or playing):
-            // switch to the stems so playback controls apply immediately.
-            st.source = PlaybackSource::Stems;
-        }
-        st.duration_sec = audio.mix.frames() as f64 / RATE as f64;
-        let init = MixerInit {
-            channels: st.channels.iter().map(params_of).collect(),
-            master_db: st.master_gain_db,
-            original: st.source == PlaybackSource::Original,
-            loop_frames: loop_frames(st.loop_range),
-            position: self.shared.heard.load(Ordering::Relaxed),
+                })
+                .collect();
+            inner.auto_muted = new_auto;
+            inner.absent = new_absent;
+            let st = &mut inner.playback;
+            if st.channels.is_empty() {
+                st.source = PlaybackSource::Original;
+            } else if old.is_empty() {
+                // First split of a song that was loaded (whether paused or playing):
+                // switch to the stems so playback controls apply immediately.
+                st.source = PlaybackSource::Stems;
+            }
+            st.duration_sec = audio.mix.frames() as f64 / RATE as f64;
+            let init = MixerInit {
+                channels: st.channels.iter().map(params_of).collect(),
+                master_db: st.master_gain_db,
+                original: st.source == PlaybackSource::Original,
+                loop_frames: loop_frames(st.loop_range),
+                position: self.shared.heard.load(Ordering::Relaxed),
+            };
+            let snap = self.shared.snapshot(st);
+            // No `Play` here: a playing mixer keeps playing across the swap, and
+            // one that already rendered to the end must not restart while its
+            // tail is still draining to the device.
+            self.send(MixerCmd::Reattach(Box::new(audio), init));
+            snap
         };
-        // No `Play` here: a playing mixer keeps playing across the swap, and
-        // one that already rendered to the end must not restart while its
-        // tail is still draining to the device.
-        self.send(MixerCmd::Reattach(Box::new(audio), init));
-        self.shared.emit_state(st);
+        self.shared.emit_snapshot(snap);
     }
 
     fn require_loaded(st: &PlaybackState) -> IpcResult<()> {
@@ -533,53 +569,71 @@ impl Player {
         self.device()
             .ensure_open(Duration::from_secs(4))
             .map_err(|m| IpcError::new(ErrorCode::AudioDevice, m))?;
-        let mut inner = lock(&self.shared.state);
-        let st = &mut inner.playback;
-        Self::require_loaded(st)?;
-        if st.playing {
-            return Ok(());
-        }
-        st.playing = true;
-        // Playing from the very end restarts (the mixer does the same).
-        let heard = self.shared.heard.load(Ordering::Relaxed);
-        if heard >= sec_to_frames(st.duration_sec) {
-            let start = st.loop_range.map_or(0, |l| sec_to_frames(l.start_sec));
-            self.shared.heard.store(start, Ordering::Relaxed);
-        }
-        self.send(MixerCmd::Play);
-        self.shared.emit_state(st);
+        let to_emit = {
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
+            Self::require_loaded(st)?;
+            if st.playing {
+                return Ok(());
+            }
+            st.playing = true;
+            // Playing from the very end restarts (the mixer does the same).
+            let heard = self.shared.heard.load(Ordering::Relaxed);
+            if heard >= sec_to_frames(st.duration_sec) {
+                let start = st.loop_range.map_or(0, |l| sec_to_frames(l.start_sec));
+                self.shared.heard.store(start, Ordering::Relaxed);
+            }
+            let snap = self.shared.snapshot(st);
+            self.send(MixerCmd::Play);
+            snap
+        };
+        self.shared.emit_snapshot(to_emit);
         Ok(())
     }
 
     pub fn pause(&self) {
-        let mut inner = lock(&self.shared.state);
-        let st = &mut inner.playback;
-        if st.playing {
-            st.playing = false;
-            self.send(MixerCmd::Pause);
-            self.shared.emit_state(st);
+        let to_emit = {
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
+            if st.playing {
+                st.playing = false;
+                let snap = self.shared.snapshot(st);
+                self.send(MixerCmd::Pause);
+                Some(snap)
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = to_emit {
+            self.shared.emit_snapshot(snap);
         }
     }
 
     pub fn seek(&self, position_sec: f64) -> IpcResult<()> {
-        let inner = lock(&self.shared.state);
-        let st = &inner.playback;
-        Self::require_loaded(st)?;
-        let sec = if position_sec.is_finite() {
-            position_sec.clamp(0.0, st.duration_sec)
-        } else {
-            0.0
-        };
-        let frames = sec_to_frames(sec);
-        self.send(MixerCmd::Seek(frames));
-        if !st.playing {
+        let tick = {
+            let inner = lock(&self.shared.state);
+            let st = &inner.playback;
+            Self::require_loaded(st)?;
+            let sec = if position_sec.is_finite() {
+                position_sec.clamp(0.0, st.duration_sec)
+            } else {
+                0.0
+            };
+            let frames = sec_to_frames(sec);
+            let epoch = self.shared.seek_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             self.shared.heard.store(frames, Ordering::Relaxed);
-            self.shared
-                .events
-                .emit(AppEvent::PlaybackTick(PlaybackTick {
+            self.send(MixerCmd::Seek(frames, epoch));
+            if !st.playing {
+                Some(PlaybackTick {
                     position_sec: sec,
                     levels: zero_levels(st),
-                }));
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(tick) = tick {
+            self.shared.events.emit(AppEvent::PlaybackTick(tick));
         }
         Ok(())
     }
@@ -591,78 +645,94 @@ impl Player {
         muted: Option<bool>,
         solo: Option<bool>,
     ) -> IpcResult<()> {
-        let mut inner = lock(&self.shared.state);
-        Self::require_loaded(&inner.playback)?;
-        let Some(index) = inner.playback.channels.iter().position(|c| c.id == id) else {
-            return Err(IpcError::not_found(
-                "That stem isn't part of the loaded song.",
-            ));
+        let snap = {
+            let mut inner = lock(&self.shared.state);
+            Self::require_loaded(&inner.playback)?;
+            let Some(index) = inner.playback.channels.iter().position(|c| c.id == id) else {
+                return Err(IpcError::not_found(
+                    "That stem isn't part of the loaded song.",
+                ));
+            };
+            if muted.is_some() || solo.is_some() {
+                inner.auto_muted.retain(|&s| s != id);
+            }
+            let st = &mut inner.playback;
+            let ch = &mut st.channels[index];
+            if let Some(g) = gain_db {
+                ch.gain_db = mixer::clamp_db(g);
+            }
+            match (muted, solo) {
+                (Some(true), Some(true)) => {
+                    ch.solo = true;
+                    ch.muted = false;
+                }
+                (Some(m), Some(s)) => {
+                    ch.muted = m;
+                    ch.solo = s;
+                }
+                (Some(true), None) => {
+                    ch.muted = true;
+                    ch.solo = false;
+                }
+                (Some(false), None) => {
+                    ch.muted = false;
+                }
+                (None, Some(true)) => {
+                    ch.solo = true;
+                    ch.muted = false;
+                }
+                (None, Some(false)) => {
+                    ch.solo = false;
+                }
+                (None, None) => {}
+            }
+            let p = params_of(ch);
+            let switched = st.source == PlaybackSource::Original;
+            if switched {
+                st.source = PlaybackSource::Stems;
+            }
+            let snap = self.shared.snapshot(st);
+            self.send(MixerCmd::Channel(index, p));
+            if switched {
+                self.send(MixerCmd::Original(false));
+            }
+            snap
         };
-        if muted.is_some() || solo.is_some() {
-            inner.auto_muted.retain(|&s| s != id);
-        }
-        let st = &mut inner.playback;
-        let ch = &mut st.channels[index];
-        if let Some(g) = gain_db {
-            ch.gain_db = mixer::clamp_db(g);
-        }
-        match (muted, solo) {
-            (Some(true), Some(true)) => {
-                ch.solo = true;
-                ch.muted = false;
-            }
-            (Some(m), Some(s)) => {
-                ch.muted = m;
-                ch.solo = s;
-            }
-            (Some(true), None) => {
-                ch.muted = true;
-                ch.solo = false;
-            }
-            (Some(false), None) => {
-                ch.muted = false;
-            }
-            (None, Some(true)) => {
-                ch.solo = true;
-                ch.muted = false;
-            }
-            (None, Some(false)) => {
-                ch.solo = false;
-            }
-            (None, None) => {}
-        }
-        let p = params_of(ch);
-        let switched = st.source == PlaybackSource::Original;
-        if switched {
-            st.source = PlaybackSource::Stems;
-        }
-        self.send(MixerCmd::Channel(index, p));
-        if switched {
-            self.send(MixerCmd::Original(false));
-        }
-        self.shared.emit_state(st);
+        self.shared.emit_snapshot(snap);
         Ok(())
     }
 
     pub fn set_master(&self, gain_db: f64) {
-        let mut inner = lock(&self.shared.state);
-        let st = &mut inner.playback;
-        st.master_gain_db = mixer::clamp_db(gain_db);
-        self.send(MixerCmd::Master(st.master_gain_db));
-        self.shared.emit_state(st);
+        let snap = {
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
+            st.master_gain_db = mixer::clamp_db(gain_db);
+            let snap = self.shared.snapshot(st);
+            self.send(MixerCmd::Master(st.master_gain_db));
+            snap
+        };
+        self.shared.emit_snapshot(snap);
     }
 
     pub fn set_source(&self, source: PlaybackSource) -> IpcResult<()> {
-        let mut inner = lock(&self.shared.state);
-        let st = &mut inner.playback;
-        Self::require_loaded(st)?;
-        if source == PlaybackSource::Stems && st.channels.is_empty() {
-            return Err(IpcError::not_found("This song hasn't been split yet."));
-        }
-        if st.source != source {
-            st.source = source;
-            self.send(MixerCmd::Original(source == PlaybackSource::Original));
-            self.shared.emit_state(st);
+        let to_emit = {
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
+            Self::require_loaded(st)?;
+            if source == PlaybackSource::Stems && st.channels.is_empty() {
+                return Err(IpcError::not_found("This song hasn't been split yet."));
+            }
+            if st.source != source {
+                st.source = source;
+                let snap = self.shared.snapshot(st);
+                self.send(MixerCmd::Original(source == PlaybackSource::Original));
+                Some(snap)
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = to_emit {
+            self.shared.emit_snapshot(snap);
         }
         Ok(())
     }
@@ -670,21 +740,25 @@ impl Player {
     /// Sets or clears the loop. Requests that are not a valid range inside
     /// the song (non-finite, reversed, shorter than 10 ms) clear it.
     pub fn set_loop(&self, range: Option<LoopRange>) -> IpcResult<()> {
-        let mut inner = lock(&self.shared.state);
-        let st = &mut inner.playback;
-        Self::require_loaded(st)?;
-        let l = normalise_loop(range, st.duration_sec);
-        st.loop_range = l;
-        if let Some(l) = l {
-            let heard = self.shared.heard.load(Ordering::Relaxed);
-            if heard >= sec_to_frames(l.end_sec) && !st.playing {
-                self.shared
-                    .heard
-                    .store(sec_to_frames(l.start_sec), Ordering::Relaxed);
+        let snap = {
+            let mut inner = lock(&self.shared.state);
+            let st = &mut inner.playback;
+            Self::require_loaded(st)?;
+            let l = normalise_loop(range, st.duration_sec);
+            st.loop_range = l;
+            if let Some(l) = l {
+                let heard = self.shared.heard.load(Ordering::Relaxed);
+                if heard >= sec_to_frames(l.end_sec) && !st.playing {
+                    self.shared
+                        .heard
+                        .store(sec_to_frames(l.start_sec), Ordering::Relaxed);
+                }
             }
-        }
-        self.send(MixerCmd::Loop(loop_frames(l)));
-        self.shared.emit_state(st);
+            let snap = self.shared.snapshot(st);
+            self.send(MixerCmd::Loop(loop_frames(l)));
+            snap
+        };
+        self.shared.emit_snapshot(snap);
         Ok(())
     }
 
@@ -742,6 +816,8 @@ struct Mark {
     end: u64,
     /// Song position after this block.
     pos: u64,
+    /// Seek epoch active when this block was rendered.
+    epoch: u64,
     peaks: [f32; MAX_METERS],
     ended: bool,
     stopped: bool,
@@ -767,6 +843,8 @@ struct MixerThread {
     tick_peaks: [f32; MAX_METERS],
     last_tick: Instant,
     ids: Vec<SourceId>,
+    epoch: u64,
+    last_prefetch_pos: u64,
 }
 
 impl MixerThread {
@@ -782,14 +860,27 @@ impl MixerThread {
             tick_peaks: [0.0; MAX_METERS],
             last_tick: Instant::now(),
             ids: Vec::new(),
+            epoch: 0,
+            last_prefetch_pos: u64::MAX,
         }
+    }
+
+    fn prefetch_at(&mut self, frame: u64) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        audio.mix.prefetch(frame, PREFETCH_FRAMES);
+        for (_, stem) in &audio.stems {
+            stem.prefetch(frame, PREFETCH_FRAMES);
+        }
+        self.last_prefetch_pos = frame;
     }
 
     fn run(mut self) {
         loop {
             let busy = self.core.is_active() || !self.marks.is_empty();
             let wait = if busy {
-                Duration::from_millis(3)
+                Duration::from_millis(2)
             } else {
                 Duration::from_millis(100)
             };
@@ -856,6 +947,8 @@ impl MixerThread {
             .map(|(id, _)| SourceId::from(*id))
             .collect();
         self.audio = Some(audio);
+        self.last_prefetch_pos = u64::MAX;
+        self.prefetch_at(pos);
         if !live {
             self.marks.clear();
             self.tick_peaks = [0.0; MAX_METERS];
@@ -872,6 +965,7 @@ impl MixerThread {
                 self.core = MixerCore::new(0, 0);
                 self.ids.clear();
                 self.marks.clear();
+                self.last_prefetch_pos = u64::MAX;
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
@@ -881,7 +975,11 @@ impl MixerThread {
             }
             MixerCmd::Play => self.core.play(),
             MixerCmd::Pause => self.core.pause(),
-            MixerCmd::Seek(f) => self.core.seek(f),
+            MixerCmd::Seek(f, ep) => {
+                self.epoch = ep;
+                self.core.seek(f);
+                self.prefetch_at(f);
+            }
             MixerCmd::Channel(i, p) => self.core.set_channel(i, p),
             MixerCmd::Master(db) => self.core.set_master_db(db),
             MixerCmd::Original(o) => self.core.set_original(o),
@@ -890,8 +988,16 @@ impl MixerThread {
                 // Anything rendered for the old stream is gone: resume from
                 // what was last heard.
                 self.marks.clear();
-                if self.audio.is_some() {
-                    self.core.seek(self.shared.heard.load(Ordering::Relaxed));
+                self.epoch = self.shared.seek_epoch.load(Ordering::Acquire);
+                let prefetch_pos = if self.audio.is_some() {
+                    let p = self.shared.heard.load(Ordering::Relaxed);
+                    self.core.seek(p);
+                    Some(p)
+                } else {
+                    None
+                };
+                if let Some(p) = prefetch_pos {
+                    self.prefetch_at(p);
                 }
                 self.out = Some(Out {
                     producer: link.producer,
@@ -907,11 +1013,18 @@ impl MixerThread {
                 self.marks.clear();
                 self.core.stop_now();
                 self.core.seek(self.shared.heard.load(Ordering::Relaxed));
-                let mut inner = lock(&self.shared.state);
-                let st = &mut inner.playback;
-                if st.playing {
-                    st.playing = false;
-                    self.shared.emit_state(st);
+                let snap = {
+                    let mut inner = lock(&self.shared.state);
+                    let st = &mut inner.playback;
+                    if st.playing {
+                        st.playing = false;
+                        Some(self.shared.snapshot(st))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(snap) = snap {
+                    self.shared.emit_snapshot(snap);
                 }
             }
             #[cfg(test)]
@@ -927,7 +1040,21 @@ impl MixerThread {
     }
 
     fn render_ahead(&mut self) {
-        let (Some(out), Some(audio)) = (&mut self.out, &self.audio) else {
+        let Some(audio) = &self.audio else {
+            self.shared.activity.set(!self.marks.is_empty());
+            return;
+        };
+        if self.core.is_active() {
+            let pos = self.core.position();
+            if pos.abs_diff(self.last_prefetch_pos) >= 22_050 {
+                audio.mix.prefetch(pos, PREFETCH_FRAMES);
+                for (_, stem) in &audio.stems {
+                    stem.prefetch(pos, PREFETCH_FRAMES);
+                }
+                self.last_prefetch_pos = pos;
+            }
+        }
+        let Some(out) = &mut self.out else {
             self.shared.activity.set(!self.marks.is_empty());
             return;
         };
@@ -974,6 +1101,7 @@ impl MixerThread {
             self.marks.push_back(Mark {
                 end: out.pushed,
                 pos: self.core.position(),
+                epoch: self.epoch,
                 peaks,
                 ended: outcome.reached_end,
                 stopped: outcome.stopped,
@@ -989,6 +1117,7 @@ impl MixerThread {
     fn follow_device(&mut self) {
         let Some(out) = &self.out else { return };
         let played = out.played.load(Ordering::Relaxed);
+        let cur_epoch = self.shared.seek_epoch.load(Ordering::Acquire);
         let mut consumed = false;
         let mut ended = false;
         let mut stopped = false;
@@ -997,17 +1126,26 @@ impl MixerThread {
             for (a, b) in self.tick_peaks.iter_mut().zip(m.peaks) {
                 *a = a.max(b);
             }
-            self.shared.heard.store(m.pos, Ordering::Relaxed);
+            if m.epoch >= cur_epoch {
+                self.shared.heard.store(m.pos, Ordering::Relaxed);
+            }
             ended |= m.ended;
             stopped |= m.stopped;
             consumed = true;
         }
         if ended {
-            let mut inner = lock(&self.shared.state);
-            let st = &mut inner.playback;
-            if st.session_id.is_some() {
-                st.playing = false;
-                self.shared.emit_state(st);
+            let snap = {
+                let mut inner = lock(&self.shared.state);
+                let st = &mut inner.playback;
+                if st.session_id.is_some() {
+                    st.playing = false;
+                    Some(self.shared.snapshot(st))
+                } else {
+                    None
+                }
+            };
+            if let Some(snap) = snap {
+                self.shared.emit_snapshot(snap);
             }
         }
         let due = self.last_tick.elapsed() >= TICK_EVERY;
@@ -1581,6 +1719,7 @@ mod tests {
                     absent: Vec::new(),
                 }),
                 heard: AtomicU64::new(0),
+                seek_epoch: AtomicU64::new(0),
                 events: Arc::new(RecordingSink::default()),
                 activity: Arc::new(ActivityFlag::default()),
             });
@@ -1665,7 +1804,7 @@ mod tests {
         let rendered = rig.mixer.core.position();
         let heard = rig.shared.heard.load(Ordering::Relaxed);
         assert!(
-            rendered > heard + 1000,
+            rendered > heard + BLOCK as u64 * 2,
             "audio is queued ahead of what was heard: {rendered} vs {heard}"
         );
 
@@ -1693,7 +1832,7 @@ mod tests {
             rig.play_out(BLOCK);
             rig.mixer.render_ahead();
         }
-        assert!(rig.queued() > 1000, "tail queued: {}", rig.queued());
+        assert!(rig.queued() > BLOCK * 2, "tail queued: {}", rig.queued());
         assert!(lock(&rig.shared.state).playback.playing);
         assert!(rig.shared.heard.load(Ordering::Relaxed) < frames);
 

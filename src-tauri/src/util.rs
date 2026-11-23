@@ -197,6 +197,66 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Atomically copies `src` to `dst`, using APFS copy-on-write `clonefile` on
+/// macOS when on the same volume and falling back to a 512 KiB buffered atomic
+/// temp+rename copy elsewhere.
+pub fn copy_file_fast(src: &Path, dst: &Path) -> io::Result<()> {
+    let dir = dst
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name = dst
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        &new_session_id()[..8]
+    ));
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        if let (Ok(c_src), Ok(c_tmp)) = (
+            CString::new(src.as_os_str().as_bytes()),
+            CString::new(tmp.as_os_str().as_bytes()),
+        ) {
+            // SAFETY: both pointers are NUL-terminated C strings live across the syscall.
+            let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_tmp.as_ptr(), 0) };
+            if rc == 0 {
+                if let Err(e) = rename_retry(&tmp, dst) {
+                    let _ = remove_file_retry(&tmp);
+                    return Err(e);
+                }
+                return Ok(());
+            }
+            let _ = remove_file_retry(&tmp);
+        }
+    }
+
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create_new(&tmp)?;
+    let res = (|| {
+        let mut buf = vec![0u8; 1 << 19];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            writer.write_all(&buf[..n])?;
+        }
+        writer.flush()?;
+        drop(writer);
+        rename_retry(&tmp, dst)
+    })();
+    if res.is_err() {
+        let _ = remove_file_retry(&tmp);
+    }
+    res
+}
+
 /// True for temporary files made by [`write_atomic`].
 pub fn is_atomic_temp(name: &str) -> bool {
     name.starts_with('.') && name.contains(".tmp-")

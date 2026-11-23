@@ -7,17 +7,16 @@
 //! Release builds ignore both variables and use the app's own model store.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use splitsound_core as core;
-use splitsound_core::runtime::{Runtime, RuntimeConfig};
 
 use super::{
     CancelToken, DecodedTrack, Engine, EngineConfig, EngineError, EngineProgress, EngineResult,
-    ExportJob, HardwareInfo, ScanOutcome, ScanResult, SplitOutput, SplitPlan, SplitRequest,
-    StemAnalysis,
+    ExportItem, ExportJob, HardwareInfo, ScanOutcome, ScanResult, SplitOutput, SplitPlan,
+    SplitRequest, StemAnalysis,
 };
 use crate::ipc::{
     Detection, ErrorCode, ExportFormat, GpuInfo, ModelDownloadProgress, ModelStatus, Peaks,
@@ -25,12 +24,31 @@ use crate::ipc::{
 };
 use crate::util::lock;
 
+struct InferenceState {
+    busy: bool,
+    applied_threads: u32,
+}
+
+struct InferenceGuard<'a> {
+    lock: &'a Mutex<InferenceState>,
+    cv: &'a Condvar,
+}
+
+impl Drop for InferenceGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = lock(self.lock);
+        st.busy = false;
+        self.cv.notify_one();
+    }
+}
+
 pub struct CoreEngine {
     engine: core::Engine,
     requested_threads: AtomicU32,
     // The core's preview and split both use the separator. Let either wait
     // for the other without holding up import, playback, or downloads.
-    applied_threads: Mutex<u32>,
+    inference_state: Mutex<InferenceState>,
+    inference_cv: Condvar,
 }
 
 #[cfg(debug_assertions)]
@@ -51,6 +69,20 @@ impl CoreEngine {
                     "The bundled ONNX Runtime library is missing.",
                 )
             })?;
+        // Validate presence/non-placeholder size synchronously, deferring actual
+        // dynamic library loading and session initialization until first inference.
+        let meta = std::fs::metadata(&runtime_path).map_err(|_| {
+            EngineError::new(
+                ErrorCode::Internal,
+                "The bundled ONNX Runtime library is missing.",
+            )
+        })?;
+        if !meta.is_file() || meta.len() < 64 * 1024 {
+            return Err(EngineError::new(
+                ErrorCode::Internal,
+                "The bundled ONNX Runtime library is missing.",
+            ));
+        }
         let mut engine_config = core::EngineConfig::new(config.models_dir);
         engine_config.onnxruntime_path = Some(runtime_path);
         engine_config.acceleration = core::Acceleration::Cpu;
@@ -63,26 +95,16 @@ impl CoreEngine {
                 base_url: format!("{}/", url.trim_end_matches('/')),
             };
         }
-        // Engine::new is lazy. Check the exact library now so a failed
-        // startup becomes one stable error for all engine-backed commands.
-        let runtime = Runtime::load(RuntimeConfig {
-            library_path: engine_config.onnxruntime_path.clone(),
-            acceleration: core::Acceleration::Cpu,
-            threads: 0,
-            cache_dir: engine_config.cache_dir.clone(),
-        })?;
-        log::info!(
-            "ONNX Runtime {} loaded from {} ({})",
-            runtime_version(runtime.library_path())?,
-            runtime.library_path().display(),
-            runtime.build_info()
-        );
         let engine = core::Engine::new(engine_config)?;
         engine.models().clean_temp_files();
         Ok(Self {
             engine,
             requested_threads: AtomicU32::new(0),
-            applied_threads: Mutex::new(0),
+            inference_state: Mutex::new(InferenceState {
+                busy: false,
+                applied_threads: 0,
+            }),
+            inference_cv: Condvar::new(),
         })
     }
 
@@ -95,56 +117,26 @@ impl CoreEngine {
         }
     }
 
-    fn inference(&self, cancel: &CancelToken) -> EngineResult<std::sync::MutexGuard<'_, u32>> {
+    fn inference(&self, cancel: &CancelToken) -> EngineResult<InferenceGuard<'_>> {
+        let mut st = lock(&self.inference_state);
         loop {
             if cancel.is_cancelled() {
                 return Err(EngineError::cancelled());
             }
-            match self.applied_threads.try_lock() {
-                Ok(mut applied) => {
-                    self.apply_threads(&mut applied);
-                    return Ok(applied);
-                }
-                Err(std::sync::TryLockError::Poisoned(error)) => {
-                    let mut applied = error.into_inner();
-                    self.apply_threads(&mut applied);
-                    return Ok(applied);
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+            if !st.busy {
+                st.busy = true;
+                self.apply_threads(&mut st.applied_threads);
+                return Ok(InferenceGuard {
+                    lock: &self.inference_state,
+                    cv: &self.inference_cv,
+                });
             }
+            let (guard, _) = self
+                .inference_cv
+                .wait_timeout(st, Duration::from_millis(25))
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
         }
-    }
-}
-
-/// Read the version from the same absolute library already held by the core.
-fn runtime_version(path: &Path) -> EngineResult<String> {
-    let failure = |detail: &dyn std::fmt::Display| {
-        EngineError::new(
-            ErrorCode::Internal,
-            format!("Cannot read the ONNX Runtime version: {detail}"),
-        )
-    };
-    // SAFETY: the core already loaded this exact library and verified its C
-    // API. These signatures are from the ONNX Runtime bindings. The C string
-    // is copied while the library handle keeps its static data alive.
-    unsafe {
-        let lib = libloading::Library::new(path).map_err(|e| failure(&e))?;
-        let get_api = lib
-            .get::<unsafe extern "system" fn() -> *const ort_sys::OrtApiBase>(b"OrtGetApiBase\0")
-            .map_err(|e| failure(&e))?;
-        let api = get_api()
-            .as_ref()
-            .ok_or_else(|| failure(&"missing API base"))?;
-        let version = (api.GetVersionString)();
-        if version.is_null() {
-            return Err(failure(&"missing version string"));
-        }
-        std::ffi::CStr::from_ptr(version)
-            .to_str()
-            .map(str::to_owned)
-            .map_err(|e| failure(&e))
     }
 }
 
@@ -305,9 +297,15 @@ impl Engine for CoreEngine {
         mix_out: &Path,
         cancel: &CancelToken,
     ) -> EngineResult<DecodedTrack> {
-        let track = self.engine.import(input, &ProgressBridge::silent(cancel))?;
-        core::wav::write_wav_f32(mix_out, &track.audio, core::audio::SAMPLE_RATE)?;
-        let info = track.info;
+        let wav = core::decode::decode_to_wav(
+            input,
+            mix_out,
+            core::audio::SAMPLE_RATE,
+            &core::decode::DecodeLimits::default(),
+            false,
+            &ProgressBridge::silent(cancel),
+        )?;
+        let info = wav.info;
         Ok(DecodedTrack {
             info: TrackInfo {
                 path: String::new(),
@@ -323,15 +321,19 @@ impl Engine for CoreEngine {
                 file_size_bytes: info.file_size_bytes,
                 has_artwork: info.has_artwork,
             },
-            artwork: track.artwork.map(|art| art.data),
+            artwork: wav.artwork.map(|art| art.data),
         })
     }
 
     fn scan_instruments(&self, wav: &Path, cancel: &CancelToken) -> EngineResult<ScanOutcome> {
         let _guard = self.inference(cancel)?;
-        let mix = core::wav::MappedWav::open(wav)?.to_stereo()?;
+        let mix = core::wav::MappedWav::open(wav)?;
+        mix.advise_sequential();
         Ok(
-            match self.engine.detect(&mix, &ProgressBridge::silent(cancel))? {
+            match self
+                .engine
+                .detect_mapped(&mix, &ProgressBridge::silent(cancel))?
+            {
                 core::DetectOutcome::Done(report) => ScanOutcome::Done(ScanResult {
                     detections: report.detections.into_iter().map(detection).collect(),
                     suggested_mode: split_mode(report.suggested_mode),
@@ -368,9 +370,9 @@ impl Engine for CoreEngine {
             cancel,
             callback: Some(Mutex::new(progress)),
         };
-        let result = self
-            .engine
-            .split_to_dir(&mix, request, &req.out_dir, &bridge)?;
+        let result =
+            self.engine
+                .split_to_dir_with_sync(&mix, request, &req.out_dir, false, &bridge)?;
         let stems = result
             .stems
             .into_iter()
@@ -383,7 +385,11 @@ impl Engine for CoreEngine {
                         active_fraction: f64::from(stats.active_fraction),
                         peak_db: f64::from(stats.peak_db),
                         rms_db: f64::from(stats.rms_db),
-                        activity: stats.activity.into_iter().map(f64::from).collect(),
+                        activity: stats
+                            .activity
+                            .into_iter()
+                            .map(|v| (f64::from(v) * 100.0).round() / 100.0)
+                            .collect(),
                         contains: stem.contains.into_iter().map(detection).collect(),
                     },
                 )
@@ -411,9 +417,8 @@ impl Engine for CoreEngine {
             ExportFormat::Flac => core::ExportFormat::Flac,
             ExportFormat::Mp3 => core::ExportFormat::Mp3,
         };
-        let progress = ProgressBridge::silent(cancel);
-        let mut files = Vec::with_capacity(job.items.len());
-        for item in &job.items {
+        let export_one = |item: &ExportItem| -> EngineResult<PathBuf> {
+            let progress = ProgressBridge::silent(cancel);
             if let [(path, 1.0)] = item.sources.as_slice() {
                 core::engine::export_file(path, format, &item.dest, &progress)?;
             } else {
@@ -431,7 +436,42 @@ impl Engine for CoreEngine {
                     .collect();
                 core::engine::export_mixdown(&sources, format, &item.dest, &progress)?;
             }
-            files.push(item.dest.clone());
+            Ok(item.dest.clone())
+        };
+        if job.items.len() <= 1 {
+            let mut files = Vec::with_capacity(job.items.len());
+            for item in &job.items {
+                files.push(export_one(item)?);
+            }
+            return Ok(files);
+        }
+        let workers = self.engine.threads().clamp(2, 4).min(job.items.len());
+        let next = AtomicUsize::new(0);
+        let results: Vec<Mutex<Option<EngineResult<PathBuf>>>> =
+            (0..job.items.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= job.items.len() {
+                            break;
+                        }
+                        let res = export_one(&job.items[i]);
+                        *lock(&results[i]) = Some(res);
+                    }
+                });
+            }
+        });
+        let mut files = Vec::with_capacity(job.items.len());
+        for slot in results {
+            let res = lock(&slot).take().unwrap_or_else(|| {
+                Err(EngineError::new(
+                    ErrorCode::Internal,
+                    "Export task did not finish.",
+                ))
+            })?;
+            files.push(res);
         }
         Ok(files)
     }
@@ -491,8 +531,10 @@ impl Engine for CoreEngine {
 
     fn configure_threads(&self, threads: u32) {
         self.requested_threads.store(threads, Ordering::Relaxed);
-        if let Ok(mut applied) = self.applied_threads.try_lock() {
-            self.apply_threads(&mut applied);
+        if let Ok(mut st) = self.inference_state.try_lock()
+            && !st.busy
+        {
+            self.apply_threads(&mut st.applied_threads);
         }
     }
 

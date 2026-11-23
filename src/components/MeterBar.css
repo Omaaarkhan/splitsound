@@ -13,7 +13,10 @@
 
 .meter__fill {
   width: 100%;
-  height: calc(var(--level, 0) * 100%);
+  height: 100%;
   background: var(--stem-color);
   display: block;
+  transform-origin: bottom;
+  transform: scaleY(var(--level, 0));
+  will-change: transform;
 }

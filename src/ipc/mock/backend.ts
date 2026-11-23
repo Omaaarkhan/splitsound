@@ -907,6 +907,41 @@ export function createMockBackend(opts: MockBackendOptions = {}): MockBackend {
         return generatePeaks(sessionId, source, buckets, present) as Commands[K]["result"];
       }
 
+      case "get_session_peaks": {
+        const { sessionId, sources, buckets } = args as Commands["get_session_peaks"]["args"];
+        const s = sessions.get(sessionId);
+        const encoder = new TextEncoder();
+        const encodedSources = sources.map((source) => {
+          const stem = s?.stems.find((st) => st.id === source);
+          const present = stem ? stem.present : true;
+          const peaks = generatePeaks(sessionId, source, buckets, present);
+          const binary = atob(peaks.data);
+          const payload = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            payload[i] = binary.charCodeAt(i);
+          }
+          return { key: encoder.encode(source), buckets: peaks.buckets, payload };
+        });
+        const totalBytes = encodedSources.reduce(
+          (sum, item) => sum + 1 + item.key.length + 4 + item.payload.length,
+          1,
+        );
+        const out = new Uint8Array(totalBytes);
+        const view = new DataView(out.buffer);
+        let offset = 0;
+        out[offset++] = encodedSources.length;
+        for (const item of encodedSources) {
+          out[offset++] = item.key.length;
+          out.set(item.key, offset);
+          offset += item.key.length;
+          view.setUint32(offset, item.buckets, true);
+          offset += 4;
+          out.set(item.payload, offset);
+          offset += item.payload.length;
+        }
+        return out.buffer as Commands[K]["result"];
+      }
+
       case "estimate_split": {
         const { sessionId, options } = args as Commands["estimate_split"]["args"];
         const s = sessions.get(sessionId);

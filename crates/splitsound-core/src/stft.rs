@@ -84,19 +84,79 @@ fn hann_window(len: usize) -> Vec<f32> {
         .collect()
 }
 
+// 8-frame tiles keep simultaneous plane writes within L1 load/fill buffers;
+// +9 padding breaks power-of-two L1 cache-set aliasing at 2048 bins (8192 B).
+const TILE: usize = 8;
+const HT_STRIDE: usize = BINS + 9;
+const SC_STRIDE: usize = SC_BINS + 9;
+const MB_STRIDE: usize = MB_BINS + 9;
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn flush_tile(
+    tile_re: &[f32],
+    tile_im: &[f32],
+    tile_stride: usize,
+    bins: usize,
+    frames: usize,
+    j0: usize,
+    t: usize,
+    re: &mut [f32],
+    im: &mut [f32],
+) {
+    for k in 0..bins {
+        let base = k * frames + j0;
+        let dst_re = &mut re[base..base + t];
+        let dst_im = &mut im[base..base + t];
+        for tj in 0..t {
+            let off = tj * tile_stride + k;
+            dst_re[tj] = tile_re[off];
+            dst_im[tj] = tile_im[off];
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn load_tile(
+    re: &[f32],
+    im: &[f32],
+    bins: usize,
+    frames: usize,
+    j0: usize,
+    t: usize,
+    tile_stride: usize,
+    tile_re: &mut [f32],
+    tile_im: &mut [f32],
+) {
+    for k in 0..bins {
+        let base = k * frames + j0;
+        let src_re = &re[base..base + t];
+        let src_im = &im[base..base + t];
+        for tj in 0..t {
+            let off = tj * tile_stride + k;
+            tile_re[off] = src_re[tj];
+            tile_im[off] = src_im[tj];
+        }
+    }
+}
+
 /// HTDemucs transform state: FFT plans, the window and scratch buffers.
 ///
 /// Not `Sync`; make one per worker thread.
 pub struct HtdemucsStft {
     forward: Arc<dyn RealToComplex<f32>>,
     inverse: Arc<dyn ComplexToReal<f32>>,
-    window: Vec<f32>,
+    window: Arc<Vec<f32>>,
+    inv_window: Arc<Vec<f32>>,
     padded: Vec<f32>,
     frame: Vec<f32>,
     spectrum: Vec<Complex32>,
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
     acc: Vec<f32>,
+    tile_re: Vec<f32>,
+    tile_im: Vec<f32>,
 }
 
 impl Default for HtdemucsStft {
@@ -112,7 +172,12 @@ impl HtdemucsStft {
         let forward = planner.plan_fft_forward(NFFT);
         let inverse = planner.plan_fft_inverse(NFFT);
         // Periodic Hann, computed in f64 for accuracy.
-        let window = hann_window(NFFT);
+        let window = Arc::new(hann_window(NFFT));
+        // realfft's inverse is unnormalised (no 1/NFFT), so the contract's
+        // `sqrt(NFFT) * irfft` becomes a plain `1/sqrt(NFFT)`; the constant
+        // overlap divisor 1.5 is folded in alongside the window.
+        let scale = 1.0 / ((NFFT as f32).sqrt() * 1.5);
+        let inv_window = Arc::new(window.iter().map(|w| w * scale).collect());
         HtdemucsStft {
             scratch_fwd: forward.make_scratch_vec(),
             scratch_inv: inverse.make_scratch_vec(),
@@ -120,9 +185,30 @@ impl HtdemucsStft {
             forward,
             inverse,
             window,
+            inv_window,
             padded: vec![0.0; PADDED],
             frame: vec![0.0; NFFT],
             acc: vec![0.0; PADDED],
+            tile_re: vec![0.0; TILE * HT_STRIDE],
+            tile_im: vec![0.0; TILE * HT_STRIDE],
+        }
+    }
+
+    /// Creates a sibling worker reusing the planned FFTs and precomputed windows.
+    pub(crate) fn clone_worker(&self) -> Self {
+        HtdemucsStft {
+            scratch_fwd: self.forward.make_scratch_vec(),
+            scratch_inv: self.inverse.make_scratch_vec(),
+            spectrum: self.forward.make_output_vec(),
+            forward: Arc::clone(&self.forward),
+            inverse: Arc::clone(&self.inverse),
+            window: Arc::clone(&self.window),
+            inv_window: Arc::clone(&self.inv_window),
+            padded: vec![0.0; PADDED],
+            frame: vec![0.0; NFFT],
+            acc: vec![0.0; PADDED],
+            tile_re: vec![0.0; TILE * HT_STRIDE],
+            tile_im: vec![0.0; TILE * HT_STRIDE],
         }
     }
 
@@ -145,19 +231,40 @@ impl HtdemucsStft {
             self.padded[PAD + SEGMENT + i] = x[SEGMENT - 2 - i];
         }
         let scale = 1.0 / (NFFT as f32).sqrt();
-        for j in 0..FRAMES {
-            let src = &self.padded[j * HOP..j * HOP + NFFT];
-            for ((f, s), w) in self.frame.iter_mut().zip(src).zip(&self.window) {
-                *f = s * w;
+        for j0 in (0..FRAMES).step_by(TILE) {
+            let t = TILE.min(FRAMES - j0);
+            for tj in 0..t {
+                let j = j0 + tj;
+                let src = &self.padded[j * HOP..j * HOP + NFFT];
+                for ((f, s), w) in self.frame.iter_mut().zip(src).zip(self.window.iter()) {
+                    *f = s * w;
+                }
+                self.forward
+                    .process_with_scratch(
+                        &mut self.frame,
+                        &mut self.spectrum,
+                        &mut self.scratch_fwd,
+                    )
+                    .map_err(|e| Error::internal(format!("fft: {e}")))?;
+                let tre = &mut self.tile_re[tj * HT_STRIDE..tj * HT_STRIDE + BINS];
+                let tim = &mut self.tile_im[tj * HT_STRIDE..tj * HT_STRIDE + BINS];
+                for k in 0..BINS {
+                    let z = self.spectrum[k];
+                    tre[k] = z.re * scale;
+                    tim[k] = z.im * scale;
+                }
             }
-            self.forward
-                .process_with_scratch(&mut self.frame, &mut self.spectrum, &mut self.scratch_fwd)
-                .map_err(|e| Error::internal(format!("fft: {e}")))?;
-            for k in 0..BINS {
-                let z = self.spectrum[k];
-                re[k * FRAMES + j] = z.re * scale;
-                im[k * FRAMES + j] = z.im * scale;
-            }
+            flush_tile(
+                &self.tile_re,
+                &self.tile_im,
+                HT_STRIDE,
+                BINS,
+                FRAMES,
+                j0,
+                t,
+                re,
+                im,
+            );
         }
         Ok(())
     }
@@ -172,26 +279,43 @@ impl HtdemucsStft {
             return Err(Error::internal("istft: wrong buffer size"));
         }
         self.acc.fill(0.0);
-        // realfft's inverse is unnormalised (no 1/NFFT), so the contract's
-        // `sqrt(NFFT) * irfft` becomes a plain `1/sqrt(NFFT)`; the constant
-        // overlap divisor 1.5 is folded in as well.
-        let scale = 1.0 / ((NFFT as f32).sqrt() * 1.5);
-        for j in 0..FRAMES {
-            for k in 0..BINS {
-                self.spectrum[k] = Complex32::new(re[k * FRAMES + j], im[k * FRAMES + j]);
-            }
-            // Zero Nyquist bin. The DC and Nyquist imaginary parts must be
-            // zero for a real inverse; the DC bin from the network is not
-            // guaranteed to be, and realfft would reject it, so drop it the
-            // way numpy's irfft silently does.
-            self.spectrum[BINS] = Complex32::new(0.0, 0.0);
-            self.spectrum[0].im = 0.0;
-            self.inverse
-                .process_with_scratch(&mut self.spectrum, &mut self.frame, &mut self.scratch_inv)
-                .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-            let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
-            for ((d, f), w) in dst.iter_mut().zip(&self.frame).zip(&self.window) {
-                *d += f * w * scale;
+        for j0 in (0..FRAMES).step_by(TILE) {
+            let t = TILE.min(FRAMES - j0);
+            load_tile(
+                re,
+                im,
+                BINS,
+                FRAMES,
+                j0,
+                t,
+                HT_STRIDE,
+                &mut self.tile_re,
+                &mut self.tile_im,
+            );
+            for tj in 0..t {
+                let j = j0 + tj;
+                let tre = &self.tile_re[tj * HT_STRIDE..tj * HT_STRIDE + BINS];
+                let tim = &self.tile_im[tj * HT_STRIDE..tj * HT_STRIDE + BINS];
+                for k in 0..BINS {
+                    self.spectrum[k] = Complex32::new(tre[k], tim[k]);
+                }
+                // Zero Nyquist bin. The DC and Nyquist imaginary parts must be
+                // zero for a real inverse; the DC bin from the network is not
+                // guaranteed to be, and realfft would reject it, so drop it the
+                // way numpy's irfft silently does.
+                self.spectrum[BINS] = Complex32::new(0.0, 0.0);
+                self.spectrum[0].im = 0.0;
+                self.inverse
+                    .process_with_scratch(
+                        &mut self.spectrum,
+                        &mut self.frame,
+                        &mut self.scratch_inv,
+                    )
+                    .map_err(|e| Error::internal(format!("ifft: {e}")))?;
+                let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
+                for ((d, f), iw) in dst.iter_mut().zip(&self.frame).zip(self.inv_window.iter()) {
+                    *d += f * iw;
+                }
             }
         }
         for (o, a) in out.iter_mut().zip(&self.acc[PAD..PAD + SEGMENT]) {
@@ -213,6 +337,8 @@ pub struct ScnetStft {
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
     acc: Vec<f32>,
+    tile_re: Vec<f32>,
+    tile_im: Vec<f32>,
 }
 
 impl Default for ScnetStft {
@@ -236,6 +362,24 @@ impl ScnetStft {
             padded: vec![0.0; SC_PADDED],
             frame: vec![0.0; NFFT],
             acc: vec![0.0; SC_PADDED],
+            tile_re: vec![0.0; TILE * SC_STRIDE],
+            tile_im: vec![0.0; TILE * SC_STRIDE],
+        }
+    }
+
+    /// Creates a sibling worker reusing the planned FFTs.
+    pub(crate) fn clone_worker(&self) -> Self {
+        ScnetStft {
+            scratch_fwd: self.forward.make_scratch_vec(),
+            scratch_inv: self.inverse.make_scratch_vec(),
+            spectrum: self.forward.make_output_vec(),
+            forward: Arc::clone(&self.forward),
+            inverse: Arc::clone(&self.inverse),
+            padded: vec![0.0; SC_PADDED],
+            frame: vec![0.0; NFFT],
+            acc: vec![0.0; SC_PADDED],
+            tile_re: vec![0.0; TILE * SC_STRIDE],
+            tile_im: vec![0.0; TILE * SC_STRIDE],
         }
     }
 
@@ -257,17 +401,38 @@ impl ScnetStft {
             self.padded[SC_CENTER + xp_len + i] = xp(xp_len - 2 - i);
         }
         let scale = 1.0 / (NFFT as f32).sqrt();
-        for j in 0..SC_FRAMES {
-            self.frame
-                .copy_from_slice(&self.padded[j * HOP..j * HOP + NFFT]);
-            self.forward
-                .process_with_scratch(&mut self.frame, &mut self.spectrum, &mut self.scratch_fwd)
-                .map_err(|e| Error::internal(format!("fft: {e}")))?;
-            for k in 0..SC_BINS {
-                let z = self.spectrum[k];
-                re[k * SC_FRAMES + j] = z.re * scale;
-                im[k * SC_FRAMES + j] = z.im * scale;
+        for j0 in (0..SC_FRAMES).step_by(TILE) {
+            let t = TILE.min(SC_FRAMES - j0);
+            for tj in 0..t {
+                let j = j0 + tj;
+                self.frame
+                    .copy_from_slice(&self.padded[j * HOP..j * HOP + NFFT]);
+                self.forward
+                    .process_with_scratch(
+                        &mut self.frame,
+                        &mut self.spectrum,
+                        &mut self.scratch_fwd,
+                    )
+                    .map_err(|e| Error::internal(format!("fft: {e}")))?;
+                let tre = &mut self.tile_re[tj * SC_STRIDE..tj * SC_STRIDE + SC_BINS];
+                let tim = &mut self.tile_im[tj * SC_STRIDE..tj * SC_STRIDE + SC_BINS];
+                for k in 0..SC_BINS {
+                    let z = self.spectrum[k];
+                    tre[k] = z.re * scale;
+                    tim[k] = z.im * scale;
+                }
             }
+            flush_tile(
+                &self.tile_re,
+                &self.tile_im,
+                SC_STRIDE,
+                SC_BINS,
+                SC_FRAMES,
+                j0,
+                t,
+                re,
+                im,
+            );
         }
         Ok(())
     }
@@ -280,32 +445,55 @@ impl ScnetStft {
         }
         self.acc.fill(0.0);
         // realfft's inverse is unnormalised, so `sqrt(NFFT) * irfft` is a
-        // plain `1 / sqrt(NFFT)`.
+        // plain `1 / sqrt(NFFT)`, folded directly into the final overlap pass.
         let scale = 1.0 / (NFFT as f32).sqrt();
-        for j in 0..SC_FRAMES {
-            for k in 0..SC_BINS {
-                self.spectrum[k] = Complex32::new(re[k * SC_FRAMES + j], im[k * SC_FRAMES + j]);
-            }
-            // A real inverse ignores the imaginary parts of DC and Nyquist;
-            // realfft rejects them, so zero them explicitly.
-            self.spectrum[0].im = 0.0;
-            self.spectrum[SC_BINS - 1].im = 0.0;
-            self.inverse
-                .process_with_scratch(&mut self.spectrum, &mut self.frame, &mut self.scratch_inv)
-                .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-            let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
-            for (d, f) in dst.iter_mut().zip(&self.frame) {
-                *d += f * scale;
+        for j0 in (0..SC_FRAMES).step_by(TILE) {
+            let t = TILE.min(SC_FRAMES - j0);
+            load_tile(
+                re,
+                im,
+                SC_BINS,
+                SC_FRAMES,
+                j0,
+                t,
+                SC_STRIDE,
+                &mut self.tile_re,
+                &mut self.tile_im,
+            );
+            for tj in 0..t {
+                let j = j0 + tj;
+                let tre = &self.tile_re[tj * SC_STRIDE..tj * SC_STRIDE + SC_BINS];
+                let tim = &self.tile_im[tj * SC_STRIDE..tj * SC_STRIDE + SC_BINS];
+                for k in 0..SC_BINS {
+                    self.spectrum[k] = Complex32::new(tre[k], tim[k]);
+                }
+                // A real inverse ignores the imaginary parts of DC and Nyquist;
+                // realfft rejects them, so zero them explicitly.
+                self.spectrum[0].im = 0.0;
+                self.spectrum[SC_BINS - 1].im = 0.0;
+                self.inverse
+                    .process_with_scratch(
+                        &mut self.spectrum,
+                        &mut self.frame,
+                        &mut self.scratch_inv,
+                    )
+                    .map_err(|e| Error::internal(format!("ifft: {e}")))?;
+                let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
+                for (d, f) in dst.iter_mut().zip(&self.frame) {
+                    *d += f;
+                }
             }
         }
-        // Divide by the number of frames covering each sample: 3 in the
-        // first hop, 4 afterwards.
+        // Divide by the number of frames covering each sample (3 in the
+        // first hop, 4 afterwards) multiplied by `scale`.
+        let scale3 = scale / 3.0;
+        let scale4 = scale / 4.0;
         let src = &self.acc[SC_CENTER..SC_CENTER + SC_SEGMENT];
         for (o, a) in out[..HOP].iter_mut().zip(&src[..HOP]) {
-            *o = *a / 3.0;
+            *o = *a * scale3;
         }
         for (o, a) in out[HOP..].iter_mut().zip(&src[HOP..]) {
-            *o = *a / 4.0;
+            *o = *a * scale4;
         }
         Ok(())
     }
@@ -317,14 +505,17 @@ impl ScnetStft {
 pub struct MelbandRoformerStft {
     forward: Arc<dyn RealToComplex<f32>>,
     inverse: Arc<dyn ComplexToReal<f32>>,
-    window: Vec<f32>,
-    env: Vec<f32>,
+    window: Arc<Vec<f32>>,
+    inv_window: Arc<Vec<f32>>,
+    inv_env: Arc<Vec<f32>>,
     padded: Vec<f32>,
     frame: Vec<f32>,
     spectrum: Vec<Complex32>,
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
     acc: Vec<f32>,
+    tile_re: Vec<f32>,
+    tile_im: Vec<f32>,
 }
 
 impl Default for MelbandRoformerStft {
@@ -340,21 +531,27 @@ impl MelbandRoformerStft {
         let mut planner = RealFftPlanner::<f32>::new();
         let forward = planner.plan_fft_forward(MB_NFFT);
         let inverse = planner.plan_fft_inverse(MB_NFFT);
-        let window = hann_window(MB_NFFT);
+        let window = Arc::new(hann_window(MB_NFFT));
+        // realfft's inverse is unnormalized, while numpy/torch unnormalized irfft
+        // divides by MB_NFFT.
+        let scale = 1.0 / (MB_NFFT as f32);
+        let inv_window = Arc::new(window.iter().map(|w| w * scale).collect());
         let mut env_pad = vec![0.0f64; MB_PADDED];
         for j in 0..MB_FRAMES {
             for (dst, w) in env_pad[j * MB_HOP..j * MB_HOP + MB_NFFT]
                 .iter_mut()
-                .zip(&window)
+                .zip(window.iter())
             {
                 let wf = f64::from(*w);
                 *dst += wf * wf;
             }
         }
-        let env = env_pad[MB_CENTER..MB_CENTER + MB_SEGMENT]
-            .iter()
-            .map(|v| *v as f32)
-            .collect();
+        let inv_env = Arc::new(
+            env_pad[MB_CENTER..MB_CENTER + MB_SEGMENT]
+                .iter()
+                .map(|v| 1.0 / (*v as f32))
+                .collect(),
+        );
         MelbandRoformerStft {
             scratch_fwd: forward.make_scratch_vec(),
             scratch_inv: inverse.make_scratch_vec(),
@@ -362,10 +559,32 @@ impl MelbandRoformerStft {
             forward,
             inverse,
             window,
-            env,
+            inv_window,
+            inv_env,
             padded: vec![0.0; MB_PADDED],
             frame: vec![0.0; MB_NFFT],
             acc: vec![0.0; MB_PADDED],
+            tile_re: vec![0.0; TILE * MB_STRIDE],
+            tile_im: vec![0.0; TILE * MB_STRIDE],
+        }
+    }
+
+    /// Creates a sibling worker reusing the planned FFTs and precomputed tables.
+    pub(crate) fn clone_worker(&self) -> Self {
+        MelbandRoformerStft {
+            scratch_fwd: self.forward.make_scratch_vec(),
+            scratch_inv: self.inverse.make_scratch_vec(),
+            spectrum: self.forward.make_output_vec(),
+            forward: Arc::clone(&self.forward),
+            inverse: Arc::clone(&self.inverse),
+            window: Arc::clone(&self.window),
+            inv_window: Arc::clone(&self.inv_window),
+            inv_env: Arc::clone(&self.inv_env),
+            padded: vec![0.0; MB_PADDED],
+            frame: vec![0.0; MB_NFFT],
+            acc: vec![0.0; MB_PADDED],
+            tile_re: vec![0.0; TILE * MB_STRIDE],
+            tile_im: vec![0.0; TILE * MB_STRIDE],
         }
     }
 
@@ -382,19 +601,40 @@ impl MelbandRoformerStft {
         for i in 0..MB_CENTER {
             self.padded[MB_CENTER + MB_SEGMENT + i] = x[MB_SEGMENT - 2 - i];
         }
-        for j in 0..MB_FRAMES {
-            let src = &self.padded[j * MB_HOP..j * MB_HOP + MB_NFFT];
-            for ((f, s), w) in self.frame.iter_mut().zip(src).zip(&self.window) {
-                *f = s * w;
+        for j0 in (0..MB_FRAMES).step_by(TILE) {
+            let t = TILE.min(MB_FRAMES - j0);
+            for tj in 0..t {
+                let j = j0 + tj;
+                let src = &self.padded[j * MB_HOP..j * MB_HOP + MB_NFFT];
+                for ((f, s), w) in self.frame.iter_mut().zip(src).zip(self.window.iter()) {
+                    *f = s * w;
+                }
+                self.forward
+                    .process_with_scratch(
+                        &mut self.frame,
+                        &mut self.spectrum,
+                        &mut self.scratch_fwd,
+                    )
+                    .map_err(|e| Error::internal(format!("fft: {e}")))?;
+                let tre = &mut self.tile_re[tj * MB_STRIDE..tj * MB_STRIDE + MB_BINS];
+                let tim = &mut self.tile_im[tj * MB_STRIDE..tj * MB_STRIDE + MB_BINS];
+                for k in 0..MB_BINS {
+                    let z = self.spectrum[k];
+                    tre[k] = z.re;
+                    tim[k] = z.im;
+                }
             }
-            self.forward
-                .process_with_scratch(&mut self.frame, &mut self.spectrum, &mut self.scratch_fwd)
-                .map_err(|e| Error::internal(format!("fft: {e}")))?;
-            for k in 0..MB_BINS {
-                let z = self.spectrum[k];
-                re[k * MB_FRAMES + j] = z.re;
-                im[k * MB_FRAMES + j] = z.im;
-            }
+            flush_tile(
+                &self.tile_re,
+                &self.tile_im,
+                MB_STRIDE,
+                MB_BINS,
+                MB_FRAMES,
+                j0,
+                t,
+                re,
+                im,
+            );
         }
         Ok(())
     }
@@ -406,29 +646,47 @@ impl MelbandRoformerStft {
             return Err(Error::internal("melband istft: wrong buffer size"));
         }
         self.acc.fill(0.0);
-        // realfft's inverse is unnormalized, while numpy/torch unnormalized irfft
-        // divides by NFFT.
-        let scale = 1.0 / (MB_NFFT as f32);
-        for j in 0..MB_FRAMES {
-            for k in 0..MB_BINS {
-                self.spectrum[k] = Complex32::new(re[k * MB_FRAMES + j], im[k * MB_FRAMES + j]);
-            }
-            self.spectrum[0].im = 0.0;
-            self.spectrum[MB_BINS - 1].im = 0.0;
-            self.inverse
-                .process_with_scratch(&mut self.spectrum, &mut self.frame, &mut self.scratch_inv)
-                .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-            let dst = &mut self.acc[j * MB_HOP..j * MB_HOP + MB_NFFT];
-            for ((d, f), w) in dst.iter_mut().zip(&self.frame).zip(&self.window) {
-                *d += f * w * scale;
+        for j0 in (0..MB_FRAMES).step_by(TILE) {
+            let t = TILE.min(MB_FRAMES - j0);
+            load_tile(
+                re,
+                im,
+                MB_BINS,
+                MB_FRAMES,
+                j0,
+                t,
+                MB_STRIDE,
+                &mut self.tile_re,
+                &mut self.tile_im,
+            );
+            for tj in 0..t {
+                let j = j0 + tj;
+                let tre = &self.tile_re[tj * MB_STRIDE..tj * MB_STRIDE + MB_BINS];
+                let tim = &self.tile_im[tj * MB_STRIDE..tj * MB_STRIDE + MB_BINS];
+                for k in 0..MB_BINS {
+                    self.spectrum[k] = Complex32::new(tre[k], tim[k]);
+                }
+                self.spectrum[0].im = 0.0;
+                self.spectrum[MB_BINS - 1].im = 0.0;
+                self.inverse
+                    .process_with_scratch(
+                        &mut self.spectrum,
+                        &mut self.frame,
+                        &mut self.scratch_inv,
+                    )
+                    .map_err(|e| Error::internal(format!("ifft: {e}")))?;
+                let dst = &mut self.acc[j * MB_HOP..j * MB_HOP + MB_NFFT];
+                for ((d, f), iw) in dst.iter_mut().zip(&self.frame).zip(self.inv_window.iter()) {
+                    *d += f * iw;
+                }
             }
         }
-        for ((o, a), e) in out
+        for ((o, a), ie) in out
             .iter_mut()
             .zip(&self.acc[MB_CENTER..MB_CENTER + MB_SEGMENT])
-            .zip(&self.env)
+            .zip(self.inv_env.iter())
         {
-            *o = *a / *e;
+            *o = *a * *ie;
         }
         Ok(())
     }

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef } from "react";
-import type { Session, StemId } from "../ipc/contract";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
+import type { Peaks, Session, StemId, StemInfo } from "../ipc/contract";
 import { invoke } from "../ipc/client";
 import { startNativeStemDrag } from "../ipc/platform";
-import { useStore } from "../stores/createStore";
+import { useShallowStore } from "../stores/createStore";
 import {
   isChannelAudible,
   playbackStore,
@@ -16,6 +16,7 @@ import { sessionStore } from "../stores/sessionStore";
 import { renderTapeDragPreview } from "../utils/dragPreview";
 import { formatDb, formatElapsed } from "../utils/format";
 import { sortStemsForDisplay, stemName, stemNameLower } from "../utils/stems";
+import type { DecodedPeaks } from "../utils/waveform";
 import { Fader } from "../components/primitives/Fader";
 import { TapeLabel } from "../components/primitives/TapeLabel";
 import { tip } from "../components/primitives/Tooltip";
@@ -29,13 +30,166 @@ import {
 } from "../components/WaveformWell";
 import "./StemsView.css";
 
+interface StemChannelStripProps {
+  stem: StemInfo;
+  index: number;
+  solo: boolean;
+  muted: boolean;
+  gainDb: number;
+  revealing: boolean;
+  onDragOut: (stemId: StemId) => void;
+}
+
+const StemChannelStrip = memo(function StemChannelStrip({
+  stem,
+  index,
+  solo,
+  muted,
+  gainDb,
+  revealing,
+  onDragOut,
+}: StemChannelStripProps) {
+  const lower = stemNameLower(stem.id);
+  const heardText = useMemo(() => stem.contains.map((d) => d.label).join(", "), [stem.contains]);
+  const shortcutNum = index < 6 ? String(index + 1) : undefined;
+  const faderTip = useMemo(
+    () =>
+      tip(`${stemName(stem.id)} volume`, {
+        detail: "Adjust loudness for listening and mixdown export. Double-click to reset to 0 dB.",
+        placement: "top",
+      }),
+    [stem.id],
+  );
+  const handleStartDragOut = useCallback(() => {
+    onDragOut(stem.id);
+  }, [onDragOut, stem.id]);
+  const handleGainChange = useCallback(
+    (db: number) => {
+      void setChannelGain(stem.id, db);
+    },
+    [stem.id],
+  );
+  const handleSolo = useCallback(() => {
+    void toggleChannelSolo(stem.id);
+  }, [stem.id]);
+  const handleMute = useCallback(() => {
+    void toggleChannelMute(stem.id);
+  }, [stem.id]);
+
+  return (
+    <div className={revealing ? `ch ch--reveal stem-${stem.id}` : `ch stem-${stem.id}`}>
+      <TapeLabel stemId={stem.id} draggableHandle onStartDragOut={handleStartDragOut} />
+
+      <div
+        className="ch__heard"
+        {...(heardText
+          ? tip("Heard in this stem", { detail: heardText, placement: "right" })
+          : {})}
+      >
+        {heardText}
+      </div>
+
+      <div className="ch__ctl">
+        <button
+          type="button"
+          className={solo ? "ch__key ch__key--solo-on" : "ch__key"}
+          aria-label={`Solo ${lower}`}
+          aria-pressed={solo}
+          onClick={handleSolo}
+          {...tip(solo ? `Stop soloing ${lower}` : `Solo ${lower}`, {
+            detail: solo
+              ? "Return to hearing all unmuted stems."
+              : "Listen to only this stem. You can solo more than one at once.",
+            shortcut: shortcutNum,
+            placement: "top",
+          })}
+        >
+          S
+        </button>
+        <button
+          type="button"
+          className={muted ? "ch__key ch__key--mute-on" : "ch__key"}
+          aria-label={`Mute ${lower}`}
+          aria-pressed={muted}
+          onClick={handleMute}
+          {...tip(muted ? `Unmute ${lower}` : `Mute ${lower}`, {
+            detail: muted
+              ? "Bring this stem back into the mix."
+              : "Silence this stem while the others keep playing.",
+            shortcut: shortcutNum ? `Shift+${shortcutNum}` : undefined,
+            placement: "top",
+          })}
+        >
+          M
+        </button>
+        <Fader
+          className="ch__fader"
+          valueDb={gainDb}
+          label={`${stemName(stem.id)} level`}
+          onChange={handleGainChange}
+          tooltip={faderTip}
+        />
+        <span
+          className="ch__db"
+          {...tip(`Level: ${formatDb(gainDb)} dB`, {
+            detail: "0.0 dB is the original volume. Double-click the slider to reset.",
+            placement: "top",
+          })}
+        >
+          {formatDb(gainDb)}
+        </span>
+      </div>
+
+      <MeterBar stemId={stem.id} />
+    </div>
+  );
+});
+
+interface StemLaneProps {
+  stemId: StemId;
+  peaks: Peaks | DecodedPeaks | undefined;
+  audible: boolean;
+  durationSec: number;
+  playing: boolean;
+  revealing: boolean;
+}
+
+const StemLane = memo(function StemLane({
+  stemId,
+  peaks,
+  audible,
+  durationSec,
+  playing,
+  revealing,
+}: StemLaneProps) {
+  return (
+    <div className={revealing ? "lane lane--reveal" : "lane"}>
+      <WaveformCanvas
+        source={stemId}
+        peaks={peaks}
+        audible={audible}
+        durationSec={durationSec}
+        playing={playing}
+      />
+    </div>
+  );
+});
+
 interface StemsViewProps {
   session: Session;
 }
 
-export function StemsView({ session }: StemsViewProps) {
-  const { peaks, revealing } = useStore(sessionStore);
-  const { playback } = useStore(playbackStore);
+export const StemsView = memo(function StemsView({ session }: StemsViewProps) {
+  const { peaks, revealing } = useShallowStore(sessionStore, (s) => ({
+    peaks: s.peaks,
+    revealing: s.revealing,
+  }));
+  const { channels, playbackDurationSec, loop, playing } = useShallowStore(playbackStore, (s) => ({
+    channels: s.playback.channels,
+    playbackDurationSec: s.playback.durationSec,
+    loop: s.playback.loop,
+    playing: s.playback.playing,
+  }));
   const deskRef = useRef<HTMLElement | null>(null);
 
   const orderedStems = useMemo(() => sortStemsForDisplay(session.stems), [session.stems]);
@@ -73,23 +227,36 @@ export function StemsView({ session }: StemsViewProps) {
     }
   }, [gridRowsTemplate, revealing, orderedStems.length]);
 
-  const durationSec = playback.durationSec || session.track.durationSec;
-  const seekHandlers = useWellSeekHandlers(durationSec, true, (pos) => {
+  const durationSec = playbackDurationSec || session.track.durationSec;
+  const handleSeek = useCallback((pos: number) => {
     void seekPlayback(pos);
-  });
+  }, []);
+  const handleChangeLoop = useCallback((nextLoop: { startSec: number; endSec: number } | null) => {
+    void setLoopRegion(nextLoop);
+  }, []);
+  const seekHandlers = useWellSeekHandlers(durationSec, true, handleSeek);
 
-  const handleDragOut = async (stemId: StemId) => {
-    try {
-      const preview = renderTapeDragPreview(stemId);
-      const paths = await invoke("prepare_drag", {
-        sessionId: session.id,
-        stemIds: [stemId],
-      });
-      await startNativeStemDrag(paths, preview);
-    } catch {
-      // ignore cancelled drag
-    }
-  };
+  const handleDragOut = useCallback(
+    async (stemId: StemId) => {
+      try {
+        const preview = renderTapeDragPreview(stemId);
+        const paths = await invoke("prepare_drag", {
+          sessionId: session.id,
+          stemIds: [stemId],
+        });
+        await startNativeStemDrag(paths, preview);
+      } catch {
+        // ignore cancelled drag
+      }
+    },
+    [session.id],
+  );
+  const triggerDragOut = useCallback(
+    (stemId: StemId) => {
+      void handleDragOut(stemId);
+    },
+    [handleDragOut],
+  );
 
   const elapsed = session.split?.elapsedSec ?? 0;
   const stemCountLabel = `${session.stems.length} ${session.stems.length === 1 ? "stem" : "stems"}`;
@@ -102,91 +269,18 @@ export function StemsView({ session }: StemsViewProps) {
         <div className="stems-strip__head">{stripHeader}</div>
 
         {presentStems.map((stem, idx) => {
-          const ch = playback.channels.find((c) => c.id === stem.id);
-          const solo = ch?.solo ?? false;
-          const muted = ch?.muted ?? false;
-          const gainDb = ch?.gainDb ?? 0;
-          const lower = stemNameLower(stem.id);
-          const heardText = stem.contains.map((d) => d.label).join(", ");
-          const shortcutNum = idx < 6 ? String(idx + 1) : undefined;
-
+          const ch = channels.find((c) => c.id === stem.id);
           return (
-            <div
+            <StemChannelStrip
               key={stem.id}
-              className={revealing ? `ch ch--reveal stem-${stem.id}` : `ch stem-${stem.id}`}
-            >
-              <TapeLabel
-                stemId={stem.id}
-                draggableHandle
-                onStartDragOut={() => void handleDragOut(stem.id)}
-              />
-
-              <div
-                className="ch__heard"
-                {...(heardText
-                  ? tip("Heard in this stem", { detail: heardText, placement: "right" })
-                  : {})}
-              >
-                {heardText}
-              </div>
-
-              <div className="ch__ctl">
-                <button
-                  type="button"
-                  className={solo ? "ch__key ch__key--solo-on" : "ch__key"}
-                  aria-label={`Solo ${lower}`}
-                  aria-pressed={solo}
-                  onClick={() => void toggleChannelSolo(stem.id)}
-                  {...tip(solo ? `Stop soloing ${lower}` : `Solo ${lower}`, {
-                    detail: solo
-                      ? "Return to hearing all unmuted stems."
-                      : "Listen to only this stem. You can solo more than one at once.",
-                    shortcut: shortcutNum,
-                    placement: "top",
-                  })}
-                >
-                  S
-                </button>
-                <button
-                  type="button"
-                  className={muted ? "ch__key ch__key--mute-on" : "ch__key"}
-                  aria-label={`Mute ${lower}`}
-                  aria-pressed={muted}
-                  onClick={() => void toggleChannelMute(stem.id)}
-                  {...tip(muted ? `Unmute ${lower}` : `Mute ${lower}`, {
-                    detail: muted
-                      ? "Bring this stem back into the mix."
-                      : "Silence this stem while the others keep playing.",
-                    shortcut: shortcutNum ? `Shift+${shortcutNum}` : undefined,
-                    placement: "top",
-                  })}
-                >
-                  M
-                </button>
-                <Fader
-                  className="ch__fader"
-                  valueDb={gainDb}
-                  label={`${stemName(stem.id)} level`}
-                  onChange={(db) => void setChannelGain(stem.id, db)}
-                  tooltip={tip(`${stemName(stem.id)} volume`, {
-                    detail:
-                      "Adjust loudness for listening and mixdown export. Double-click to reset to 0 dB.",
-                    placement: "top",
-                  })}
-                />
-                <span
-                  className="ch__db"
-                  {...tip(`Level: ${formatDb(gainDb)} dB`, {
-                    detail: "0.0 dB is the original volume. Double-click the slider to reset.",
-                    placement: "top",
-                  })}
-                >
-                  {formatDb(gainDb)}
-                </span>
-              </div>
-
-              <MeterBar stemId={stem.id} />
-            </div>
+              stem={stem}
+              index={idx}
+              solo={ch?.solo ?? false}
+              muted={ch?.muted ?? false}
+              gainDb={ch?.gainDb ?? 0}
+              revealing={revealing}
+              onDragOut={triggerDragOut}
+            />
           );
         })}
 
@@ -212,25 +306,25 @@ export function StemsView({ session }: StemsViewProps) {
       >
         <TimeRuler
           durationSec={durationSec}
-          loop={playback.loop}
-          onSeek={(pos) => void seekPlayback(pos)}
-          onChangeLoop={(loop) => void setLoopRegion(loop)}
+          loop={loop}
+          onSeek={handleSeek}
+          onChangeLoop={handleChangeLoop}
         />
-        <LoopWash loop={playback.loop} durationSec={durationSec} />
+        <LoopWash loop={loop} durationSec={durationSec} />
 
         {presentStems.map((stem) => {
-          const ch = playback.channels.find((c) => c.id === stem.id);
-          const audible = isChannelAudible(ch, playback.channels);
+          const ch = channels.find((c) => c.id === stem.id);
+          const audible = isChannelAudible(ch, channels);
           return (
-            <div key={stem.id} className={revealing ? "lane lane--reveal" : "lane"}>
-              <WaveformCanvas
-                source={stem.id}
-                peaks={peaks[stem.id]}
-                audible={audible}
-                durationSec={durationSec}
-                playing={playback.playing}
-              />
-            </div>
+            <StemLane
+              key={stem.id}
+              stemId={stem.id}
+              peaks={peaks[stem.id]}
+              audible={audible}
+              durationSec={durationSec}
+              playing={playing}
+              revealing={revealing}
+            />
           );
         })}
 
@@ -238,8 +332,8 @@ export function StemsView({ session }: StemsViewProps) {
           <div key={stem.id} className="lane lane--flat" aria-hidden="true" />
         ))}
 
-        <PlayheadLine durationSec={durationSec} playing={playback.playing} />
+        <PlayheadLine durationSec={durationSec} playing={playing} />
       </section>
     </main>
   );
-}
+});
