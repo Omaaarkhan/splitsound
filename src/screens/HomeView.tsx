@@ -243,6 +243,38 @@ const HomeIllustration = memo(function HomeIllustration({
   );
 });
 
+const artworkObserverTargets = new WeakMap<Element, string>();
+let sharedArtworkObserver: IntersectionObserver | null = null;
+
+function observeRowArtwork(el: Element, sessionId: string): () => void {
+  if (typeof IntersectionObserver === "undefined") {
+    void loadSessionArtwork(sessionId);
+    return () => {};
+  }
+  if (!sharedArtworkObserver) {
+    sharedArtworkObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const id = artworkObserverTargets.get(entry.target);
+          artworkObserverTargets.delete(entry.target);
+          sharedArtworkObserver?.unobserve(entry.target);
+          if (id) {
+            void loadSessionArtwork(id);
+          }
+        }
+      },
+      { rootMargin: "200px" },
+    );
+  }
+  artworkObserverTargets.set(el, sessionId);
+  sharedArtworkObserver.observe(el);
+  return () => {
+    artworkObserverTargets.delete(el);
+    sharedArtworkObserver?.unobserve(el);
+  };
+}
+
 interface LibraryRowProps {
   session: SessionSummary;
   artworkUrl: string | null | undefined;
@@ -265,21 +297,11 @@ const LibraryRow = memo(function LibraryRow({
   useEffect(() => {
     if (!session.hasArtwork || artworkUrl !== undefined) return;
     const el = rowRef.current;
-    if (!el || typeof IntersectionObserver === "undefined") {
+    if (!el) {
       void loadSessionArtwork(session.id);
       return;
     }
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          io.disconnect();
-          void loadSessionArtwork(session.id);
-        }
-      },
-      { rootMargin: "200px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
+    return observeRowArtwork(el, session.id);
   }, [session.id, session.hasArtwork, artworkUrl]);
 
   useEffect(() => {

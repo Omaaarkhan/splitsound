@@ -152,7 +152,7 @@ pub fn run() {
                 onnxruntime: ort,
             });
             let sink: Arc<dyn EventSink> = Arc::new(TauriSink(handle.clone()));
-            let core = AppCore::start(CoreOptions {
+            let core = AppCore::start_deferred(CoreOptions {
                 paths,
                 engine,
                 events: sink.clone(),

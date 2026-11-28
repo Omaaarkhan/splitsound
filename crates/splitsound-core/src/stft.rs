@@ -149,12 +149,13 @@ pub struct HtdemucsStft {
     inverse: Arc<dyn ComplexToReal<f32>>,
     window: Arc<Vec<f32>>,
     inv_window: Arc<Vec<f32>>,
-    padded: Vec<f32>,
+    /// Shared time-domain scratch: holds reflect-padded input during `forward`
+    /// and the overlap-add accumulator during `inverse_add` (never live together).
+    work: Vec<f32>,
     frame: Vec<f32>,
     spectrum: Vec<Complex32>,
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
-    acc: Vec<f32>,
     tile_re: Vec<f32>,
     tile_im: Vec<f32>,
 }
@@ -186,9 +187,8 @@ impl HtdemucsStft {
             inverse,
             window,
             inv_window,
-            padded: vec![0.0; PADDED],
+            work: vec![0.0; PADDED],
             frame: vec![0.0; NFFT],
-            acc: vec![0.0; PADDED],
             tile_re: vec![0.0; TILE * HT_STRIDE],
             tile_im: vec![0.0; TILE * HT_STRIDE],
         }
@@ -204,9 +204,8 @@ impl HtdemucsStft {
             inverse: Arc::clone(&self.inverse),
             window: Arc::clone(&self.window),
             inv_window: Arc::clone(&self.inv_window),
-            padded: vec![0.0; PADDED],
+            work: vec![0.0; PADDED],
             frame: vec![0.0; NFFT],
-            acc: vec![0.0; PADDED],
             tile_re: vec![0.0; TILE * HT_STRIDE],
             tile_im: vec![0.0; TILE * HT_STRIDE],
         }
@@ -224,18 +223,18 @@ impl HtdemucsStft {
         }
         // Reflect padding without repeating the edge sample.
         for i in 0..PAD {
-            self.padded[i] = x[PAD - i];
+            self.work[i] = x[PAD - i];
         }
-        self.padded[PAD..PAD + SEGMENT].copy_from_slice(x);
+        self.work[PAD..PAD + SEGMENT].copy_from_slice(x);
         for i in 0..PAD_R {
-            self.padded[PAD + SEGMENT + i] = x[SEGMENT - 2 - i];
+            self.work[PAD + SEGMENT + i] = x[SEGMENT - 2 - i];
         }
         let scale = 1.0 / (NFFT as f32).sqrt();
         for j0 in (0..FRAMES).step_by(TILE) {
             let t = TILE.min(FRAMES - j0);
             for tj in 0..t {
                 let j = j0 + tj;
-                let src = &self.padded[j * HOP..j * HOP + NFFT];
+                let src = &self.work[j * HOP..j * HOP + NFFT];
                 for ((f, s), w) in self.frame.iter_mut().zip(src).zip(self.window.iter()) {
                     *f = s * w;
                 }
@@ -278,7 +277,7 @@ impl HtdemucsStft {
         if out.len() != SEGMENT || re.len() != PLANE || im.len() != PLANE {
             return Err(Error::internal("istft: wrong buffer size"));
         }
-        self.acc.fill(0.0);
+        self.work.fill(0.0);
         for j0 in (0..FRAMES).step_by(TILE) {
             let t = TILE.min(FRAMES - j0);
             load_tile(
@@ -312,13 +311,13 @@ impl HtdemucsStft {
                         &mut self.scratch_inv,
                     )
                     .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-                let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
+                let dst = &mut self.work[j * HOP..j * HOP + NFFT];
                 for ((d, f), iw) in dst.iter_mut().zip(&self.frame).zip(self.inv_window.iter()) {
                     *d += f * iw;
                 }
             }
         }
-        for (o, a) in out.iter_mut().zip(&self.acc[PAD..PAD + SEGMENT]) {
+        for (o, a) in out.iter_mut().zip(&self.work[PAD..PAD + SEGMENT]) {
             *o += *a;
         }
         Ok(())
@@ -331,12 +330,11 @@ impl HtdemucsStft {
 pub struct ScnetStft {
     forward: Arc<dyn RealToComplex<f32>>,
     inverse: Arc<dyn ComplexToReal<f32>>,
-    padded: Vec<f32>,
+    work: Vec<f32>,
     frame: Vec<f32>,
     spectrum: Vec<Complex32>,
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
-    acc: Vec<f32>,
     tile_re: Vec<f32>,
     tile_im: Vec<f32>,
 }
@@ -359,9 +357,8 @@ impl ScnetStft {
             spectrum: forward.make_output_vec(),
             forward,
             inverse,
-            padded: vec![0.0; SC_PADDED],
+            work: vec![0.0; SC_PADDED],
             frame: vec![0.0; NFFT],
-            acc: vec![0.0; SC_PADDED],
             tile_re: vec![0.0; TILE * SC_STRIDE],
             tile_im: vec![0.0; TILE * SC_STRIDE],
         }
@@ -375,9 +372,8 @@ impl ScnetStft {
             spectrum: self.forward.make_output_vec(),
             forward: Arc::clone(&self.forward),
             inverse: Arc::clone(&self.inverse),
-            padded: vec![0.0; SC_PADDED],
+            work: vec![0.0; SC_PADDED],
             frame: vec![0.0; NFFT],
-            acc: vec![0.0; SC_PADDED],
             tile_re: vec![0.0; TILE * SC_STRIDE],
             tile_im: vec![0.0; TILE * SC_STRIDE],
         }
@@ -392,13 +388,13 @@ impl ScnetStft {
         // xp = x ++ zeros[TAIL]; then reflect CENTER samples on both sides.
         let xp_len = SC_SEGMENT + SC_TAIL;
         let xp = |i: usize| if i < SC_SEGMENT { x[i] } else { 0.0 };
-        for (i, p) in self.padded[..SC_CENTER].iter_mut().enumerate() {
+        for (i, p) in self.work[..SC_CENTER].iter_mut().enumerate() {
             *p = xp(SC_CENTER - i);
         }
-        self.padded[SC_CENTER..SC_CENTER + SC_SEGMENT].copy_from_slice(x);
-        self.padded[SC_CENTER + SC_SEGMENT..SC_CENTER + xp_len].fill(0.0);
+        self.work[SC_CENTER..SC_CENTER + SC_SEGMENT].copy_from_slice(x);
+        self.work[SC_CENTER + SC_SEGMENT..SC_CENTER + xp_len].fill(0.0);
         for i in 0..SC_CENTER {
-            self.padded[SC_CENTER + xp_len + i] = xp(xp_len - 2 - i);
+            self.work[SC_CENTER + xp_len + i] = xp(xp_len - 2 - i);
         }
         let scale = 1.0 / (NFFT as f32).sqrt();
         for j0 in (0..SC_FRAMES).step_by(TILE) {
@@ -406,7 +402,7 @@ impl ScnetStft {
             for tj in 0..t {
                 let j = j0 + tj;
                 self.frame
-                    .copy_from_slice(&self.padded[j * HOP..j * HOP + NFFT]);
+                    .copy_from_slice(&self.work[j * HOP..j * HOP + NFFT]);
                 self.forward
                     .process_with_scratch(
                         &mut self.frame,
@@ -443,7 +439,7 @@ impl ScnetStft {
         if out.len() != SC_SEGMENT || re.len() != SC_PLANE || im.len() != SC_PLANE {
             return Err(Error::internal("scnet istft: wrong buffer size"));
         }
-        self.acc.fill(0.0);
+        self.work.fill(0.0);
         // realfft's inverse is unnormalised, so `sqrt(NFFT) * irfft` is a
         // plain `1 / sqrt(NFFT)`, folded directly into the final overlap pass.
         let scale = 1.0 / (NFFT as f32).sqrt();
@@ -478,7 +474,7 @@ impl ScnetStft {
                         &mut self.scratch_inv,
                     )
                     .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-                let dst = &mut self.acc[j * HOP..j * HOP + NFFT];
+                let dst = &mut self.work[j * HOP..j * HOP + NFFT];
                 for (d, f) in dst.iter_mut().zip(&self.frame) {
                     *d += f;
                 }
@@ -488,7 +484,7 @@ impl ScnetStft {
         // first hop, 4 afterwards) multiplied by `scale`.
         let scale3 = scale / 3.0;
         let scale4 = scale / 4.0;
-        let src = &self.acc[SC_CENTER..SC_CENTER + SC_SEGMENT];
+        let src = &self.work[SC_CENTER..SC_CENTER + SC_SEGMENT];
         for (o, a) in out[..HOP].iter_mut().zip(&src[..HOP]) {
             *o = *a * scale3;
         }
@@ -508,12 +504,11 @@ pub struct MelbandRoformerStft {
     window: Arc<Vec<f32>>,
     inv_window: Arc<Vec<f32>>,
     inv_env: Arc<Vec<f32>>,
-    padded: Vec<f32>,
+    work: Vec<f32>,
     frame: Vec<f32>,
     spectrum: Vec<Complex32>,
     scratch_fwd: Vec<Complex32>,
     scratch_inv: Vec<Complex32>,
-    acc: Vec<f32>,
     tile_re: Vec<f32>,
     tile_im: Vec<f32>,
 }
@@ -561,9 +556,8 @@ impl MelbandRoformerStft {
             window,
             inv_window,
             inv_env,
-            padded: vec![0.0; MB_PADDED],
+            work: vec![0.0; MB_PADDED],
             frame: vec![0.0; MB_NFFT],
-            acc: vec![0.0; MB_PADDED],
             tile_re: vec![0.0; TILE * MB_STRIDE],
             tile_im: vec![0.0; TILE * MB_STRIDE],
         }
@@ -580,9 +574,8 @@ impl MelbandRoformerStft {
             window: Arc::clone(&self.window),
             inv_window: Arc::clone(&self.inv_window),
             inv_env: Arc::clone(&self.inv_env),
-            padded: vec![0.0; MB_PADDED],
+            work: vec![0.0; MB_PADDED],
             frame: vec![0.0; MB_NFFT],
-            acc: vec![0.0; MB_PADDED],
             tile_re: vec![0.0; TILE * MB_STRIDE],
             tile_im: vec![0.0; TILE * MB_STRIDE],
         }
@@ -594,18 +587,18 @@ impl MelbandRoformerStft {
         if x.len() != MB_SEGMENT || re.len() != MB_PLANE || im.len() != MB_PLANE {
             return Err(Error::internal("melband stft: wrong buffer size"));
         }
-        for (i, p) in self.padded[..MB_CENTER].iter_mut().enumerate() {
+        for (i, p) in self.work[..MB_CENTER].iter_mut().enumerate() {
             *p = x[MB_CENTER - i];
         }
-        self.padded[MB_CENTER..MB_CENTER + MB_SEGMENT].copy_from_slice(x);
+        self.work[MB_CENTER..MB_CENTER + MB_SEGMENT].copy_from_slice(x);
         for i in 0..MB_CENTER {
-            self.padded[MB_CENTER + MB_SEGMENT + i] = x[MB_SEGMENT - 2 - i];
+            self.work[MB_CENTER + MB_SEGMENT + i] = x[MB_SEGMENT - 2 - i];
         }
         for j0 in (0..MB_FRAMES).step_by(TILE) {
             let t = TILE.min(MB_FRAMES - j0);
             for tj in 0..t {
                 let j = j0 + tj;
-                let src = &self.padded[j * MB_HOP..j * MB_HOP + MB_NFFT];
+                let src = &self.work[j * MB_HOP..j * MB_HOP + MB_NFFT];
                 for ((f, s), w) in self.frame.iter_mut().zip(src).zip(self.window.iter()) {
                     *f = s * w;
                 }
@@ -645,7 +638,7 @@ impl MelbandRoformerStft {
         if out.len() != MB_SEGMENT || re.len() != MB_PLANE || im.len() != MB_PLANE {
             return Err(Error::internal("melband istft: wrong buffer size"));
         }
-        self.acc.fill(0.0);
+        self.work.fill(0.0);
         for j0 in (0..MB_FRAMES).step_by(TILE) {
             let t = TILE.min(MB_FRAMES - j0);
             load_tile(
@@ -675,7 +668,7 @@ impl MelbandRoformerStft {
                         &mut self.scratch_inv,
                     )
                     .map_err(|e| Error::internal(format!("ifft: {e}")))?;
-                let dst = &mut self.acc[j * MB_HOP..j * MB_HOP + MB_NFFT];
+                let dst = &mut self.work[j * MB_HOP..j * MB_HOP + MB_NFFT];
                 for ((d, f), iw) in dst.iter_mut().zip(&self.frame).zip(self.inv_window.iter()) {
                     *d += f * iw;
                 }
@@ -683,7 +676,7 @@ impl MelbandRoformerStft {
         }
         for ((o, a), ie) in out
             .iter_mut()
-            .zip(&self.acc[MB_CENTER..MB_CENTER + MB_SEGMENT])
+            .zip(&self.work[MB_CENTER..MB_CENTER + MB_SEGMENT])
             .zip(self.inv_env.iter())
         {
             *o = *a * *ie;

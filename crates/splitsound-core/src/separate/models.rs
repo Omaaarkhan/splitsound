@@ -35,12 +35,34 @@ pub fn open_segment_model(
     session: Session,
     num_sources: usize,
 ) -> Result<Box<dyn SegmentModel + Send>> {
+    open_segment_model_with_threads(kind, session, num_sources, worker_count())
+}
+
+/// [`open_segment_model`] with an explicit upper bound on parallel STFT
+/// workers (typically `Engine::threads()`), additionally capped by the
+/// model's stereo channel count (`num_sources * 2`).
+pub fn open_segment_model_with_threads(
+    kind: SeparatorKind,
+    session: Session,
+    num_sources: usize,
+    max_threads: usize,
+) -> Result<Box<dyn SegmentModel + Send>> {
     match kind {
-        SeparatorKind::Scnet => Ok(Box::new(ScnetModel::new(session, num_sources))),
-        SeparatorKind::Htdemucs => Ok(Box::new(HtdemucsModel::new(session, num_sources))),
-        SeparatorKind::MelbandRoformer => {
-            Ok(Box::new(MelbandRoformerModel::new(session, num_sources)))
-        }
+        SeparatorKind::Scnet => Ok(Box::new(ScnetModel::with_threads(
+            session,
+            num_sources,
+            max_threads,
+        ))),
+        SeparatorKind::Htdemucs => Ok(Box::new(HtdemucsModel::with_threads(
+            session,
+            num_sources,
+            max_threads,
+        ))),
+        SeparatorKind::MelbandRoformer => Ok(Box::new(MelbandRoformerModel::with_threads(
+            session,
+            num_sources,
+            max_threads,
+        ))),
     }
 }
 
@@ -66,8 +88,18 @@ fn worker_count() -> usize {
         .clamp(1, 12)
 }
 
-fn make_workers<S>(first: &S, clone: impl Fn(&S) -> S) -> Vec<S> {
-    let n = worker_count().saturating_sub(1);
+/// Number of auxiliary STFT workers (excluding the primary instance) needed
+/// for a model with `sources` stereo outputs and at most `max_threads`
+/// threads. Forward STFT uses at most 2 threads (L/R) and inverse STFT uses at
+/// most `sources * 2` threads.
+pub(crate) fn extra_worker_count(sources: usize, max_threads: usize) -> usize {
+    let max_tasks = sources.saturating_mul(2).max(2);
+    let total = max_threads.clamp(1, 12).min(max_tasks);
+    total.saturating_sub(1)
+}
+
+fn make_workers<S>(first: &S, sources: usize, max_threads: usize, clone: impl Fn(&S) -> S) -> Vec<S> {
+    let n = extra_worker_count(sources, max_threads);
     (0..n).map(|_| clone(first)).collect()
 }
 
@@ -157,8 +189,13 @@ pub struct ScnetModel {
 impl ScnetModel {
     /// Wraps a session of an SCNet graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        Self::with_threads(session, sources, worker_count())
+    }
+
+    /// [`ScnetModel::new`] capped to at most `max_threads` STFT workers.
+    pub fn with_threads(session: Session, sources: usize, max_threads: usize) -> Self {
         let stft = ScnetStft::new();
-        let workers = make_workers(&stft, ScnetStft::clone_worker);
+        let workers = make_workers(&stft, sources, max_threads, ScnetStft::clone_worker);
         ScnetModel {
             session,
             stft,
@@ -255,8 +292,13 @@ pub struct HtdemucsModel {
 impl HtdemucsModel {
     /// Wraps a session of an HTDemucs graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        Self::with_threads(session, sources, worker_count())
+    }
+
+    /// [`HtdemucsModel::new`] capped to at most `max_threads` STFT workers.
+    pub fn with_threads(session: Session, sources: usize, max_threads: usize) -> Self {
         let stft = HtdemucsStft::new();
-        let workers = make_workers(&stft, HtdemucsStft::clone_worker);
+        let workers = make_workers(&stft, sources, max_threads, HtdemucsStft::clone_worker);
         HtdemucsModel {
             session,
             stft,
@@ -370,8 +412,18 @@ pub struct MelbandRoformerModel {
 impl MelbandRoformerModel {
     /// Wraps a session of a Mel-Band RoFormer graph with `sources` outputs.
     pub fn new(session: Session, sources: usize) -> Self {
+        Self::with_threads(session, sources, worker_count())
+    }
+
+    /// [`MelbandRoformerModel::new`] capped to at most `max_threads` STFT workers.
+    pub fn with_threads(session: Session, sources: usize, max_threads: usize) -> Self {
         let stft = MelbandRoformerStft::new();
-        let workers = make_workers(&stft, MelbandRoformerStft::clone_worker);
+        let workers = make_workers(
+            &stft,
+            sources,
+            max_threads,
+            MelbandRoformerStft::clone_worker,
+        );
         MelbandRoformerModel {
             session,
             stft,
@@ -455,5 +507,23 @@ impl SegmentModel for MelbandRoformerModel {
             t.dst.resize(MB_SEGMENT, 0.0);
             s.inverse(t.re, t.im, t.dst)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_pool_is_bounded_by_sources_and_threads() {
+        // Single-source stereo model (RoFormer): never needs more than 1 extra worker.
+        assert_eq!(extra_worker_count(1, 12), 1);
+        assert_eq!(extra_worker_count(1, 1), 0);
+        // 4-source model (SCNet): bounded by min(8, threads) - 1.
+        assert_eq!(extra_worker_count(4, 4), 3);
+        assert_eq!(extra_worker_count(4, 12), 7);
+        // 6-source model (HTDemucs): bounded by min(12, threads) - 1.
+        assert_eq!(extra_worker_count(6, 4), 3);
+        assert_eq!(extra_worker_count(6, 16), 11);
     }
 }

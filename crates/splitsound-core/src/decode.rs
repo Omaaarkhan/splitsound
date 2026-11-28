@@ -279,6 +279,11 @@ struct StreamingWavSink {
     target_rate: u32,
     channels: usize,
     matrix: Vec<(f32, f32)>,
+    /// True when source is already stereo at `target_rate` with an identity
+    /// channel matrix: write sanitized interleaved packets straight to disk,
+    /// skipping de-interleave, passthrough resampler copy, and re-interleave.
+    direct_stereo: bool,
+    direct_frames: u64,
     resampler: Option<StreamResampler>,
     writer: Option<crate::wav::WavWriter>,
     dst: std::path::PathBuf,
@@ -296,17 +301,32 @@ impl PcmSink for StreamingWavSink {
         _hint_frames: u64,
     ) -> Result<()> {
         self.channels = channels;
+        self.direct_stereo = rate == self.target_rate
+            && channels == 2
+            && matrix.len() == 2
+            && (matrix[0].0 - 1.0).abs() < 1e-6
+            && matrix[0].1.abs() < 1e-6
+            && matrix[1].0.abs() < 1e-6
+            && (matrix[1].1 - 1.0).abs() < 1e-6;
+        self.direct_frames = 0;
         self.matrix = matrix;
-        self.resampler = Some(StreamResampler::new(rate, self.target_rate, 2)?);
+        if !self.direct_stereo {
+            self.resampler = Some(StreamResampler::new(rate, self.target_rate, 2)?);
+        }
         self.writer = Some(crate::wav::WavWriter::create(&self.dst, self.target_rate)?);
         Ok(())
     }
 
     fn write(&mut self, interleaved: &[f32]) -> Result<()> {
-        let Some(rs) = self.resampler.as_mut() else {
+        let Some(writer) = self.writer.as_mut() else {
             return Err(Error::internal("sink used before begin"));
         };
-        let Some(writer) = self.writer.as_mut() else {
+        if self.direct_stereo {
+            writer.write_interleaved(interleaved)?;
+            self.direct_frames += (interleaved.len() / 2) as u64;
+            return Ok(());
+        }
+        let Some(rs) = self.resampler.as_mut() else {
             return Err(Error::internal("sink used before begin"));
         };
         for c in &mut self.chunk_buf {
@@ -352,6 +372,8 @@ pub fn decode_to_wav(
             target_rate,
             channels: 0,
             matrix: Vec::new(),
+            direct_stereo: false,
+            direct_frames: 0,
             resampler: None,
             writer: None,
             dst: out_wav.to_path_buf(),
@@ -360,20 +382,24 @@ pub fn decode_to_wav(
             tmp_r: Vec::new(),
         };
         let (mut info, artwork) = decode_inner(path, limits, progress, &mut sink)?;
-        let Some(mut rs) = sink.resampler.take() else {
-            return Err(damaged().with_detail("no audio could be decoded"));
-        };
         let Some(mut writer) = sink.writer.take() else {
             return Err(damaged().with_detail("no audio could be decoded"));
         };
-        for c in &mut sink.chunk_buf {
-            c.clear();
-        }
-        rs.finish(&mut sink.chunk_buf)?;
-        if !sink.chunk_buf[0].is_empty() {
-            writer.write_planar(&sink.chunk_buf[0], &sink.chunk_buf[1])?;
-        }
-        let frames = rs.frames_out();
+        let frames = if sink.direct_stereo {
+            sink.direct_frames
+        } else {
+            let Some(mut rs) = sink.resampler.take() else {
+                return Err(damaged().with_detail("no audio could be decoded"));
+            };
+            for c in &mut sink.chunk_buf {
+                c.clear();
+            }
+            rs.finish(&mut sink.chunk_buf)?;
+            if !sink.chunk_buf[0].is_empty() {
+                writer.write_planar(&sink.chunk_buf[0], &sink.chunk_buf[1])?;
+            }
+            rs.frames_out()
+        };
         if frames == 0 {
             return Err(damaged().with_detail("no audio could be decoded"));
         }

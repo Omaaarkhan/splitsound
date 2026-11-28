@@ -150,7 +150,6 @@ interface StemLaneProps {
   peaks: Peaks | DecodedPeaks | undefined;
   audible: boolean;
   durationSec: number;
-  playing: boolean;
   revealing: boolean;
 }
 
@@ -159,18 +158,11 @@ const StemLane = memo(function StemLane({
   peaks,
   audible,
   durationSec,
-  playing,
   revealing,
 }: StemLaneProps) {
   return (
     <div className={revealing ? "lane lane--reveal" : "lane"}>
-      <WaveformCanvas
-        source={stemId}
-        peaks={peaks}
-        audible={audible}
-        durationSec={durationSec}
-        playing={playing}
-      />
+      <WaveformCanvas source={stemId} peaks={peaks} audible={audible} durationSec={durationSec} />
     </div>
   );
 });
@@ -184,11 +176,10 @@ export const StemsView = memo(function StemsView({ session }: StemsViewProps) {
     peaks: s.peaks,
     revealing: s.revealing,
   }));
-  const { channels, playbackDurationSec, loop, playing } = useShallowStore(playbackStore, (s) => ({
+  const { channels, playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
     channels: s.playback.channels,
     playbackDurationSec: s.playback.durationSec,
     loop: s.playback.loop,
-    playing: s.playback.playing,
   }));
   const deskRef = useRef<HTMLElement | null>(null);
 
@@ -322,7 +313,6 @@ export const StemsView = memo(function StemsView({ session }: StemsViewProps) {
               peaks={peaks[stem.id]}
               audible={audible}
               durationSec={durationSec}
-              playing={playing}
               revealing={revealing}
             />
           );
@@ -332,7 +322,7 @@ export const StemsView = memo(function StemsView({ session }: StemsViewProps) {
           <div key={stem.id} className="lane lane--flat" aria-hidden="true" />
         ))}
 
-        <PlayheadLine durationSec={durationSec} playing={playing} />
+        <PlayheadLine durationSec={durationSec} />
       </section>
     </main>
   );

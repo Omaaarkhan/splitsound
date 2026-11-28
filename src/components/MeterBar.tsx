@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import type { StemId } from "../ipc/contract";
-import { getPlaybackLevels, subscribePlaybackFrame } from "../stores/playbackStore";
+import { getPlaybackLevels, subscribePlaybackTicks } from "../stores/playbackStore";
 import "./MeterBar.css";
 
 interface MeterBarProps {
@@ -23,7 +23,7 @@ export const MeterBar = memo(function MeterBar({ stemId }: MeterBarProps) {
       }
     };
     sync();
-    return subscribePlaybackFrame(sync);
+    return subscribePlaybackTicks(sync);
   }, [stemId]);
 
   return (

@@ -340,7 +340,6 @@ interface WaveformCanvasProps {
   peaks: Peaks | DecodedPeaks | undefined;
   audible: boolean;
   durationSec: number;
-  playing: boolean;
   /** Optional splitting cut line bands to draw behind it. */
   splitOverlay?: {
     fraction?: number;
@@ -355,6 +354,10 @@ interface WaveformCacheLayer {
   w: number;
   h: number;
   dpr: number;
+  source: SourceId;
+  decoded: DecodedPeaks | null;
+  audible: boolean;
+  splitOverlay: WaveformCanvasProps["splitOverlay"];
   playedCanvas: HTMLCanvasElement;
   aheadCanvas: HTMLCanvasElement;
   ribbonsCanvas: HTMLCanvasElement | null;
@@ -373,7 +376,6 @@ export const WaveformCanvas = memo(function WaveformCanvas({
   peaks,
   audible,
   durationSec,
-  playing: _playing,
   splitOverlay,
   splitFraction,
 }: WaveformCanvasProps) {
@@ -388,6 +390,7 @@ export const WaveformCanvas = memo(function WaveformCanvas({
   const sizeRef = useRef<{ w: number; h: number; dpr: number }>({ w: 0, h: 0, dpr: 1 });
   const cacheRef = useRef<WaveformCacheLayer | null>(null);
   const paintRef = useRef<() => void>(() => {});
+  const startSplitAnimRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const frac = splitFraction ?? splitOverlay?.fraction;
@@ -396,6 +399,8 @@ export const WaveformCanvas = memo(function WaveformCanvas({
       if (!splitOverlay?.animate) {
         smoothCutRef.current = frac;
         paintRef.current();
+      } else if (Math.abs(frac - smoothCutRef.current) >= 0.0005) {
+        startSplitAnimRef.current?.();
       }
     }
   }, [splitFraction, splitOverlay]);
@@ -414,6 +419,24 @@ export const WaveformCanvas = memo(function WaveformCanvas({
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const animateSplit = Boolean(splitOverlay?.animate) && !reducedMotion;
+
+    let releaseSplitAnim: (() => void) | null = null;
+    const ensureSplitAnim = () => {
+      if (animateSplit && !releaseSplitAnim) {
+        releaseSplitAnim = acquirePlaybackAnimation();
+      }
+    };
+    const stopSplitAnim = () => {
+      if (releaseSplitAnim) {
+        const release = releaseSplitAnim;
+        releaseSplitAnim = null;
+        release();
+      }
+    };
+
+    let lastPlayPx = -1;
+    let lastCutFrac = -1;
+    let needsFullDraw = true;
 
     const rebuildCache = (w: number, h: number, dpr: number): WaveformCacheLayer => {
       const targetW = Math.max(1, Math.round(w * dpr));
@@ -487,6 +510,10 @@ export const WaveformCanvas = memo(function WaveformCanvas({
         w,
         h,
         dpr,
+        source,
+        decoded,
+        audible,
+        splitOverlay,
         playedCanvas,
         aheadCanvas,
         ribbonsCanvas,
@@ -496,118 +523,173 @@ export const WaveformCanvas = memo(function WaveformCanvas({
       return built;
     };
 
-    const drawPlayheadSplit = (
+    const drawPlayheadSplitInCssSpace = (
       ctx: CanvasRenderingContext2D,
       cache: WaveformCacheLayer,
       w: number,
       h: number,
-      playFrac: number,
+      targetW: number,
+      targetH: number,
+      playPx: number,
     ) => {
-      const playX = w * playFrac;
-      if (playX > 0) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(0, 0, playX, h);
-        ctx.clip();
-        ctx.drawImage(cache.playedCanvas, 0, 0, w, h);
-        ctx.restore();
+      const playCssX = (playPx / targetW) * w;
+      if (playPx > 0) {
+        ctx.drawImage(cache.playedCanvas, 0, 0, playPx, targetH, 0, 0, playCssX, h);
       }
-      if (playX < w) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(playX, 0, w - playX, h);
-        ctx.clip();
-        ctx.drawImage(cache.aheadCanvas, 0, 0, w, h);
-        ctx.restore();
+      if (playPx < targetW) {
+        const remPx = targetW - playPx;
+        ctx.drawImage(cache.aheadCanvas, playPx, 0, remPx, targetH, playCssX, 0, w - playCssX, h);
       }
     };
 
     const paint = () => {
       if (animateSplit) {
         const diff = targetCutRef.current - smoothCutRef.current;
-        smoothCutRef.current =
-          Math.abs(diff) < 0.0005 ? targetCutRef.current : smoothCutRef.current + diff * 0.12;
+        if (Math.abs(diff) < 0.0005) {
+          smoothCutRef.current = targetCutRef.current;
+          stopSplitAnim();
+        } else {
+          smoothCutRef.current += diff * 0.12;
+        }
       }
 
       const { w, h, dpr } = sizeRef.current;
       if (w <= 0 || h <= 0) return;
 
-      const targetW = Math.round(w * dpr);
-      const targetH = Math.round(h * dpr);
+      const targetW = Math.max(1, Math.round(w * dpr));
+      const targetH = Math.max(1, Math.round(h * dpr));
       if (canvas.width !== targetW || canvas.height !== targetH) {
         canvas.width = targetW;
         canvas.height = targetH;
+        needsFullDraw = true;
+        lastPlayPx = -1;
+      }
+
+      let cache = cacheRef.current;
+      if (
+        !cache ||
+        cache.w !== w ||
+        cache.h !== h ||
+        cache.dpr !== dpr ||
+        cache.source !== source ||
+        cache.decoded !== decoded ||
+        cache.audible !== audible ||
+        cache.splitOverlay !== splitOverlay
+      ) {
+        cache = rebuildCache(w, h, dpr);
+        needsFullDraw = true;
+        lastPlayPx = -1;
+      }
+
+      const playFrac =
+        durationSec > 0 ? Math.max(0, Math.min(1, getInterpolatedPositionSec() / durationSec)) : 0;
+      const playPx = Math.max(0, Math.min(targetW, Math.round(targetW * playFrac)));
+
+      if (!splitOverlay) {
+        if (!needsFullDraw && playPx === lastPlayPx) {
+          return;
+        }
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (!decoded) {
+          ctx.clearRect(0, 0, targetW, targetH);
+        } else if (needsFullDraw || lastPlayPx < 0) {
+          ctx.clearRect(0, 0, targetW, targetH);
+          if (playPx > 0) {
+            ctx.drawImage(cache.playedCanvas, 0, 0, playPx, targetH, 0, 0, playPx, targetH);
+          }
+          if (playPx < targetW) {
+            const rem = targetW - playPx;
+            ctx.drawImage(cache.aheadCanvas, playPx, 0, rem, targetH, playPx, 0, rem, targetH);
+          }
+        } else {
+          const x0 = Math.min(lastPlayPx, playPx);
+          const stripW = Math.abs(playPx - lastPlayPx);
+          if (stripW > 0) {
+            ctx.clearRect(x0, 0, stripW, targetH);
+            const src = playPx > lastPlayPx ? cache.playedCanvas : cache.aheadCanvas;
+            ctx.drawImage(src, x0, 0, stripW, targetH, x0, 0, stripW, targetH);
+          }
+        }
+        ctx.restore();
+        lastPlayPx = playPx;
+        needsFullDraw = false;
+        return;
+      }
+
+      const cutFrac = Math.max(0, Math.min(1, smoothCutRef.current));
+      if (!needsFullDraw && playPx === lastPlayPx && Math.abs(cutFrac - lastCutFrac) < 1e-6) {
+        return;
       }
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      let cache = cacheRef.current;
-      if (!cache || cache.w !== w || cache.h !== h || cache.dpr !== dpr) {
-        cache = rebuildCache(w, h, dpr);
-      }
-
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
-      const playFrac =
-        durationSec > 0 ? Math.max(0, Math.min(1, getInterpolatedPositionSec() / durationSec)) : 0;
+      const cx = cutFrac * w;
+      const dx = h * 0.5;
+      const topX = cx + dx;
+      const botX = cx - dx;
 
-      if (splitOverlay) {
-        const cutFrac = Math.max(0, Math.min(1, smoothCutRef.current));
-        const cx = cutFrac * w;
-        const dx = h * 0.5;
-        const topX = cx + dx;
-        const botX = cx - dx;
-
-        if (decoded) {
-          if (cache.ribbonsCanvas && topX > 0) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(0, 0);
-            ctx.lineTo(topX, 0);
-            ctx.lineTo(botX, h);
-            ctx.lineTo(0, h);
-            ctx.closePath();
-            ctx.clip();
-            ctx.drawImage(cache.ribbonsCanvas, 0, 0, w, h);
-            ctx.restore();
-          }
-
+      if (decoded) {
+        if (cache.ribbonsCanvas && topX > 0) {
           ctx.save();
           ctx.beginPath();
-          ctx.moveTo(topX, 0);
-          ctx.lineTo(w, 0);
-          ctx.lineTo(w, h);
+          ctx.moveTo(0, 0);
+          ctx.lineTo(topX, 0);
           ctx.lineTo(botX, h);
+          ctx.lineTo(0, h);
           ctx.closePath();
           ctx.clip();
-          drawPlayheadSplit(ctx, cache, w, h, playFrac);
+          ctx.drawImage(cache.ribbonsCanvas, 0, 0, w, h);
           ctx.restore();
         }
 
         ctx.save();
-        ctx.strokeStyle = cache.lampColor;
-        ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(botX, h);
-        ctx.lineTo(topX, 0);
-        ctx.stroke();
+        ctx.moveTo(topX, 0);
+        ctx.lineTo(w, 0);
+        ctx.lineTo(w, h);
+        ctx.lineTo(botX, h);
+        ctx.closePath();
+        ctx.clip();
+        drawPlayheadSplitInCssSpace(ctx, cache, w, h, targetW, targetH, playPx);
         ctx.restore();
-      } else if (decoded) {
-        drawPlayheadSplit(ctx, cache, w, h, playFrac);
       }
 
+      ctx.save();
+      ctx.strokeStyle = cache.lampColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(botX, h);
+      ctx.lineTo(topX, 0);
+      ctx.stroke();
       ctx.restore();
+
+      ctx.restore();
+      lastPlayPx = playPx;
+      lastCutFrac = cutFrac;
+      needsFullDraw = false;
     };
 
     paintRef.current = paint;
+    startSplitAnimRef.current = () => {
+      ensureSplitAnim();
+      paint();
+    };
 
     const syncSizeAndPaint = () => {
       const rect = canvas.getBoundingClientRect();
       const dpr = Math.min(3, window.devicePixelRatio || 1);
       sizeRef.current = { w: rect.width, h: rect.height, dpr };
+      needsFullDraw = true;
       paint();
     };
 
@@ -622,6 +704,7 @@ export const WaveformCanvas = memo(function WaveformCanvas({
           h: entry.contentRect.height,
           dpr,
         };
+        needsFullDraw = true;
         paint();
       } else {
         syncSizeAndPaint();
@@ -630,13 +713,16 @@ export const WaveformCanvas = memo(function WaveformCanvas({
     ro.observe(canvas);
 
     const unsubFrame = subscribePlaybackFrame(paint);
-    const releaseAnim = animateSplit ? acquirePlaybackAnimation() : null;
+    if (animateSplit && Math.abs(targetCutRef.current - smoothCutRef.current) >= 0.0005) {
+      ensureSplitAnim();
+    }
 
     return () => {
       paintRef.current = () => {};
+      startSplitAnimRef.current = null;
       ro.disconnect();
       unsubFrame();
-      releaseAnim?.();
+      stopSplitAnim();
     };
   }, [source, decoded, audible, durationSec, splitOverlay]);
 
@@ -645,7 +731,6 @@ export const WaveformCanvas = memo(function WaveformCanvas({
 
 interface PlayheadLineProps {
   durationSec: number;
-  playing?: boolean;
 }
 
 export const PlayheadLine = memo(function PlayheadLine({ durationSec }: PlayheadLineProps) {

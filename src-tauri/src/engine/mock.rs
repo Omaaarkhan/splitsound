@@ -383,6 +383,7 @@ impl MockEngine {
             rms_db,
             activity,
             contains,
+            peaks_960: None,
         })
     }
 }

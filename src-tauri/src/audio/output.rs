@@ -99,17 +99,29 @@ pub fn fill_device_buffer<T>(
     {
         {
             let (a, b) = chunk.as_slices();
-            let mut it = a.iter().chain(b.iter()).copied();
-            for frame in data.chunks_exact_mut(channels).take(n) {
-                let l = it.next().unwrap_or(0.0);
-                let r = it.next().unwrap_or(0.0);
-                if channels == 1 {
-                    frame[0] = T::from_sample((l + r) * 0.5);
-                } else {
-                    frame[0] = T::from_sample(l);
-                    frame[1] = T::from_sample(r);
-                    for s in &mut frame[2..] {
-                        *s = T::EQUILIBRIUM;
+            if channels == 2 {
+                // Fast contiguous slice copy for the overwhelmingly common stereo
+                // output path (avoids per-sample Iterator::chain overhead).
+                let dst = &mut data[..n * 2];
+                for (d, &s) in dst[..a.len()].iter_mut().zip(a) {
+                    *d = T::from_sample(s);
+                }
+                for (d, &s) in dst[a.len()..].iter_mut().zip(b) {
+                    *d = T::from_sample(s);
+                }
+            } else {
+                let mut it = a.iter().chain(b.iter()).copied();
+                for frame in data.chunks_exact_mut(channels).take(n) {
+                    let l = it.next().unwrap_or(0.0);
+                    let r = it.next().unwrap_or(0.0);
+                    if channels == 1 {
+                        frame[0] = T::from_sample((l + r) * 0.5);
+                    } else {
+                        frame[0] = T::from_sample(l);
+                        frame[1] = T::from_sample(r);
+                        for s in &mut frame[2..] {
+                            *s = T::EQUILIBRIUM;
+                        }
                     }
                 }
             }
@@ -380,7 +392,19 @@ fn device_thread(
     };
 
     loop {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+        // When no stream is open and none is wanted, block indefinitely on the
+        // command channel (0 idle wakeups/s). While a stream is open or retrying,
+        // poll every 250 ms for device changes, failure recovery, and the 30 s
+        // idle auto-close timeout.
+        let recv_result = if current.is_none() && !wanted {
+            match rx.recv() {
+                Ok(cmd) => Ok(cmd),
+                Err(_) => Err(RecvTimeoutError::Disconnected),
+            }
+        } else {
+            rx.recv_timeout(Duration::from_millis(250))
+        };
+        match recv_result {
             Ok(DeviceCmd::Ensure(reply)) => {
                 wanted = true;
                 last_active = Instant::now();

@@ -12,9 +12,173 @@
 
 use crate::audio::Stereo;
 use crate::error::{Error, Result};
+use crate::wav::MappedWav;
 
 /// Range of the deterministic shifts: half a second at 44.1 kHz.
 pub const MAX_SHIFT: usize = 22_050;
+
+/// Read-only stereo audio source for [`separate_track_source`].
+pub(crate) enum TrackSource<'a> {
+    Planar(&'a Stereo),
+    Mapped(&'a MappedWav),
+}
+
+impl TrackSource<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            TrackSource::Planar(s) => s.len(),
+            TrackSource::Mapped(m) => m.frames(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            TrackSource::Planar(s) => {
+                if s.left.len() != s.right.len() {
+                    return Err(Error::internal("separate: ragged mix"));
+                }
+                Ok(())
+            }
+            TrackSource::Mapped(m) => {
+                let ch = m.channels();
+                if ch != 1 && ch != 2 {
+                    return Err(Error::unsupported(
+                        "This WAV file has more than two channels",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 1.1 Track normalisation: mean and unbiased std of the mono fold-down.
+    pub(crate) fn normalize_params(&self) -> (f32, f32) {
+        let len = self.len();
+        if len == 0 {
+            return (0.0, 1.0);
+        }
+        let (sum, var) = match self {
+            TrackSource::Planar(mix) => {
+                let mut sum = 0f64;
+                for (l, r) in mix.left.iter().zip(&mix.right) {
+                    sum += 0.5 * (f64::from(*l) + f64::from(*r));
+                }
+                let mean = sum / len as f64;
+                let mut var = 0f64;
+                for (l, r) in mix.left.iter().zip(&mix.right) {
+                    let d = 0.5 * (f64::from(*l) + f64::from(*r)) - mean;
+                    var += d * d;
+                }
+                (mean, var)
+            }
+            TrackSource::Mapped(m) => {
+                let samples = m.samples();
+                if m.channels() == 2 {
+                    let mut sum = 0f64;
+                    for frame in samples.as_chunks::<2>().0 {
+                        sum += 0.5 * (f64::from(frame[0]) + f64::from(frame[1]));
+                    }
+                    let mean = sum / len as f64;
+                    let mut var = 0f64;
+                    for frame in samples.as_chunks::<2>().0 {
+                        let d = 0.5 * (f64::from(frame[0]) + f64::from(frame[1])) - mean;
+                        var += d * d;
+                    }
+                    (mean, var)
+                } else {
+                    let mut sum = 0f64;
+                    for &s in samples {
+                        sum += f64::from(s);
+                    }
+                    let mean = sum / len as f64;
+                    let mut var = 0f64;
+                    for &s in samples {
+                        let d = f64::from(s) - mean;
+                        var += d * d;
+                    }
+                    (mean, var)
+                }
+            }
+        };
+        let std = if len > 1 {
+            (var / (len - 1) as f64).sqrt()
+        } else {
+            0.0
+        };
+        // Digital silence (or NaN): the originals would divide by zero.
+        // Written as a negated comparison so NaN lands here too.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let std = if !(std >= 1e-8) { 1.0 } else { std };
+        (sum as f32, std as f32)
+    }
+
+    fn copy_normalized(
+        &self,
+        mix_off: usize,
+        dst_l: &mut [f32],
+        dst_r: &mut [f32],
+        mean: f32,
+        inv_std: f32,
+    ) {
+        let count = dst_l.len();
+        let identity = mean == 0.0 && inv_std == 1.0;
+        match self {
+            TrackSource::Planar(mix) => {
+                if identity {
+                    dst_l.copy_from_slice(&mix.left[mix_off..mix_off + count]);
+                    dst_r.copy_from_slice(&mix.right[mix_off..mix_off + count]);
+                } else {
+                    for ((dl, dr), (&ml, &mr)) in dst_l.iter_mut().zip(dst_r.iter_mut()).zip(
+                        mix.left[mix_off..mix_off + count]
+                            .iter()
+                            .zip(&mix.right[mix_off..mix_off + count]),
+                    ) {
+                        *dl = (ml - mean) * inv_std;
+                        *dr = (mr - mean) * inv_std;
+                    }
+                }
+            }
+            TrackSource::Mapped(m) => {
+                let samples = m.samples();
+                if m.channels() == 2 {
+                    let slice = &samples[mix_off * 2..(mix_off + count) * 2];
+                    if identity {
+                        for ((dl, dr), frame) in
+                            dst_l.iter_mut().zip(dst_r.iter_mut()).zip(slice.as_chunks::<2>().0)
+                        {
+                            *dl = frame[0];
+                            *dr = frame[1];
+                        }
+                    } else {
+                        for ((dl, dr), frame) in
+                            dst_l.iter_mut().zip(dst_r.iter_mut()).zip(slice.as_chunks::<2>().0)
+                        {
+                            *dl = (frame[0] - mean) * inv_std;
+                            *dr = (frame[1] - mean) * inv_std;
+                        }
+                    }
+                } else {
+                    let slice = &samples[mix_off..mix_off + count];
+                    if identity {
+                        dst_l.copy_from_slice(slice);
+                        dst_r.copy_from_slice(slice);
+                    } else {
+                        for ((dl, dr), &s) in dst_l.iter_mut().zip(dst_r.iter_mut()).zip(slice) {
+                            let v = (s - mean) * inv_std;
+                            *dl = v;
+                            *dr = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Track-level mean and unbiased std for a single planar stereo buffer.
+pub(crate) fn normalize_params_stereo(mix: &Stereo) -> (f32, f32) {
+    TrackSource::Planar(mix).normalize_params()
+}
 
 /// One fixed-size model invocation.
 pub trait SegmentModel {
@@ -79,17 +243,128 @@ pub fn count_segments(len: usize, stride: usize, shifts: usize) -> usize {
         .sum()
 }
 
-/// The summed transition weight at every sample of a track of `len`
-/// samples (what the overlap-add is divided by).
-fn weight_sum(len: usize, segment: usize, stride: usize, weight: &[f32]) -> Vec<f32> {
-    let mut sum = vec![0f32; len];
-    for o in chunk_offsets(len, stride) {
-        let chunk_len = segment.min(len - o);
-        for (s, w) in sum[o..o + chunk_len].iter_mut().zip(&weight[..chunk_len]) {
-            *s += *w;
+/// Precomputed `numerator / weight_sum[x]` in O(segment + stride) memory.
+///
+/// For any `x >= segment - 1` (interior through the end of the track), the
+/// overlapping triangular chunk weights are strictly periodic with period
+/// `stride`, avoiding a full-track `O(len)` weight array and eliminating
+/// per-sample float divisions in the normalization pass.
+struct WeightScale {
+    edge: Vec<f32>,
+    period: Vec<f32>,
+    stride: usize,
+}
+
+impl WeightScale {
+    fn new(len: usize, segment: usize, stride: usize, weight: &[f32], numerator: f32) -> Self {
+        let edge_len = segment.saturating_sub(1).min(len);
+        let mut edge = vec![0f32; edge_len];
+        let mut o = 0usize;
+        while o < edge_len {
+            let take = segment.min(edge_len - o);
+            for (s, &w) in edge[o..o + take].iter_mut().zip(&weight[..take]) {
+                *s += w;
+            }
+            o += stride;
+        }
+        for v in &mut edge {
+            *v = numerator / *v;
+        }
+        let period = if len > edge_len {
+            let mut p = Vec::with_capacity(stride);
+            for r in 0..stride {
+                let mut sum = 0f32;
+                let m_max = (segment - 1 - r) / stride;
+                for m in (0..=m_max).rev() {
+                    sum += weight[r + m * stride];
+                }
+                p.push(numerator / sum);
+            }
+            p
+        } else {
+            Vec::new()
+        };
+        WeightScale {
+            edge,
+            period,
+            stride,
         }
     }
-    sum
+
+    /// Applies `*d = *d * scale[start_idx + i] + mean` across `dst`.
+    fn apply_denorm(&self, start_idx: usize, dst: &mut [f32], mean: f32) {
+        let mut pos = 0usize;
+        if start_idx < self.edge.len() {
+            let take = (self.edge.len() - start_idx).min(dst.len());
+            for (d, &sc) in dst[..take]
+                .iter_mut()
+                .zip(&self.edge[start_idx..start_idx + take])
+            {
+                *d = *d * sc + mean;
+            }
+            pos = take;
+        }
+        if pos < dst.len() {
+            let rest = &mut dst[pos..];
+            let rem = (start_idx + pos) % self.stride;
+            let first = (self.stride - rem).min(rest.len());
+            for (d, &sc) in rest[..first]
+                .iter_mut()
+                .zip(&self.period[rem..rem + first])
+            {
+                *d = *d * sc + mean;
+            }
+            for chunk in rest[first..].chunks_mut(self.stride) {
+                let clen = chunk.len();
+                for (d, &sc) in chunk.iter_mut().zip(&self.period[..clen]) {
+                    *d = *d * sc + mean;
+                }
+            }
+        }
+    }
+
+    /// Accumulates `*d += w * s * scale[start_idx + i]` across `dst`.
+    fn accum_weighted(&self, start_idx: usize, dst: &mut [f32], w_slice: &[f32], e_slice: &[f32]) {
+        let len = w_slice.len().min(e_slice.len()).min(dst.len());
+        let mut pos = 0usize;
+        if start_idx < self.edge.len() {
+            let take = (self.edge.len() - start_idx).min(len);
+            for (((d, &w), &s), &iw) in dst[..take]
+                .iter_mut()
+                .zip(&w_slice[..take])
+                .zip(&e_slice[..take])
+                .zip(&self.edge[start_idx..start_idx + take])
+            {
+                *d += w * s * iw;
+            }
+            pos = take;
+        }
+        if pos < len {
+            let rem = (start_idx + pos) % self.stride;
+            let first = (self.stride - rem).min(len - pos);
+            for (((d, &w), &s), &iw) in dst[pos..pos + first]
+                .iter_mut()
+                .zip(&w_slice[pos..pos + first])
+                .zip(&e_slice[pos..pos + first])
+                .zip(&self.period[rem..rem + first])
+            {
+                *d += w * s * iw;
+            }
+            pos += first;
+            while pos < len {
+                let take = self.stride.min(len - pos);
+                for (((d, &w), &s), &iw) in dst[pos..pos + take]
+                    .iter_mut()
+                    .zip(&w_slice[pos..pos + take])
+                    .zip(&e_slice[pos..pos + take])
+                    .zip(&self.period[..take])
+                {
+                    *d += w * s * iw;
+                }
+                pos += take;
+            }
+        }
+    }
 }
 
 /// Separates a whole track.
@@ -110,14 +385,30 @@ pub fn separate_track(
     shifts: usize,
     on_segment: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<Vec<Stereo>> {
+    separate_track_source(
+        model,
+        TrackSource::Planar(mix),
+        stride,
+        wanted,
+        shifts,
+        on_segment,
+    )
+}
+
+pub(crate) fn separate_track_source(
+    model: &mut dyn SegmentModel,
+    mix: TrackSource<'_>,
+    stride: usize,
+    wanted: &[usize],
+    shifts: usize,
+    on_segment: &mut dyn FnMut(usize, usize) -> Result<()>,
+) -> Result<Vec<Stereo>> {
     let n = model.segment_len();
     let len = mix.len();
     if n == 0 || !n.is_multiple_of(2) || stride == 0 || stride > n {
         return Err(Error::internal("separate: bad segment or stride"));
     }
-    if mix.left.len() != mix.right.len() {
-        return Err(Error::internal("separate: ragged mix"));
-    }
+    mix.validate()?;
     if wanted.iter().any(|s| *s >= model.num_sources()) {
         return Err(Error::internal("separate: source index out of range"));
     }
@@ -127,26 +418,7 @@ pub fn separate_track(
 
     // 1.1 Track normalisation: mean and unbiased std of the mono fold-down.
     let (mean, std) = if model.normalize() {
-        let mut sum = 0f64;
-        for (l, r) in mix.left.iter().zip(&mix.right) {
-            sum += 0.5 * (f64::from(*l) + f64::from(*r));
-        }
-        let mean = sum / len as f64;
-        let mut var = 0f64;
-        for (l, r) in mix.left.iter().zip(&mix.right) {
-            let d = 0.5 * (f64::from(*l) + f64::from(*r)) - mean;
-            var += d * d;
-        }
-        let std = if len > 1 {
-            (var / (len - 1) as f64).sqrt()
-        } else {
-            0.0
-        };
-        // Digital silence (or NaN): the originals would divide by zero.
-        // Written as a negated comparison so NaN lands here too.
-        #[allow(clippy::neg_cmp_op_on_partial_ord)]
-        let std = if !(std >= 1e-8) { 1.0 } else { std };
-        (mean as f32, std as f32)
+        mix.normalize_params()
     } else {
         (0.0f32, 1.0f32)
     };
@@ -180,14 +452,8 @@ pub fn separate_track(
     for &shift in &amounts {
         // This pass sees `shift` zeros followed by the normalised mix.
         let plen = len + shift;
-        let inv_w: Vec<f32> = if passes > 1 {
-            weight_sum(plen, n, stride, &weight)
-                .into_iter()
-                .map(|w| 1.0 / w)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let inv_w: Option<WeightScale> = (passes > 1)
+            .then(|| WeightScale::new(plen, n, stride, &weight, 1.0));
         for o in chunk_offsets(plen, stride) {
             let chunk_len = n.min(plen - o);
             // 1.2: a short (last) chunk is centred in its segment and the
@@ -224,26 +490,13 @@ pub fn separate_track(
             }
             if valid_end > valid_start {
                 let mix_off = (m_first + valid_start as isize) as usize;
-                let count = valid_end - valid_start;
-                if mean == 0.0 && inv_std == 1.0 {
-                    seg_l[valid_start..valid_end]
-                        .copy_from_slice(&mix.left[mix_off..mix_off + count]);
-                    seg_r[valid_start..valid_end]
-                        .copy_from_slice(&mix.right[mix_off..mix_off + count]);
-                } else {
-                    for ((dl, dr), (&ml, &mr)) in seg_l[valid_start..valid_end]
-                        .iter_mut()
-                        .zip(&mut seg_r[valid_start..valid_end])
-                        .zip(
-                            mix.left[mix_off..mix_off + count]
-                                .iter()
-                                .zip(&mix.right[mix_off..mix_off + count]),
-                        )
-                    {
-                        *dl = (ml - mean) * inv_std;
-                        *dr = (mr - mean) * inv_std;
-                    }
-                }
+                mix.copy_normalized(
+                    mix_off,
+                    &mut seg_l[valid_start..valid_end],
+                    &mut seg_r[valid_start..valid_end],
+                    mean,
+                    inv_std,
+                );
             }
             if valid_end < n {
                 seg_l[valid_end..].fill(0.0);
@@ -268,16 +521,11 @@ pub fn separate_track(
                         let dst = &mut stem.channel_mut(c)[dst_start..];
                         let w_slice = &weight[i0..chunk_len];
                         let e_slice = &est_c[trim + i0..trim + chunk_len];
-                        if passes == 1 {
+                        if let Some(scale) = &inv_w {
+                            scale.accum_weighted(o + i0, dst, w_slice, e_slice);
+                        } else {
                             for ((d, &w), &s) in dst.iter_mut().zip(w_slice).zip(e_slice) {
                                 *d += w * s;
-                            }
-                        } else {
-                            let inv_slice = &inv_w[o + i0..o + chunk_len];
-                            for (((d, &w), &s), &iw) in
-                                dst.iter_mut().zip(w_slice).zip(e_slice).zip(inv_slice)
-                            {
-                                *d += w * s * iw;
                             }
                         }
                     }
@@ -286,14 +534,10 @@ pub fn separate_track(
             on_segment(calls, total_calls)?;
         }
         if passes == 1 {
-            let sum_w = weight_sum(plen, n, stride, &weight);
+            let scale = WeightScale::new(plen, n, stride, &weight, std);
             for stem in acc.iter_mut() {
-                for (d, &sw) in stem.left.iter_mut().zip(&sum_w[shift..]) {
-                    *d = *d * (std / sw) + mean;
-                }
-                for (d, &sw) in stem.right.iter_mut().zip(&sum_w[shift..]) {
-                    *d = *d * (std / sw) + mean;
-                }
+                scale.apply_denorm(shift, &mut stem.left, mean);
+                scale.apply_denorm(shift, &mut stem.right, mean);
             }
         }
     }
@@ -396,10 +640,21 @@ mod tests {
     }
 
     #[test]
-    fn weight_sum_is_what_overlapping_triangles_add_up_to() {
+    fn weight_scale_matches_overlapping_triangles_bit_exact() {
+        fn brute_weight_sum(len: usize, segment: usize, stride: usize, weight: &[f32]) -> Vec<f32> {
+            let mut sum = vec![0f32; len];
+            for o in chunk_offsets(len, stride) {
+                let chunk_len = segment.min(len - o);
+                for (s, w) in sum[o..o + chunk_len].iter_mut().zip(&weight[..chunk_len]) {
+                    *s += *w;
+                }
+            }
+            sum
+        }
+
         // n = 8, stride = 6, len = 14: chunks at 0, 6, 12.
         let w = transition_weight(8);
-        let s = weight_sum(14, 8, 6, &w);
+        let s = brute_weight_sum(14, 8, 6, &w);
         let expected = [
             0.25,
             0.5,
@@ -420,6 +675,31 @@ mod tests {
             assert!((a - b).abs() < 1e-6, "{s:?}");
         }
         assert!(s.iter().all(|v| *v > 0.0));
+
+        // Verify periodic WeightScale matches brute-force sum bit-for-bit across
+        // short tracks, non-dividing strides, and shift offsets.
+        for (n, stride, len, shift, num) in [
+            (8usize, 6usize, 14usize, 0usize, 1.0f32),
+            (8, 2, 31, 0, 0.37),
+            (64, 48, 511, 0, 0.42),
+            (64, 48, 30, 0, 1.5),
+            (64, 16, 300, 7, 2.0),
+            (64, 64, 200, 11, 0.8),
+        ] {
+            let w = transition_weight(n);
+            let brute = brute_weight_sum(len, n, stride, &w);
+            let ws = WeightScale::new(len, n, stride, &w, num);
+            let mut got = vec![1.0f32; len - shift];
+            ws.apply_denorm(shift, &mut got, 0.125);
+            for (i, (&g, &sw)) in got.iter().zip(&brute[shift..]).enumerate() {
+                let want = 1.0f32 * (num / sw) + 0.125;
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "mismatch at n={n} stride={stride} len={len} shift={shift} i={i}: {g} vs {want}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ fn analyze_core(
     sample_rate: u32,
     stem: Window<'_>,
     mix_rms: Option<&[f32]>,
+    mut active_windows: Option<&mut Vec<bool>>,
 ) -> StemStats {
     if frames == 0 {
         return StemStats {
@@ -80,6 +81,10 @@ fn analyze_core(
     // Single pass over the stem combining 100 ms active-window gating and 240
     // activity-envelope bins cleanly at overlapping interval boundaries.
     let window = (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
+    if let Some(mask) = active_windows.as_mut() {
+        mask.clear();
+        mask.reserve(frames.div_ceil(window));
+    }
     let floor = crate::audio::db_to_gain(ACTIVE_FLOOR_DB);
     let rel = crate::audio::db_to_gain(-ACTIVE_BELOW_MIX_DB);
     let mut windows = 0usize;
@@ -115,6 +120,9 @@ fn analyze_core(
             windows += 1;
             if is_active {
                 active += 1;
+            }
+            if let Some(mask) = active_windows.as_mut() {
+                mask.push(is_active);
             }
             w_start = w_end;
             w_end = (w_start + window).min(frames);
@@ -162,6 +170,36 @@ fn slice_window(samples: &[f32]) -> (f64, f32) {
     (sum, peak)
 }
 
+/// Length in frames of one active-gating window at `sample_rate` (100 ms).
+pub(crate) fn activity_window_frames(sample_rate: u32) -> usize {
+    (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize
+}
+
+/// Precomputes the per-window RMS of interleaved `mix` (`channels` channels)
+/// once, avoiding a full-track copy when operating directly on a `MappedWav`.
+pub fn precompute_mix_rms_interleaved(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+) -> Vec<f32> {
+    let channels = channels.max(1);
+    let frames = samples.len() / channels;
+    if frames == 0 {
+        return Vec::new();
+    }
+    let window = activity_window_frames(sample_rate);
+    let mut out = Vec::with_capacity(frames.div_ceil(window));
+    let mut start = 0usize;
+    while start < frames {
+        let end = (start + window).min(frames);
+        let (sq, _) = slice_window(&samples[start * channels..end * channels]);
+        let count = (end - start) * channels;
+        out.push((sq / count.max(1) as f64).sqrt() as f32);
+        start = end;
+    }
+    out
+}
+
 /// Precomputes the per-window RMS of planar stereo `mix` once so analyzing all
 /// stems against it does not rescan `mix` 6 times.
 pub fn precompute_mix_rms(mix: &crate::audio::Stereo, sample_rate: u32) -> Vec<f32> {
@@ -169,7 +207,7 @@ pub fn precompute_mix_rms(mix: &crate::audio::Stereo, sample_rate: u32) -> Vec<f
     if frames == 0 {
         return Vec::new();
     }
-    let window = (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
+    let window = activity_window_frames(sample_rate);
     let mut out = Vec::with_capacity(frames.div_ceil(window));
     let mut start = 0usize;
     while start < frames {
@@ -199,27 +237,40 @@ pub fn analyze_stem(
     let frames = stem.len() / channels;
     let stem_window = |s: usize, e: usize| slice_window(&stem[s * channels..e * channels]);
     let mix = mix.filter(|m| m.len() >= frames * channels);
-    let mix_rms = mix.map(|m| {
-        let window =
-            (WINDOW_FRAMES as u64 * u64::from(sample_rate.max(1)) / 44_100).max(1) as usize;
-        let mut out = Vec::with_capacity(frames.div_ceil(window));
-        let mut start = 0usize;
-        while start < frames {
-            let end = (start + window).min(frames);
-            let (sq, _) = slice_window(&m[start * channels..end * channels]);
-            let count = (end - start) * channels;
-            out.push((sq / count.max(1) as f64).sqrt() as f32);
-            start = end;
-        }
-        out
-    });
+    let mix_rms = mix.map(|m| precompute_mix_rms_interleaved(&m[..frames * channels], channels, sample_rate));
     analyze_core(
         frames,
         channels,
         sample_rate,
         &stem_window,
         mix_rms.as_deref(),
+        None,
     )
+}
+
+/// [`analyze_stem`] for planar stereo, using a precomputed `mix_rms` slice
+/// from [`precompute_mix_rms`], also returning the per-100ms active-window mask.
+pub fn analyze_stereo_with_activity(
+    stem: &crate::audio::Stereo,
+    mix_rms: Option<&[f32]>,
+    sample_rate: u32,
+) -> (StemStats, Vec<bool>) {
+    let frames = stem.len();
+    let stem_window = |s: usize, e: usize| {
+        let (l, lp) = slice_window(&stem.left[s..e]);
+        let (r, rp) = slice_window(&stem.right[s..e]);
+        (l + r, lp.max(rp))
+    };
+    let mut active_mask = Vec::new();
+    let stats = analyze_core(
+        frames,
+        2,
+        sample_rate,
+        &stem_window,
+        mix_rms,
+        Some(&mut active_mask),
+    );
+    (stats, active_mask)
 }
 
 /// [`analyze_stem`] for planar stereo, using a precomputed `mix_rms` slice
@@ -235,7 +286,7 @@ pub fn analyze_stereo_with_mix_rms(
         let (r, rp) = slice_window(&stem.right[s..e]);
         (l + r, lp.max(rp))
     };
-    analyze_core(frames, 2, sample_rate, &stem_window, mix_rms)
+    analyze_core(frames, 2, sample_rate, &stem_window, mix_rms, None)
 }
 
 /// [`analyze_stem`] for planar stereo, without copying anything.

@@ -10,6 +10,7 @@ pub mod export;
 pub mod manifest;
 pub mod opus;
 pub mod peaks;
+pub mod playback;
 pub mod progress;
 pub mod resample;
 pub mod runtime;

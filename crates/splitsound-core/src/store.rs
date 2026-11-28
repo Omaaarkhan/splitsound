@@ -489,28 +489,41 @@ impl ModelStore {
                 format!("{}: size {len}, expected {}", file.name, file.size_bytes),
             ));
         }
+        let expected_len = usize::try_from(len).map_err(|_| Error::out_of_memory())?;
         let mut data = Vec::new();
-        data.try_reserve_exact(len as usize)
+        data.try_reserve_exact(expected_len)
             .map_err(|_| Error::out_of_memory())?;
-        // Single-pass 512 KiB buffered read + SHA-256 while data is L2-resident.
+        data.resize(expected_len, 0);
+        // Single-pass 512 KiB direct read into `data` + SHA-256 while L2-resident
+        // (avoids an intermediate scratch buffer + up to 463 MB memcpy).
+        const CHUNK: usize = 1 << 19;
         let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1 << 19];
-        let mut total = 0u64;
-        loop {
-            let n = match (&mut f).take(len.saturating_add(1) - total).read(&mut buf) {
+        let mut pos = 0usize;
+        while pos < expected_len {
+            let end = (pos + CHUNK).min(expected_len);
+            let n = match f.read(&mut data[pos..end]) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(Error::from_read(&e, &path)),
             };
-            total += n as u64;
-            if total > file.size_bytes {
-                return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name)));
-            }
-            hasher.update(&buf[..n]);
-            data.extend_from_slice(&buf[..n]);
+            hasher.update(&data[pos..pos + n]);
+            pos += n;
         }
-        if total != file.size_bytes || hex(&hasher.finalize()) != file.sha256 {
+        if pos != expected_len {
+            return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name)));
+        }
+        // Detect if the file grew concurrently past the verified length.
+        let mut extra = [0u8; 1];
+        loop {
+            match f.read(&mut extra) {
+                Ok(0) => break,
+                Ok(_) => return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name))),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::from_read(&e, &path)),
+            }
+        }
+        if hex(&hasher.finalize()) != file.sha256 {
             return Err(damaged(entry, format!("{}: SHA-256 mismatch", file.name)));
         }
         Ok(data)
@@ -953,18 +966,56 @@ pub fn check_external_locations(
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let (&first, rest) = needle.split_first()?;
-    let mut offset = 0usize;
-    while haystack.len().saturating_sub(offset) >= needle.len() {
-        let search = &haystack[offset..haystack.len() - rest.len()];
-        let rel = search.iter().position(|&b| b == first)?;
-        let pos = offset + rel;
-        if &haystack[pos + 1..pos + needle.len()] == rest {
-            return Some(pos);
-        }
-        offset = pos + 1;
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
-    None
+    let last_start = haystack.len() - needle.len();
+    if needle.len() >= 2 {
+        // SWAR 8-byte scan matching the first TWO needle bytes simultaneously
+        // (1/65,536 false-positive rate on random weight tensors vs 1/256 for
+        // single-byte scans).
+        const LO: u64 = 0x0101_0101_0101_0101;
+        const HI: u64 = 0x8080_8080_8080_8080;
+        let b0 = needle[0];
+        let b1 = needle[1];
+        let mask0 = u64::from_ne_bytes([b0; 8]);
+        let mask1 = u64::from_ne_bytes([b1; 8]);
+        let mut base = 0usize;
+        while base + 8 <= haystack.len() && base <= last_start {
+            let word = u64::from_le_bytes(
+                haystack[base..base + 8]
+                    .try_into()
+                    .expect("8-byte slice"),
+            );
+            let x0 = word ^ mask0;
+            let m0 = x0.wrapping_sub(LO) & !x0 & HI;
+            if m0 != 0 {
+                let x1 = word ^ mask1;
+                let m1 = x1.wrapping_sub(LO) & !x1 & HI;
+                let mut hits = m0 & (m1 >> 8);
+                if (m0 & (1u64 << 63)) != 0 && haystack.get(base + 8) == Some(&b1) {
+                    hits |= 1u64 << 63;
+                }
+                while hits != 0 {
+                    let tz = hits.trailing_zeros() as usize;
+                    let pos = base + (tz >> 3);
+                    if pos <= last_start && &haystack[pos..pos + needle.len()] == needle {
+                        return Some(pos);
+                    }
+                    hits &= hits - 1;
+                }
+            }
+            base += 8;
+        }
+        for pos in base..=last_start {
+            if &haystack[pos..pos + needle.len()] == needle {
+                return Some(pos);
+            }
+        }
+        return None;
+    }
+    let b0 = needle[0];
+    haystack.iter().position(|&b| b == b0)
 }
 
 #[cfg(test)]

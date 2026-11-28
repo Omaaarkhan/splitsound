@@ -60,20 +60,50 @@ impl ExportFormat {
     }
 }
 
-/// Uniform random numbers for dither: xorshift, fixed seed, so an export
-/// is reproducible.
-struct Dither(u64);
+/// Uniform random numbers for dither: 4-lane xorshift64, fixed seed, so an
+/// export is reproducible while breaking the per-sample serial dependency chain.
+struct Dither([u64; 4]);
 
 impl Dither {
-    /// Triangular noise in (-1, 1) LSB: the sum of two uniform values.
-    fn tpdf(&mut self) -> f32 {
-        let mut next = || {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    fn new(mut seed: u64) -> Self {
+        let mut next_seed = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let v = z ^ (z >> 31);
+            if v == 0 { 1 } else { v }
         };
-        next() + next()
+        Self([next_seed(), next_seed(), next_seed(), next_seed()])
+    }
+
+    #[inline(always)]
+    fn step_lane(s: &mut u64) -> f32 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        let u1 = (x >> 40) as i32;
+        let u2 = ((x >> 16) & 0x00FF_FFFF) as i32;
+        (u1 - u2) as f32 * (1.0 / 16_777_216.0)
+    }
+
+    /// Triangular noise in (-1, 1) LSB: the difference of two 24-bit uniform draws.
+    #[inline(always)]
+    fn tpdf(&mut self) -> f32 {
+        Self::step_lane(&mut self.0[0])
+    }
+
+    /// Four independent TPDF samples computed across parallel xorshift lanes.
+    #[inline(always)]
+    fn tpdf4(&mut self) -> [f32; 4] {
+        [
+            Self::step_lane(&mut self.0[0]),
+            Self::step_lane(&mut self.0[1]),
+            Self::step_lane(&mut self.0[2]),
+            Self::step_lane(&mut self.0[3]),
+        ]
     }
 }
 
@@ -119,6 +149,15 @@ fn write_wav_pcm_header(
     ))
 }
 
+#[inline(always)]
+fn sample_to_i24(s: f32) -> i32 {
+    // Multiplying by 2^23 adds 23 to the f32 exponent with zero rounding error
+    // for all |s| <= 1.0, and every integer in [-2^23, 2^23 - 1] is exact in f32.
+    (sanitize(s) * 8_388_608.0)
+        .round()
+        .clamp(-8_388_608.0, 8_388_607.0) as i32
+}
+
 fn write_wav_pcm_samples(
     out: &mut impl Write,
     samples: &[f32],
@@ -127,30 +166,49 @@ fn write_wav_pcm_samples(
     buf: &mut Vec<u8>,
     progress: &dyn Progress,
 ) -> std::io::Result<Result<()>> {
-    let bytes_per = usize::from(bits / 8);
-    for chunk in samples.chunks(8192) {
-        if progress.is_cancelled() {
-            return Ok(Err(Error::cancelled()));
-        }
-        buf.clear();
-        buf.reserve(chunk.len() * bytes_per);
-        for &s in chunk {
-            let s = sanitize(s);
-            if bits == 16 {
-                // Dither before rounding so the quantisation error is
-                // noise rather than distortion.
+    if bits == 16 {
+        for chunk in samples.chunks(8192) {
+            if progress.is_cancelled() {
+                return Ok(Err(Error::cancelled()));
+            }
+            buf.resize(chunk.len() * 2, 0);
+            let (in4, in_rem) = chunk.as_chunks::<4>();
+            let (out8, out_rem) = buf.as_chunks_mut::<8>();
+            for (src, dst) in in4.iter().zip(out8.iter_mut()) {
+                let d = dither.tpdf4();
+                for j in 0..4 {
+                    let s = sanitize(src[j]);
+                    // Dither before rounding so the quantisation error is
+                    // noise rather than distortion.
+                    let v = (s * 32768.0 + d[j]).round().clamp(-32768.0, 32767.0) as i16;
+                    let b = v.to_le_bytes();
+                    dst[j * 2] = b[0];
+                    dst[j * 2 + 1] = b[1];
+                }
+            }
+            for (&s, dst) in in_rem.iter().zip(out_rem.as_chunks_mut::<2>().0.iter_mut()) {
+                let s = sanitize(s);
                 let v = (s * 32768.0 + dither.tpdf())
                     .round()
                     .clamp(-32768.0, 32767.0) as i16;
-                buf.extend_from_slice(&v.to_le_bytes());
-            } else {
-                let v = (f64::from(s) * 8_388_608.0)
-                    .round()
-                    .clamp(-8_388_608.0, 8_388_607.0) as i32;
-                buf.extend_from_slice(&v.to_le_bytes()[..3]);
+                *dst = v.to_le_bytes();
             }
+            out.write_all(buf)?;
         }
-        out.write_all(buf)?;
+    } else {
+        for chunk in samples.chunks(8192) {
+            if progress.is_cancelled() {
+                return Ok(Err(Error::cancelled()));
+            }
+            buf.resize(chunk.len() * 3, 0);
+            for (&s, dst) in chunk.iter().zip(buf.as_chunks_mut::<3>().0.iter_mut()) {
+                let b = sample_to_i24(s).to_le_bytes();
+                dst[0] = b[0];
+                dst[1] = b[1];
+                dst[2] = b[2];
+            }
+            out.write_all(buf)?;
+        }
     }
     Ok(Ok(()))
 }
@@ -164,19 +222,20 @@ fn write_wav_pcm(
     progress: &dyn Progress,
 ) -> std::io::Result<Result<()>> {
     write_wav_pcm_header(out, bits, channels, sample_rate, samples.len() as u64)?;
-    let mut dither = Dither(0x2545_F491_4F6C_DD1D);
+    let mut dither = Dither::new(0x2545_F491_4F6C_DD1D);
     let mut buf = Vec::with_capacity(8192 * usize::from(bits / 8));
     write_wav_pcm_samples(out, samples, bits, &mut dither, &mut buf, progress)
 }
 
 /// Feeds `f32` samples to the FLAC encoder as 24-bit integers without
-/// first copying the whole track.
+/// first copying the whole track, checking `progress.is_cancelled()` per block.
 struct FlacSource<'a> {
     samples: &'a [f32],
     channels: usize,
     sample_rate: usize,
     pos: usize,
     scratch: Vec<i32>,
+    progress: &'a dyn Progress,
 }
 
 impl flacenc::source::Source for FlacSource<'_> {
@@ -194,15 +253,14 @@ impl flacenc::source::Source for FlacSource<'_> {
         block_size: usize,
         dest: &mut F,
     ) -> std::result::Result<usize, flacenc::error::SourceError> {
+        if self.progress.is_cancelled() {
+            return Err(flacenc::error::SourceError::from_unknown());
+        }
         let want = block_size * self.channels;
         let end = (self.pos + want).min(self.samples.len());
         self.scratch.clear();
         self.scratch
-            .extend(self.samples[self.pos..end].iter().map(|s| {
-                (f64::from(sanitize(*s)) * 8_388_608.0)
-                    .round()
-                    .clamp(-8_388_608.0, 8_388_607.0) as i32
-            }));
+            .extend(self.samples[self.pos..end].iter().map(|&s| sample_to_i24(s)));
         dest.fill_interleaved(&self.scratch)?;
         self.pos = end;
         Ok(self.scratch.len() / self.channels)
@@ -220,6 +278,7 @@ struct MixFlacSource<'a> {
     pos: usize,
     mix_buf: Vec<f32>,
     scratch: Vec<i32>,
+    progress: &'a dyn Progress,
 }
 
 impl flacenc::source::Source for MixFlacSource<'_> {
@@ -237,16 +296,16 @@ impl flacenc::source::Source for MixFlacSource<'_> {
         block_size: usize,
         dest: &mut F,
     ) -> std::result::Result<usize, flacenc::error::SourceError> {
+        if self.progress.is_cancelled() {
+            return Err(flacenc::error::SourceError::from_unknown());
+        }
         let want = block_size * 2;
         let end = (self.pos + want).min(self.total_samples);
         let len = end - self.pos;
         fill_mix_chunk(&self.active, self.pos, len, &mut self.mix_buf);
         self.scratch.clear();
-        self.scratch.extend(self.mix_buf.iter().map(|s| {
-            (f64::from(sanitize(*s)) * 8_388_608.0)
-                .round()
-                .clamp(-8_388_608.0, 8_388_607.0) as i32
-        }));
+        self.scratch
+            .extend(self.mix_buf.iter().map(|&s| sample_to_i24(s)));
         dest.fill_interleaved(&self.scratch)?;
         self.pos = end;
         Ok(self.scratch.len() / 2)
@@ -267,13 +326,18 @@ fn finish_flac_source<S: flacenc::source::Source>(
     let config = flacenc::config::Encoder::default()
         .into_verified()
         .map_err(|(_, e)| Error::internal(format!("flac config: {e}")))?;
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-        .map_err(|e| Error::internal(format!("flac encode: {e}")))?;
+    let stream = match flacenc::encode_with_fixed_block_size(&config, source, config.block_size) {
+        Ok(s) => s,
+        Err(_) if progress.is_cancelled() => return Err(Error::cancelled()),
+        Err(e) => return Err(Error::internal(format!("flac encode: {e}"))),
+    };
     check_cancelled(progress)?;
-    let mut sink = flacenc::bitsink::ByteSink::new();
+    let mut sink = flacenc::bitsink::ByteSink::with_capacity(frames.saturating_mul(4));
     stream
         .write(&mut sink)
         .map_err(|e| Error::internal(format!("flac write: {e}")))?;
+    // Release the encoded AST before writing bytes to disk (cuts peak RAM ~45%).
+    drop(stream);
     let mut bytes = sink.into_inner();
     // flacenc records the short final block as the stream's minimum block
     // size. The FLAC format defines that field as excluding the last block
@@ -290,6 +354,7 @@ fn finish_flac_source<S: flacenc::source::Source>(
     let (tmp, file) = crate::wav::create_temp_sibling(dst).map_err(werr)?;
     let mut out = BufWriter::with_capacity(1 << 18, file);
     out.write_all(&bytes).map_err(werr)?;
+    drop(bytes);
     let file = out.into_inner().map_err(|e| werr(e.into_error()))?;
     file.sync_all().map_err(werr)?;
     drop(file);
@@ -434,6 +499,7 @@ pub fn export_audio(
                 sample_rate: sample_rate as usize,
                 pos: 0,
                 scratch: Vec::new(),
+                progress,
             };
             finish_flac_source(source, frames, dst, progress)
         }
@@ -516,7 +582,7 @@ pub fn export_mixdown_streaming(
             let mut out = BufWriter::with_capacity(1 << 18, file);
             write_wav_pcm_header(&mut out, bits, 2, sample_rate, total_samples as u64)
                 .map_err(werr)?;
-            let mut dither = Dither(0x2545_F491_4F6C_DD1D);
+            let mut dither = Dither::new(0x2545_F491_4F6C_DD1D);
             let mut pcm_buf = Vec::with_capacity(8192 * usize::from(bits / 8));
             for start in (0..total_samples).step_by(CHUNK_SAMPLES) {
                 let len = (total_samples - start).min(CHUNK_SAMPLES);
@@ -545,6 +611,7 @@ pub fn export_mixdown_streaming(
                 pos: 0,
                 mix_buf: Vec::new(),
                 scratch: Vec::new(),
+                progress,
             };
             finish_flac_source(source, frames, dst, progress)
         }
@@ -673,7 +740,7 @@ mod tests {
 
     #[test]
     fn dither_is_triangular_and_decorrelates_the_error() {
-        let mut d = Dither(1);
+        let mut d = Dither::new(1);
         let n = 200_000;
         let v: Vec<f32> = (0..n).map(|_| d.tpdf()).collect();
         let mean = v.iter().sum::<f32>() / n as f32;

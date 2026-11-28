@@ -10,18 +10,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
-use crate::analyze::{StemStats, analyze_stereo, analyze_stereo_with_mix_rms, precompute_mix_rms};
+use crate::analyze::{
+    StemStats, analyze_stereo, analyze_stereo_with_activity, precompute_mix_rms,
+    precompute_mix_rms_interleaved,
+};
 use crate::audio::{SAMPLE_RATE, Stereo, TAGGER_SAMPLE_RATE};
 use crate::decode::{Artwork, DecodeLimits, SourceInfo, decode_file};
 use crate::error::{Error, ErrorCode, Result};
 use crate::export::{ExportFormat, export_audio, export_mixdown_streaming};
 use crate::manifest::ModelKind;
-use crate::peaks::{Peaks, compute_peaks};
+use crate::peaks::{Peaks, compute_peaks, compute_peaks_planar_bytes};
 use crate::progress::{PlannedStep, Progress, Stage, Tracker, check_cancelled};
 use crate::resample::StreamResampler;
 use crate::runtime::{Acceleration, Provider, Runtime, RuntimeConfig, SessionConfig};
-use crate::separate::chunk::{SegmentModel, count_segments, separate_track};
-use crate::separate::models::{SeparatorKind, open_segment_model};
+use crate::separate::chunk::{
+    SegmentModel, TrackSource, count_segments, normalize_params_stereo, separate_track_source,
+};
+use crate::separate::models::{SeparatorKind, open_segment_model_with_threads};
 use crate::separate::pipeline::{Pass, PassInput, SplitOptions, passes, remainder_stem};
 use crate::store::{DownloadObserver, ModelSource, ModelStatus, ModelStore};
 use crate::tagger::{Detection, InstrumentMap, SplitMode, StemId, Tagger, suggest_mode};
@@ -184,6 +189,10 @@ pub struct StemResult {
     /// Instruments heard inside this stem, among the families that can be
     /// in it. Most interesting for "other".
     pub contains: Vec<Detection>,
+    /// Precomputed 960-bucket waveform peaks (`2 * 960` signed bytes) computed
+    /// while the stem is still in RAM, avoiding a full-file re-read afterwards.
+    #[serde(skip)]
+    pub peaks_960: Option<Vec<u8>>,
 }
 
 /// The result of [`Engine::split_to_dir`].
@@ -564,6 +573,7 @@ impl Engine {
                     memory_pattern: true,
                 },
             )?;
+            drop(verified);
             let resampler = StreamResampler::new(SAMPLE_RATE, TAGGER_SAMPLE_RATE, 1)?;
             *slot = Some(TaggerSlot {
                 tagger: Tagger::new(session),
@@ -577,25 +587,82 @@ impl Engine {
         }
     }
 
-    /// Tagger maxima for `audio`, with `hop` samples (at 32 kHz) between
-    /// windows.
-    fn tag_scores(&self, audio: &Stereo, hop: usize, progress: &dyn Progress) -> Result<Vec<f32>> {
-        let mono = audio.to_mono();
+    /// Tagger maxima for stereo slices `left`/`right`, with `hop` samples (at
+    /// 32 kHz) between windows. Streams mono fold-down in bounded chunks to
+    /// avoid full-track temporary allocations, shrinks oversized resampler
+    /// capacity afterwards, and optionally skips 10 s windows containing no
+    /// active 100 ms frames from `active_mask`.
+    fn tag_slice_scores(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        hop: usize,
+        active_mask: Option<&[bool]>,
+        progress: &dyn Progress,
+    ) -> Result<Vec<f32>> {
+        // 16,384 stereo frames -> 64 KiB mono chunk (fits in L1/L2 cache).
+        const MONO_CHUNK: usize = 16_384;
+        // Release `TaggerSlot::resampled` when a long track inflated it past 4 MiB (~32 s).
+        const MAX_RETAINED_FLOATS: usize = 1_048_576;
+        // 100 ms at 32 kHz = 3,200 samples (exact integer ratio to 4,410 @ 44.1 kHz).
+        const MASK_STEP_32K: usize = TAGGER_SAMPLE_RATE as usize / 10;
+
+        let len = left.len().min(right.len());
+        let mut mono_chunk = Vec::with_capacity(MONO_CHUNK.min(len));
         self.with_tagger(|slot| {
             slot.resampler.reset();
             slot.resampled.clear();
-            let reserve = slot.resampler.max_output_for(mono.len()) + 64;
+            let reserve = slot.resampler.max_output_for(len) + 64;
             slot.resampled.reserve(reserve);
             let mut out = [std::mem::take(&mut slot.resampled)];
-            slot.resampler.push(&[&mono], &mut out)?;
+            let mut pos = 0usize;
+            while pos < len {
+                check_cancelled(progress)?;
+                let end = (pos + MONO_CHUNK).min(len);
+                mono_chunk.clear();
+                mono_chunk.extend(
+                    left[pos..end]
+                        .iter()
+                        .zip(&right[pos..end])
+                        .map(|(l, r)| 0.5 * (l + r)),
+                );
+                slot.resampler.push(&[&mono_chunk], &mut out)?;
+                pos = end;
+            }
             slot.resampler.finish(&mut out)?;
             let mono_32k = out.into_iter().next().unwrap_or_default();
-            let res = slot
-                .tagger
-                .score_with_hop(&mono_32k, hop, &mut |_, _| check_cancelled(progress));
-            slot.resampled = mono_32k;
+            let res = slot.tagger.score_with_hop_filtered(
+                &mono_32k,
+                hop,
+                |start| match active_mask {
+                    None | Some([]) => true,
+                    Some(mask) => {
+                        let first = start / MASK_STEP_32K;
+                        let last = (start + crate::tagger::WINDOW)
+                            .div_ceil(MASK_STEP_32K)
+                            .min(mask.len());
+                        if first >= last {
+                            false
+                        } else {
+                            mask[first..last].iter().any(|&a| a)
+                        }
+                    }
+                },
+                &mut |_, _| check_cancelled(progress),
+            );
+            slot.resampled = if mono_32k.capacity() > MAX_RETAINED_FLOATS {
+                Vec::new()
+            } else {
+                mono_32k
+            };
             Ok(res?.max)
         })
+    }
+
+    /// Tagger maxima for `audio`, with `hop` samples (at 32 kHz) between
+    /// windows.
+    fn tag_scores(&self, audio: &Stereo, hop: usize, progress: &dyn Progress) -> Result<Vec<f32>> {
+        self.tag_slice_scores(&audio.left, &audio.right, hop, None, progress)
     }
 
     /// The scan run after import: says which instruments are in the song
@@ -619,10 +686,12 @@ impl Engine {
     /// # Errors
     /// `busy` (a split is running; try again afterwards), `cancelled`.
     pub fn detect(&self, mix: &Stereo, progress: &dyn Progress) -> Result<DetectOutcome> {
+        let len = mix.len();
         self.detect_segments(
             progress,
             |n| Ok(preview_starts(mix, n)),
             |start, end| {
+                let end = end.min(len);
                 Ok(Stereo::from_channels(
                     mix.left[start..end].to_vec(),
                     mix.right[start..end].to_vec(),
@@ -635,16 +704,20 @@ impl Engine {
     /// directly on a memory-mapped working WAV file.
     pub fn detect_mapped(&self, mix: &MappedWav, progress: &dyn Progress) -> Result<DetectOutcome> {
         let ch = mix.channels();
+        let len = mix.frames();
         let samples = mix.samples();
         self.detect_segments(
             progress,
             |n| preview_starts_mapped(mix, n),
-            |start, end| match ch {
-                1 => Ok(Stereo::from_mono(samples[start..end].to_vec())),
-                2 => Ok(Stereo::from_interleaved(&samples[start * 2..end * 2])),
-                _ => Err(Error::unsupported(
-                    "This WAV file has more than two channels",
-                )),
+            |start, end| {
+                let end = end.min(len);
+                match ch {
+                    1 => Ok(Stereo::from_mono(samples[start..end].to_vec())),
+                    2 => Ok(Stereo::from_interleaved(&samples[start * 2..end * 2])),
+                    _ => Err(Error::unsupported(
+                        "This WAV file has more than two channels",
+                    )),
+                }
             },
         )
     }
@@ -655,6 +728,11 @@ impl Engine {
         choose_starts: impl FnOnce(usize) -> Result<Vec<usize>>,
         slice_excerpt: impl Fn(usize, usize) -> Result<Stereo>,
     ) -> Result<DetectOutcome> {
+        // Exactly 10.0 s at 44.1 kHz -> 320,000 samples at 32 kHz (one tagger
+        // window, avoiding a 90%-zero-padded second window on 11 s SCNet excerpts).
+        const PREVIEW_TAG_SAMPLES: usize =
+            (crate::tagger::WINDOW as u64 * SAMPLE_RATE as u64 / TAGGER_SAMPLE_RATE as u64) as usize;
+
         let missing: Vec<String> = [PREVIEW_MODEL, TAGGER_MODEL]
             .into_iter()
             .filter(|id| !self.store.is_installed(id))
@@ -686,35 +764,103 @@ impl Engine {
         if !starts.is_empty() {
             self.load_separator(&mut slot, PREVIEW_MODEL)?;
         }
+        // Reuse segment I/O buffers across all preview excerpts instead of
+        // allocating full `separate_track` accumulators/weights per excerpt.
+        let mut seg_l = vec![0f32; n];
+        let mut seg_r = vec![0f32; n];
+        let mut out: Vec<[Vec<f32>; 2]> = wanted
+            .iter()
+            .map(|_| [vec![0f32; n], vec![0f32; n]])
+            .collect();
+        let mut other_l = Vec::with_capacity(n);
+        let mut other_r = Vec::with_capacity(n);
+
         for &start in &starts {
             check_cancelled(progress)?;
             let excerpt = slice_excerpt(start, start + n)?;
+            let m = excerpt.len();
+            if m == 0 {
+                continue;
+            }
             let Some(loaded) = slot.as_mut() else {
                 return Err(Error::internal("separator slot empty"));
             };
-            // One model call: the excerpt is at most one segment long.
-            let mut stems = separate_track(
-                loaded.model.as_mut(),
-                &excerpt,
-                n,
-                &wanted,
-                0,
-                &mut |_, _| check_cancelled(progress),
-            )?;
-            let mut other = excerpt.clone();
-            for s in &stems {
-                other.subtract(s);
+            let (mean, std) = if loaded.model.normalize() {
+                normalize_params_stereo(&excerpt)
+            } else {
+                (0.0f32, 1.0f32)
+            };
+            let inv_std = 1.0 / std;
+            let trim = (n - m) / 2;
+            if trim > 0 {
+                seg_l[..trim].fill(0.0);
+                seg_r[..trim].fill(0.0);
             }
-            stems.push(other);
+            if mean == 0.0 && inv_std == 1.0 {
+                seg_l[trim..trim + m].copy_from_slice(&excerpt.left);
+                seg_r[trim..trim + m].copy_from_slice(&excerpt.right);
+            } else {
+                for ((dl, dr), (&ml, &mr)) in seg_l[trim..trim + m]
+                    .iter_mut()
+                    .zip(&mut seg_r[trim..trim + m])
+                    .zip(excerpt.left.iter().zip(&excerpt.right))
+                {
+                    *dl = (ml - mean) * inv_std;
+                    *dr = (mr - mean) * inv_std;
+                }
+            }
+            if trim + m < n {
+                seg_l[trim + m..].fill(0.0);
+                seg_r[trim + m..].fill(0.0);
+            }
+            loaded.model.run_segment(&seg_l, &seg_r, &wanted, &mut out)?;
+            other_l.clear();
+            other_l.extend_from_slice(&excerpt.left);
+            other_r.clear();
+            other_r.extend_from_slice(&excerpt.right);
+            for est in &mut out {
+                if est[0].len() != n || est[1].len() != n {
+                    return Err(Error::internal("preview: model returned a wrong size"));
+                }
+                for (sl, ol) in est[0][trim..trim + m].iter_mut().zip(&mut other_l) {
+                    *sl = *sl * std + mean;
+                    *ol -= *sl;
+                }
+                for (sr, or) in est[1][trim..trim + m].iter_mut().zip(&mut other_r) {
+                    *sr = *sr * std + mean;
+                    *or -= *sr;
+                }
+            }
+
             let mix_energy = energy(&excerpt).max(1e-20);
-            for (slot_ev, audio) in evidence.iter_mut().zip(&stems) {
-                let ratio_db = (10.0 * (energy(audio) / mix_energy).max(1e-20).log10()) as f32;
+            let slice_energy = |l: &[f32], r: &[f32]| -> f64 {
+                l.iter()
+                    .chain(r)
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum()
+            };
+            // Center-crop to 10 s so each stem runs exactly one tagger window.
+            let tag_off = m.saturating_sub(PREVIEW_TAG_SAMPLES) / 2;
+            let tag_end = (tag_off + PREVIEW_TAG_SAMPLES).min(m);
+
+            for (idx, slot_ev) in evidence.iter_mut().enumerate() {
+                let (sl, sr): (&[f32], &[f32]) = if idx < out.len() {
+                    (&out[idx][0][trim..trim + m], &out[idx][1][trim..trim + m])
+                } else {
+                    (&other_l[..], &other_r[..])
+                };
+                let ratio_db = (10.0 * (slice_energy(sl, sr) / mix_energy).max(1e-20).log10()) as f32;
                 slot_ev.1 = slot_ev.1.max(ratio_db);
                 if ratio_db <= HEARD_FLOOR_DB {
                     continue;
                 }
-                // One 10 s tagger window per stem per segment.
-                let scores = self.tag_scores(audio, crate::tagger::WINDOW, progress)?;
+                let scores = self.tag_slice_scores(
+                    &sl[tag_off..tag_end],
+                    &sr[tag_off..tag_end],
+                    crate::tagger::WINDOW,
+                    None,
+                    progress,
+                )?;
                 match &mut slot_ev.2 {
                     Some(best) => {
                         for (b, s) in best.iter_mut().zip(&scores) {
@@ -745,6 +891,24 @@ impl Engine {
     ) -> Result<Vec<Detection>> {
         // Back-to-back windows: half the work of the reference schedule.
         let scores = self.tag_scores(stem_audio, crate::tagger::WINDOW, progress)?;
+        Ok(self.instrument_map.detect_in_stem(&scores, stem, mode))
+    }
+
+    fn detect_in_stem_with_mask(
+        &self,
+        stem_audio: &Stereo,
+        stem: StemId,
+        mode: SplitMode,
+        active_mask: &[bool],
+        progress: &dyn Progress,
+    ) -> Result<Vec<Detection>> {
+        let scores = self.tag_slice_scores(
+            &stem_audio.left,
+            &stem_audio.right,
+            crate::tagger::WINDOW,
+            Some(active_mask),
+            progress,
+        )?;
         Ok(self.instrument_map.detect_in_stem(&scores, stem, mode))
     }
 
@@ -826,9 +990,17 @@ impl Engine {
         let (session, _provider) =
             self.runtime()?
                 .session_from_verified_with(&verified.graph, external, session_cfg)?;
+        // Free the verified protobuf/weights buffers (up to 463 MB for RoFormer)
+        // before allocating STFT scratch buffers.
+        drop(verified);
         *slot = Some(LoadedSeparator {
             id: id.to_string(),
-            model: open_segment_model(kind, session, entry.sources.len())?,
+            model: open_segment_model_with_threads(
+                kind,
+                session,
+                entry.sources.len(),
+                self.threads(),
+            )?,
         });
         Ok(())
     }
@@ -851,13 +1023,20 @@ impl Engine {
         progress: &dyn Progress,
     ) -> Result<Split> {
         let plan = passes(options);
-        let steps = self.separation_steps(&plan, mix)?;
+        let steps = self.separation_steps(&plan, mix.duration_sec(SAMPLE_RATE))?;
         let tracker = Tracker::new(progress, steps);
         let mut produced: Vec<(StemId, Stereo)> = Vec::new();
-        let model_ids = self.run_passes(mix, options, &plan, &tracker, 0, &mut |id, audio| {
-            produced.push((id, audio));
-            Ok(())
-        })?;
+        let model_ids = self.run_passes_source(
+            TrackSource::Planar(mix),
+            options,
+            &plan,
+            &tracker,
+            0,
+            &mut |id, audio| {
+                produced.push((id, audio));
+                Ok(())
+            },
+        )?;
         // Lane order.
         let mut stems = Vec::with_capacity(produced.len());
         for id in options.mode.stems() {
@@ -868,8 +1047,7 @@ impl Engine {
         Ok(Split { stems, model_ids })
     }
 
-    fn separation_steps(&self, plan: &[Pass], mix: &Stereo) -> Result<Vec<PlannedStep>> {
-        let audio_sec = mix.duration_sec(SAMPLE_RATE);
+    fn separation_steps(&self, plan: &[Pass], audio_sec: f64) -> Result<Vec<PlannedStep>> {
         let mut steps = Vec::with_capacity(plan.len());
         for pass in plan {
             self.store.manifest().get(pass.model_id)?;
@@ -883,12 +1061,13 @@ impl Engine {
         Ok(steps)
     }
 
-    /// Runs the passes of `plan`. Every stem is handed to `on_stem` as soon
-    /// as it is final (the remainder stem last), so the caller decides how
-    /// long it stays in memory. Returns the ids of the models that ran.
-    fn run_passes(
+    /// Runs the passes of `plan` against either an in-memory `Stereo` or a
+    /// zero-copy `MappedWav`. Pass 0 reads straight from `mix` without
+    /// materialising `residual` beforehand, cutting peak heap audio memory
+    /// during the first model's execution by 1–2 full-track buffers.
+    fn run_passes_source(
         &self,
-        mix: &Stereo,
+        mix: TrackSource<'_>,
         options: SplitOptions,
         plan: &[Pass],
         tracker: &Tracker<'_>,
@@ -906,8 +1085,11 @@ impl Engine {
             }
         }
         let mut slot = self.lock_separator()?;
-        // The mix minus everything produced so far. It ends up as "other".
-        let mut residual = mix.clone();
+        let len = mix.len();
+        let duration_sec = len as f64 / f64::from(SAMPLE_RATE);
+        // Materialised lazily right after Pass 0 finishes so it does not sit
+        // on the heap alongside Pass 0's accumulators and ORT activations.
+        let mut residual: Option<Stereo> = None;
         let mut model_ids = Vec::new();
         for (i, pass) in plan.iter().enumerate() {
             tracker.begin(first_step + i)?;
@@ -923,22 +1105,29 @@ impl Engine {
                 })?);
             }
             let stride = entry.stride_samples;
-            let total = count_segments(mix.len(), stride, 0).max(1);
+            let total = count_segments(len, stride, 0).max(1);
             // Mel-Band RoFormer holds ~3.6 GiB on CPU and only costs ~0.4 s to
             // reload, so release it after every pass (including cancelled or
             // failed runs) rather than keeping it pinned across SCNet/Demucs or
             // after an early exit.
             let drop_after =
-                mix.duration_sec(SAMPLE_RATE) > 300.0 || entry.kind == ModelKind::MelbandRoformer;
-            let input = match pass.input {
-                PassInput::Mix => mix,
-                PassInput::Residual => &residual,
-            };
+                duration_sec > 300.0 || entry.kind == ModelKind::MelbandRoformer;
             // Load time counts as the first few percent of the step.
             let result = tracker.update(0.03).and_then(|()| {
-                separate_track(
+                let src = match (pass.input, residual.as_ref()) {
+                    (PassInput::Mix, _) => match &mix {
+                        TrackSource::Planar(s) => TrackSource::Planar(s),
+                        TrackSource::Mapped(m) => TrackSource::Mapped(m),
+                    },
+                    (PassInput::Residual, Some(r)) => TrackSource::Planar(r),
+                    (PassInput::Residual, None) => match &mix {
+                        TrackSource::Planar(s) => TrackSource::Planar(s),
+                        TrackSource::Mapped(m) => TrackSource::Mapped(m),
+                    },
+                };
+                separate_track_source(
                     loaded.model.as_mut(),
-                    input,
+                    src,
                     stride,
                     &wanted,
                     0,
@@ -950,13 +1139,30 @@ impl Engine {
             }
             let stems = result?;
             model_ids.push(entry.id.clone());
+            let res = match &mut residual {
+                Some(r) => r,
+                None => {
+                    let built = match &mix {
+                        TrackSource::Planar(s) => (*s).clone(),
+                        TrackSource::Mapped(m) => m.to_stereo()?,
+                    };
+                    residual.insert(built)
+                }
+            };
             for (stem, audio) in pass.stems.iter().zip(stems) {
-                residual.subtract(&audio);
+                res.subtract(&audio);
                 on_stem(*stem, audio)?;
             }
         }
         drop(slot);
-        on_stem(remainder_stem(options.mode), residual)?;
+        let final_residual = match residual {
+            Some(r) => r,
+            None => match &mix {
+                TrackSource::Planar(s) => (*s).clone(),
+                TrackSource::Mapped(m) => m.to_stereo()?,
+            },
+        };
+        on_stem(remainder_stem(options.mode), final_residual)?;
         Ok(model_ids)
     }
 
@@ -999,6 +1205,31 @@ impl Engine {
         sync: bool,
         progress: &dyn Progress,
     ) -> Result<SplitResult> {
+        self.split_source_to_dir(TrackSource::Planar(mix), request, out_dir, sync, progress)
+    }
+
+    /// Zero-initial-copy variant of [`Engine::split_to_dir_with_sync`] that
+    /// reads Pass 0 straight from a memory-mapped working WAV and avoids
+    /// duplicating `mix` on the heap.
+    pub fn split_mapped_to_dir_with_sync(
+        &self,
+        mix: &MappedWav,
+        request: SplitRequest,
+        out_dir: &Path,
+        sync: bool,
+        progress: &dyn Progress,
+    ) -> Result<SplitResult> {
+        self.split_source_to_dir(TrackSource::Mapped(mix), request, out_dir, sync, progress)
+    }
+
+    fn split_source_to_dir(
+        &self,
+        mix: TrackSource<'_>,
+        request: SplitRequest,
+        out_dir: &Path,
+        sync: bool,
+        progress: &dyn Progress,
+    ) -> Result<SplitResult> {
         let started = Instant::now();
         let options = request.options;
         let plan = passes(options);
@@ -1028,7 +1259,7 @@ impl Engine {
             }
         }
 
-        let audio_sec = mix.duration_sec(SAMPLE_RATE);
+        let audio_sec = mix.len() as f64 / f64::from(SAMPLE_RATE);
         let mut steps = Vec::new();
         for m in &missing {
             steps.push(PlannedStep {
@@ -1039,7 +1270,7 @@ impl Engine {
             });
         }
         let downloads = steps.len();
-        steps.extend(self.separation_steps(&plan, mix)?);
+        steps.extend(self.separation_steps(&plan, audio_sec)?);
         // Measuring and saving the stems of a pass happens at the end of
         // that pass's step; these two steps cover the remainder stem.
         let analyze_step = steps.len();
@@ -1071,14 +1302,19 @@ impl Engine {
                 .install(&m.id, request.accept_restricted, &Bridge(&tracker))?;
         }
 
-        // Stages 2 to 4: separate; measure, name and save each stem as it
-        // arrives, then let go of it.
+        // Stages 2 to 4: separate; measure, name, peak-scan and save each stem
+        // as it arrives, then let go of it.
         std::fs::create_dir_all(out_dir).map_err(|e| Error::from_write(&e, out_dir))?;
-        let mix_rms = precompute_mix_rms(mix, SAMPLE_RATE);
+        let mix_rms = match &mix {
+            TrackSource::Planar(s) => precompute_mix_rms(s, SAMPLE_RATE),
+            TrackSource::Mapped(m) => {
+                precompute_mix_rms_interleaved(m.samples(), usize::from(m.channels()), SAMPLE_RATE)
+            }
+        };
         let remainder = remainder_stem(options.mode);
         let tag = request.tag_stems && self.store.is_installed(TAGGER_MODEL);
         let mut results: Vec<StemResult> = Vec::new();
-        let model_ids = self.run_passes(
+        let model_ids = self.run_passes_source(
             mix,
             options,
             &plan,
@@ -1088,9 +1324,17 @@ impl Engine {
                 if id == remainder {
                     tracker.begin(analyze_step)?;
                 }
-                let stats = analyze_stereo_with_mix_rms(&audio, Some(&mix_rms), SAMPLE_RATE);
+                let (stats, active_mask) =
+                    analyze_stereo_with_activity(&audio, Some(&mix_rms), SAMPLE_RATE);
+                let peaks_960 = Some(compute_peaks_planar_bytes(&audio, 960));
                 let contains = if tag && stats.present {
-                    self.detect_in_stem(&audio, id, options.mode, progress)?
+                    self.detect_in_stem_with_mask(
+                        &audio,
+                        id,
+                        options.mode,
+                        &active_mask,
+                        progress,
+                    )?
                 } else {
                     Vec::new()
                 };
@@ -1108,6 +1352,7 @@ impl Engine {
                     path,
                     stats,
                     contains,
+                    peaks_960,
                 });
                 Ok(())
             },
@@ -1147,7 +1392,28 @@ pub fn export_file(
     dst: &Path,
     progress: &dyn Progress,
 ) -> Result<()> {
+    check_cancelled(progress)?;
     let wav = MappedWav::open(src)?;
+    if format == ExportFormat::Wav32f {
+        let ch = wav.channels();
+        if ch == 0 || ch > 2 {
+            return Err(Error::new(
+                ErrorCode::UnsupportedFormat,
+                "Only mono and stereo audio can be exported",
+            ));
+        }
+        if std::fs::metadata(dst).is_ok_and(|m| m.is_dir()) {
+            return Err(Error::from_write(
+                &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+                dst,
+            ));
+        }
+        // Release the mapping before copying/cloning so Windows never sees a
+        // conflicting open handle and macOS APFS can clonefile in <1 ms.
+        drop(wav);
+        return crate::wav::copy_file_atomic(src, dst)
+            .map_err(|e| Error::from_write(&e, dst));
+    }
     wav.advise_sequential();
     export_audio(
         wav.samples(),

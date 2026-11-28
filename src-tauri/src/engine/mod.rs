@@ -183,6 +183,9 @@ pub struct StemAnalysis {
     /// [`crate::ipc::ACTIVITY_BINS`] values in 0..1.
     pub activity: Vec<f64>,
     pub contains: Vec<Detection>,
+    /// Optional precomputed 960-bucket raw peak bytes (`2 * 960` bytes) to seed
+    /// the session's peak cache without re-reading the written WAV from disk.
+    pub peaks_960: Option<Vec<u8>>,
 }
 
 /// One file of an export.
@@ -279,6 +282,9 @@ pub trait Engine: Send + Sync + 'static {
     fn import_model_files(&self, paths: &[PathBuf]) -> EngineResult<Vec<String>>;
 
     fn configure_threads(&self, _threads: u32) {}
+
+    /// Releases cached model sessions when idle or shutting down.
+    fn unload_models(&self) {}
 
     fn hardware(&self) -> HardwareInfo;
 }

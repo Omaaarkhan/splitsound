@@ -16,17 +16,24 @@ pub const MAX_BUCKETS: u32 = 65_536;
 
 /// Min/max per bucket over interleaved stereo (both channels folded
 /// together), as `2 * buckets` signed bytes where ±127 is ±1.0.
+/// Delegates to `splitsound-core` (compiled at `-O3` with SIMD vectorization)
+/// for all standard bucket counts (`<= 16_384`).
 pub fn compute(samples: &[f32], buckets: u32) -> Vec<i8> {
-    let buckets = buckets.max(1) as usize;
+    let buckets_usize = buckets.max(1) as usize;
+    if buckets_usize <= splitsound_core::peaks::MAX_BUCKETS {
+        return splitsound_core::peaks::compute_peaks(samples, 2, buckets_usize).data;
+    }
     let frames = samples.len() / 2;
-    let mut out = vec![0i8; buckets * 2];
+    let mut out = vec![0i8; buckets_usize * 2];
     if frames == 0 {
         return out;
     }
     let q = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
-    for b in 0..buckets {
-        let start = b * frames / buckets;
-        let end = ((b + 1) * frames / buckets).max(start + 1).min(frames);
+    for b in 0..buckets_usize {
+        let start = (b as u128 * frames as u128 / buckets_usize as u128) as usize;
+        let end = (((b as u128 + 1) * frames as u128 / buckets_usize as u128) as usize)
+            .max(start + 1)
+            .min(frames);
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for &s in &samples[start * 2..end * 2] {
             if s.is_finite() {
@@ -73,6 +80,41 @@ fn wav_fingerprint(path: &Path) -> io::Result<[u8; 20]> {
     Ok(fp)
 }
 
+/// Writes precomputed raw peak bytes (`2 * buckets`) into the session's
+/// `<session_dir>/peaks/<source_key>-<buckets>.bin` cache keyed by `wav_path`'s
+/// current size + mtime. Best-effort: silently ignored on I/O error.
+pub fn write_peak_cache(
+    session_dir: &Path,
+    wav_path: &Path,
+    source_key: &str,
+    buckets: u32,
+    bytes: &[u8],
+) {
+    let buckets = buckets.max(1);
+    if bytes.len() != buckets as usize * 2 {
+        return;
+    }
+    let Ok(fp) = wav_fingerprint(wav_path) else {
+        return;
+    };
+    let peaks_dir = session_dir.join("peaks");
+    if fs::create_dir_all(&peaks_dir).is_err() {
+        return;
+    }
+    let cache_path = peaks_dir.join(format!("{source_key}-{buckets}.bin"));
+    let tmp = peaks_dir.join(format!(
+        ".{source_key}-{buckets}.tmp-{}",
+        &new_session_id()[..8]
+    ));
+    if let Ok(mut out) = File::create_new(&tmp) {
+        let ok = out.write_all(&fp).is_ok() && out.write_all(bytes).is_ok() && out.flush().is_ok();
+        drop(out);
+        if !ok || rename_retry(&tmp, &cache_path).is_err() {
+            let _ = remove_file_retry(&tmp);
+        }
+    }
+}
+
 /// Returns raw `2 * buckets` peak bytes for `wav_path`, caching under
 /// `<session_dir>/peaks/<source_key>-<buckets>.bin` keyed by WAV size + mtime.
 pub fn cached_peak_bytes(
@@ -99,21 +141,7 @@ pub fn cached_peak_bytes(
     let w = MappedWav::open(wav_path)?;
     w.advise_sequential();
     let bytes = compute_bytes(w.samples(), buckets);
-
-    if fs::create_dir_all(&peaks_dir).is_ok() {
-        let tmp = peaks_dir.join(format!(
-            ".{source_key}-{buckets}.tmp-{}",
-            &new_session_id()[..8]
-        ));
-        if let Ok(mut out) = File::create_new(&tmp) {
-            let ok =
-                out.write_all(&fp).is_ok() && out.write_all(&bytes).is_ok() && out.flush().is_ok();
-            drop(out);
-            if !ok || rename_retry(&tmp, &cache_path).is_err() {
-                let _ = remove_file_retry(&tmp);
-            }
-        }
-    }
+    write_peak_cache(session_dir, wav_path, source_key, buckets, &bytes);
     Ok(bytes)
 }
 

@@ -5,6 +5,7 @@ import { getScanModels } from "../utils/format";
 import {
   applyLibraryChanged,
   applyLibraryProgress,
+  libraryStore,
   refreshLibrary,
   seedLibraryProgress,
 } from "./libraryStore";
@@ -239,12 +240,22 @@ export async function retryInstrumentScan(): Promise<void> {
 export async function bootstrapApp(): Promise<UnlistenFn> {
   const unlisteners = await Promise.all([
     listen("library:changed", (sessions) => {
+      const prev = libraryStore.getState();
+      let prevBytes = 0;
+      for (const s of prev.sessions) prevBytes += s.sizeBytes;
+      let nextBytes = 0;
+      for (const s of sessions) nextBytes += s.sizeBytes;
+      const storageChanged =
+        !prev.loaded || prev.sessions.length !== sessions.length || prevBytes !== nextBytes;
+
       applyLibraryChanged(sessions);
       const current = sessionStore.getState().current;
       if (current && !sessions.some((s) => s.id === current.id)) {
         closeSession();
       }
-      void refreshAppInfo();
+      if (storageChanged) {
+        void refreshAppInfo();
+      }
     }),
     listen("session:updated", (session) => {
       const prev = sessionStore.getState();

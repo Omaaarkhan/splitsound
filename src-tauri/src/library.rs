@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,33 @@ pub struct LoadReport {
 pub struct Library {
     root: PathBuf,
     entries: Mutex<BTreeMap<String, Entry>>,
+    ready_flag: AtomicBool,
+    ready_gate: (Mutex<bool>, Condvar),
+}
+
+fn move_to_gc(path: &Path, gc_batch: &mut Option<PathBuf>, gc_parent: Option<&Path>) {
+    if let Some(parent) = gc_parent {
+        let batch = gc_batch.get_or_insert_with(|| {
+            let dir = parent.join(format!(".lib-gc-{}", &util::new_session_id()[..8]));
+            let _ = fs::create_dir_all(&dir);
+            dir
+        });
+        let dst = batch.join(util::new_session_id());
+        if util::rename_retry(path, &dst).is_ok() {
+            return;
+        }
+    }
+    let _ = fs::remove_dir_all(path);
+}
+
+fn spawn_gc(gc_batch: Option<PathBuf>) {
+    if let Some(dir) = gc_batch {
+        let _ = std::thread::Builder::new()
+            .name("splitsound-lib-gc".into())
+            .spawn(move || {
+                let _ = util::remove_dir_all_retry(&dir);
+            });
+    }
 }
 
 fn invalid_id() -> IpcError {
@@ -103,23 +131,99 @@ impl Library {
     /// imports, deletes and splits, and resetting sessions a crash left in
     /// `queued` or `splitting`.
     pub fn open(root: PathBuf) -> io::Result<(Self, LoadReport)> {
+        Self::open_with_gc_dir(root, None)
+    }
+
+    /// [`Library::open`] that offloads removal of `.staging-*`, `.trash-*`,
+    /// `stems.partial`, and `stems.old` directories to a background thread via
+    /// O(1) rename into `gc_dir` when provided on the same volume.
+    pub fn open_with_gc_dir(root: PathBuf, gc_dir: Option<&Path>) -> io::Result<(Self, LoadReport)> {
+        let (entries, report) = Self::scan_root(&root, gc_dir)?;
+        Ok((
+            Library {
+                root,
+                entries: Mutex::new(entries),
+                ready_flag: AtomicBool::new(true),
+                ready_gate: (Mutex::new(true), Condvar::new()),
+            },
+            report,
+        ))
+    }
+
+    /// Creates an unhydrated `Library` handle immediately so window creation
+    /// can overlap with scanning the library directory on a background thread.
+    /// Any query waits cleanly until [`Library::hydrate`] completes.
+    pub fn new_deferred(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&root)?;
+        Ok(Library {
+            root,
+            entries: Mutex::new(BTreeMap::new()),
+            ready_flag: AtomicBool::new(false),
+            ready_gate: (Mutex::new(false), Condvar::new()),
+        })
+    }
+
+    /// Hydrates a deferred library in the background and unblocks waiting
+    /// callers even if scanning encountered an error.
+    pub fn hydrate(&self, gc_dir: Option<&Path>) -> io::Result<LoadReport> {
+        let res = Self::scan_root(&self.root, gc_dir);
+        match res {
+            Ok((loaded, report)) => {
+                *lock(&self.entries) = loaded;
+                self.mark_ready();
+                Ok(report)
+            }
+            Err(e) => {
+                self.mark_ready();
+                Err(e)
+            }
+        }
+    }
+
+    fn mark_ready(&self) {
+        let mut ready = lock(&self.ready_gate.0);
+        *ready = true;
+        self.ready_flag.store(true, Ordering::Release);
+        self.ready_gate.1.notify_all();
+    }
+
+    #[inline]
+    fn wait_ready(&self) {
+        if self.ready_flag.load(Ordering::Acquire) {
+            return;
+        }
+        let mut ready = lock(&self.ready_gate.0);
+        while !*ready {
+            ready = self
+                .ready_gate
+                .1
+                .wait(ready)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn scan_root(
+        root: &Path,
+        gc_dir: Option<&Path>,
+    ) -> io::Result<(BTreeMap<String, Entry>, LoadReport)> {
+        fs::create_dir_all(root)?;
         let mut report = LoadReport::default();
         let mut entries = BTreeMap::new();
-        for item in fs::read_dir(&root)?.flatten() {
+        let mut gc_batch: Option<PathBuf> = None;
+        for item in fs::read_dir(root)?.flatten() {
             let name = item.file_name().to_string_lossy().into_owned();
             let path = item.path();
             let Ok(ft) = item.file_type() else { continue };
             if name.starts_with(".staging-") || name.starts_with(".trash-") {
                 if ft.is_dir() {
-                    let _ = fs::remove_dir_all(&path);
+                    move_to_gc(&path, &mut gc_batch, gc_dir);
                 }
                 continue;
             }
             if !ft.is_dir() || !is_valid_session_id(&name) {
                 continue;
             }
-            match Self::load_one(&path, &name) {
+            match Self::load_one(&path, &name, &mut gc_batch, gc_dir) {
                 Ok((mut entry, repaired)) => {
                     if repaired {
                         report.repaired.push(name.clone());
@@ -145,16 +249,16 @@ impl Library {
                 }
             }
         }
-        Ok((
-            Library {
-                root,
-                entries: Mutex::new(entries),
-            },
-            report,
-        ))
+        spawn_gc(gc_batch);
+        Ok((entries, report))
     }
 
-    fn load_one(dir: &Path, id: &str) -> io::Result<(Entry, bool)> {
+    fn load_one(
+        dir: &Path,
+        id: &str,
+        gc_batch: &mut Option<PathBuf>,
+        gc_dir: Option<&Path>,
+    ) -> io::Result<(Entry, bool)> {
         let bytes = util::read_bounded(&dir.join(SESSION_FILE), MAX_SESSION_JSON)?;
         let stored: Stored = serde_json::from_slice(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -169,11 +273,18 @@ impl Library {
         if s.status == SessionStatus::Splitting {
             rollback_stems(dir, !s.stems.is_empty())?;
         }
-        // Leftovers of an interrupted split or write.
-        let _ = fs::remove_dir_all(dir.join("stems.partial"));
-        let _ = fs::remove_dir_all(dir.join("stems.old"));
+        // Single directory pass to clean leftovers and check for mix.wav.
+        let mut has_mix = false;
         for f in fs::read_dir(dir)?.flatten() {
-            if util::is_atomic_temp(&f.file_name().to_string_lossy()) {
+            let fname = f.file_name();
+            let Some(name) = fname.to_str() else {
+                continue;
+            };
+            if name == "mix.wav" {
+                has_mix = f.file_type().is_ok_and(|t| t.is_file());
+            } else if name == "stems.partial" || name == "stems.old" {
+                move_to_gc(&f.path(), gc_batch, gc_dir);
+            } else if util::is_atomic_temp(name) {
                 let _ = fs::remove_file(f.path());
             }
         }
@@ -200,7 +311,7 @@ impl Library {
             );
             repaired = true;
         }
-        if !dir.join("mix.wav").is_file() {
+        if !has_mix {
             s.status = SessionStatus::Failed;
             s.error =
                 Some("This song's audio is missing. Delete it and import the file again.".into());
@@ -242,6 +353,7 @@ impl Library {
         if !is_valid_session_id(id) {
             return Err(invalid_id());
         }
+        self.wait_ready();
         lock(&self.entries)
             .get(id)
             .map(|e| e.session.clone())
@@ -249,15 +361,18 @@ impl Library {
     }
 
     pub fn contains(&self, id: &str) -> bool {
+        self.wait_ready();
         lock(&self.entries).contains_key(id)
     }
 
     pub fn ids(&self) -> Vec<String> {
+        self.wait_ready();
         lock(&self.entries).keys().cloned().collect()
     }
 
     /// All sessions, newest first.
     pub fn summaries(&self) -> Vec<SessionSummary> {
+        self.wait_ready();
         let entries = lock(&self.entries);
         let mut v: Vec<SessionSummary> = entries
             .values()
@@ -285,11 +400,13 @@ impl Library {
     }
 
     pub fn total_bytes(&self) -> u64 {
+        self.wait_ready();
         lock(&self.entries).values().map(|e| e.size).sum()
     }
 
     /// Moves a finished import from its staging folder into the library.
     pub fn insert(&self, session: Session, staging: &Path) -> IpcResult<()> {
+        self.wait_ready();
         let dir = self.dir(&session.id)?;
         let size = util::dir_size(staging);
         let stored = Stored {
@@ -318,26 +435,50 @@ impl Library {
         id: &str,
         f: impl FnOnce(&mut Session, &mut Option<SplitSummary>) -> R,
     ) -> IpcResult<(Session, R)> {
+        self.update_inner(id, None, f)
+    }
+
+    /// Like [`Library::update`], also recording a refreshed `size_bytes` in the
+    /// same atomic metadata write (avoiding a second `fsync`).
+    pub fn update_with_size<R>(
+        &self,
+        id: &str,
+        size: u64,
+        f: impl FnOnce(&mut Session, &mut Option<SplitSummary>) -> R,
+    ) -> IpcResult<(Session, R)> {
+        self.update_inner(id, Some(size), f)
+    }
+
+    fn update_inner<R>(
+        &self,
+        id: &str,
+        new_size: Option<u64>,
+        f: impl FnOnce(&mut Session, &mut Option<SplitSummary>) -> R,
+    ) -> IpcResult<(Session, R)> {
+        self.wait_ready();
         let dir = self.dir(id)?;
         let mut entries = lock(&self.entries);
         let entry = entries.get_mut(id).ok_or_else(invalid_id)?;
         let mut session = entry.session.clone();
         let mut prev = entry.previous_split.clone();
         let r = f(&mut session, &mut prev);
+        let size = new_size.unwrap_or(entry.size);
         let stored = Stored {
             format: STORE_FORMAT,
             session: session.clone(),
             previous_split: prev.clone(),
-            size_bytes: Some(entry.size),
+            size_bytes: Some(size),
         };
         write_stored(&dir, &stored).map_err(|e| IpcError::io("save the song", &e))?;
         entry.session = session.clone();
         entry.previous_split = prev;
+        entry.size = size;
         Ok((session, r))
     }
 
     /// Recomputes the disk usage of a session.
     pub fn refresh_size(&self, id: &str) {
+        self.wait_ready();
         let Ok(dir) = self.dir(id) else { return };
         let size = util::dir_size(&dir);
         let stored = {
@@ -359,6 +500,7 @@ impl Library {
     /// Deletes a session folder. The folder is first renamed out of the way
     /// so a failure half-way never leaves a broken session behind.
     pub fn remove(&self, id: &str) -> IpcResult<()> {
+        self.wait_ready();
         let dir = self.dir(id)?;
         let mut entries = lock(&self.entries);
         if !entries.contains_key(id) {

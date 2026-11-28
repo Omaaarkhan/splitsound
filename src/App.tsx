@@ -54,9 +54,8 @@ function isSliderOrInteractiveRole(target: EventTarget | null): boolean {
 }
 
 export default function App() {
-  const { session, splitOptions } = useShallowStore(sessionStore, (s) => ({
+  const { session } = useShallowStore(sessionStore, (s) => ({
     session: s.current,
-    splitOptions: s.splitOptions,
   }));
   const { platform } = useShallowStore(settingsStore, (s) => ({
     platform: s.appInfo.platform,
@@ -236,8 +235,6 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleChooseFile]);
-
-  void splitOptions;
 
   const showTransport = session !== null;
 

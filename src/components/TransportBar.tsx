@@ -25,16 +25,17 @@ export const TransportBar = memo(function TransportBar({
   session,
   onOpenExport,
 }: TransportBarProps) {
-  const { playing, sessionId, positionSec, playbackDurationSec, loop, source, masterGainDb } =
-    useShallowStore(playbackStore, (s) => ({
+  const { playing, sessionId, playbackDurationSec, loop, source, masterGainDb } = useShallowStore(
+    playbackStore,
+    (s) => ({
       playing: s.playback.playing,
       sessionId: s.playback.sessionId,
-      positionSec: s.playback.positionSec,
       playbackDurationSec: s.playback.durationSec,
       loop: s.playback.loop,
       source: s.playback.source,
       masterGainDb: s.playback.masterGainDb,
-    }));
+    }),
+  );
   const { platform } = useShallowStore(settingsStore, (s) => ({
     platform: s.appInfo.platform,
   }));
@@ -64,7 +65,7 @@ export const TransportBar = memo(function TransportBar({
     };
     syncText();
     return subscribePlaybackFrame(syncText);
-  }, [playing, sessionId, positionSec]);
+  }, [playing, sessionId]);
 
   return (
     <footer className="transport" aria-label="Playback controls">
@@ -104,7 +105,7 @@ export const TransportBar = memo(function TransportBar({
       </button>
 
       <div className="transport__time" aria-label="Playback position">
-        <span ref={posRef}>{formatTimeTenths(positionSec)}</span>
+        <span ref={posRef}>{formatTimeTenths(getInterpolatedPositionSec())}</span>
         <span className="transport__total">/ {formatTime(durationSec)}</span>
       </div>
 

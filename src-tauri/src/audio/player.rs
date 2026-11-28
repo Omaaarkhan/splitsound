@@ -35,9 +35,9 @@ use crate::ipc::{
 use crate::util::lock;
 
 /// Frames (at the device rate) rendered per block.
-const BLOCK: usize = 128;
+const BLOCK: usize = 256;
 /// How far ahead of the device the mixer renders.
-const AHEAD_MS: usize = 18;
+const AHEAD_MS: usize = 24;
 /// Window (~0.75 s at 44.1 kHz) prefetched ahead of active playback/seeks.
 const PREFETCH_FRAMES: u64 = 32_768;
 const TICK_EVERY: Duration = Duration::from_millis(33);
@@ -869,9 +869,13 @@ impl MixerThread {
         let Some(audio) = &self.audio else {
             return;
         };
-        audio.mix.prefetch(frame, PREFETCH_FRAMES);
-        for (_, stem) in &audio.stems {
-            stem.prefetch(frame, PREFETCH_FRAMES);
+        if self.core.needs_mix_source() {
+            audio.mix.prefetch(frame, PREFETCH_FRAMES);
+        }
+        for (i, (_, stem)) in audio.stems.iter().enumerate() {
+            if self.core.needs_stem_source(i) {
+                stem.prefetch(frame, PREFETCH_FRAMES);
+            }
         }
         self.last_prefetch_pos = frame;
     }
@@ -879,12 +883,17 @@ impl MixerThread {
     fn run(mut self) {
         loop {
             let busy = self.core.is_active() || !self.marks.is_empty();
-            let wait = if busy {
-                Duration::from_millis(2)
+            // Block indefinitely when idle/paused (0 wakeups/s); poll at ~250 Hz
+            // against the 24 ms render-ahead buffer while playing or draining.
+            let recv_result = if busy {
+                self.rx.recv_timeout(Duration::from_millis(4))
             } else {
-                Duration::from_millis(100)
+                match self.rx.recv() {
+                    Ok(cmd) => Ok(cmd),
+                    Err(_) => Err(RecvTimeoutError::Disconnected),
+                }
             };
-            match self.rx.recv_timeout(wait) {
+            match recv_result {
                 Ok(cmd) => {
                     if !self.handle(cmd) {
                         drop(self.audio.take());
@@ -1047,9 +1056,13 @@ impl MixerThread {
         if self.core.is_active() {
             let pos = self.core.position();
             if pos.abs_diff(self.last_prefetch_pos) >= 22_050 {
-                audio.mix.prefetch(pos, PREFETCH_FRAMES);
-                for (_, stem) in &audio.stems {
-                    stem.prefetch(pos, PREFETCH_FRAMES);
+                if self.core.needs_mix_source() {
+                    audio.mix.prefetch(pos, PREFETCH_FRAMES);
+                }
+                for (i, (_, stem)) in audio.stems.iter().enumerate() {
+                    if self.core.needs_stem_source(i) {
+                        stem.prefetch(pos, PREFETCH_FRAMES);
+                    }
                 }
                 self.last_prefetch_pos = pos;
             }

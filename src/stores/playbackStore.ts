@@ -40,6 +40,8 @@ const frameListeners = new Set<() => void>();
 let extraAnimCount = 0;
 let rafId = 0;
 
+type LoopRegion = { startSec: number; endSec: number } | null;
+
 // In-flight IPC coalescing + optimistic edit guards so stale state/tick echoes never fight drags.
 const inFlightChannelGain = new Map<SourceId, Promise<void>>();
 const pendingChannelGain = new Map<SourceId, number>();
@@ -47,6 +49,8 @@ let inFlightMasterGain: Promise<void> | null = null;
 let pendingMasterGain: number | null = null;
 let inFlightSeek: Promise<void> | null = null;
 let pendingSeekPos: number | null = null;
+let inFlightLoop: Promise<void> | null = null;
+let pendingLoop: LoopRegion | undefined = undefined;
 
 const pendingChannelEdits = new Map<SourceId, number>();
 let pendingMasterEdits = 0;
@@ -106,6 +110,8 @@ function clearPendingGuards(): void {
   pendingMasterGain = null;
   inFlightSeek = null;
   pendingSeekPos = null;
+  inFlightLoop = null;
+  pendingLoop = undefined;
   pendingChannelEdits.clear();
   pendingMasterEdits = 0;
   pendingSeekEdits = 0;
@@ -252,7 +258,16 @@ export function applyPlaybackTick(tick: PlaybackTick): void {
     nextLevels[entry.id] = entry.peak;
   }
   currentLevels = nextLevels;
-  notifyTickListeners();
+  for (const fn of tickListeners) {
+    fn();
+  }
+  // When the central rAF loop is already driving frameListeners at display refresh rate,
+  // avoid firing them an extra 30 times/sec on every playback:tick echo.
+  if (rafId === 0) {
+    for (const fn of frameListeners) {
+      fn();
+    }
+  }
 }
 
 export function isChannelAudible(
@@ -499,6 +514,30 @@ export async function toggleHearOriginal(): Promise<void> {
   }
 }
 
+function sendLoopRegion(nextLoop: LoopRegion): Promise<void> {
+  pendingLoop = nextLoop;
+  if (inFlightLoop) return inFlightLoop;
+
+  pendingLoopEdits++;
+  let task: Promise<void> | null = null;
+  task = (async () => {
+    try {
+      while (pendingLoop !== undefined) {
+        const toSend = pendingLoop;
+        pendingLoop = undefined;
+        await invoke("playback_set_loop", { loop: toSend });
+      }
+    } finally {
+      if (inFlightLoop === task) {
+        inFlightLoop = null;
+      }
+      pendingLoopEdits = Math.max(0, pendingLoopEdits - 1);
+    }
+  })();
+  inFlightLoop = task;
+  return task;
+}
+
 export async function setLoopRegion(
   loop: { startSec: number; endSec: number } | null,
 ): Promise<void> {
@@ -528,12 +567,7 @@ export async function setLoopRegion(
     playback: { ...prev.playback, loop: normalized },
     lastLoopRegion: normalized ?? prev.lastLoopRegion,
   }));
-  pendingLoopEdits++;
-  try {
-    await invoke("playback_set_loop", { loop: normalized });
-  } finally {
-    pendingLoopEdits = Math.max(0, pendingLoopEdits - 1);
-  }
+  return sendLoopRegion(normalized);
 }
 
 export async function toggleLoop(): Promise<void> {
@@ -547,10 +581,5 @@ export async function toggleLoop(): Promise<void> {
     playback: { ...prev.playback, loop: nextLoop },
     lastLoopRegion: nextLoop ?? prev.lastLoopRegion,
   }));
-  pendingLoopEdits++;
-  try {
-    await invoke("playback_set_loop", { loop: nextLoop });
-  } finally {
-    pendingLoopEdits = Math.max(0, pendingLoopEdits - 1);
-  }
+  return sendLoopRegion(nextLoop);
 }

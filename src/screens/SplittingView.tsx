@@ -19,6 +19,14 @@ interface SplittingViewProps {
   onCancel: () => void;
 }
 
+function handleSeekPlayback(pos: number): void {
+  void seekPlayback(pos);
+}
+
+function handleChangeLoop(loop: { startSec: number; endSec: number } | null): void {
+  void setLoopRegion(loop);
+}
+
 export const SplittingView = memo(function SplittingView({
   session,
   onCancel,
@@ -27,8 +35,7 @@ export const SplittingView = memo(function SplittingView({
     peaks: s.peaks,
     splitProgress: s.splitProgress,
   }));
-  const { playing, playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
-    playing: s.playback.playing,
+  const { playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
     playbackDurationSec: s.playback.durationSec,
     loop: s.playback.loop,
   }));
@@ -59,9 +66,7 @@ export const SplittingView = memo(function SplittingView({
   );
 
   const durationSec = playbackDurationSec || session.track.durationSec;
-  const seekHandlers = useWellSeekHandlers(durationSec, true, (pos) => {
-    void seekPlayback(pos);
-  });
+  const seekHandlers = useWellSeekHandlers(durationSec, true, handleSeekPlayback);
 
   useEffect(() => {
     const el = fillRef.current;
@@ -108,8 +113,8 @@ export const SplittingView = memo(function SplittingView({
         <TimeRuler
           durationSec={durationSec}
           loop={loop}
-          onSeek={(pos) => void seekPlayback(pos)}
-          onChangeLoop={(l) => void setLoopRegion(l)}
+          onSeek={handleSeekPlayback}
+          onChangeLoop={handleChangeLoop}
         />
         <LoopWash loop={loop} durationSec={durationSec} />
         <div className="lane">
@@ -118,12 +123,11 @@ export const SplittingView = memo(function SplittingView({
             peaks={peaks.mix}
             audible
             durationSec={durationSec}
-            playing={playing}
             splitOverlay={splitOverlay}
             splitFraction={fraction}
           />
         </div>
-        <PlayheadLine durationSec={durationSec} playing={playing} />
+        <PlayheadLine durationSec={durationSec} />
       </section>
     </main>
   );

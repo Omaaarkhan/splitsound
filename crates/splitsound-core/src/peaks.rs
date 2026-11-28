@@ -51,12 +51,39 @@ impl Peaks {
 /// clamped (a waveform never needs more columns than a very wide screen).
 pub const MAX_BUCKETS: usize = 16_384;
 
+#[inline]
 fn quantise(v: f32) -> i8 {
     if v.is_nan() {
         0
     } else {
         (v.clamp(-1.0, 1.0) * 127.0).round() as i8
     }
+}
+
+#[inline]
+fn minmax_slice(slice: &[f32]) -> (f32, f32) {
+    // 4-way unrolled accumulation lets LLVM emit parallel SIMD fminnm/fmaxnm
+    // instructions across lanes; IEEE min/max automatically ignore NaN.
+    let mut lo = [f32::INFINITY; 4];
+    let mut hi = [f32::NEG_INFINITY; 4];
+    let (chunks, rem) = slice.as_chunks::<4>();
+    for c in chunks {
+        lo[0] = lo[0].min(c[0]);
+        hi[0] = hi[0].max(c[0]);
+        lo[1] = lo[1].min(c[1]);
+        hi[1] = hi[1].max(c[1]);
+        lo[2] = lo[2].min(c[2]);
+        hi[2] = hi[2].max(c[2]);
+        lo[3] = lo[3].min(c[3]);
+        hi[3] = hi[3].max(c[3]);
+    }
+    let mut l = lo[0].min(lo[1]).min(lo[2].min(lo[3]));
+    let mut h = hi[0].max(hi[1]).max(hi[2].max(hi[3]));
+    for &v in rem {
+        l = l.min(v);
+        h = h.max(v);
+    }
+    (l, h)
 }
 
 /// Computes `buckets` min/max pairs over interleaved `samples` with
@@ -82,17 +109,59 @@ pub fn compute_peaks(samples: &[f32], channels: usize, buckets: usize) -> Peaks 
         if end <= start {
             end = start + 1;
         }
-        let slice = &samples[start * channels..end * channels];
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for &v in slice {
-            lo = lo.min(v);
-            hi = hi.max(v);
+        let (lo, hi) = minmax_slice(&samples[start * channels..end * channels]);
+        if lo <= hi {
+            data[2 * b] = quantise(lo);
+            data[2 * b + 1] = quantise(hi);
         }
-        data[2 * b] = quantise(lo);
-        data[2 * b + 1] = quantise(hi);
     }
     Peaks { buckets, data }
+}
+
+/// Computes `buckets` min/max pairs directly over planar stereo [`Stereo`]
+/// without interleaving or re-reading from disk.
+pub fn compute_peaks_planar(audio: &crate::audio::Stereo, buckets: usize) -> Peaks {
+    let buckets = buckets.clamp(1, MAX_BUCKETS);
+    let frames = audio.len();
+    let mut data = vec![0i8; buckets * 2];
+    if frames == 0 {
+        return Peaks { buckets, data };
+    }
+    for b in 0..buckets {
+        let start = (b as u128 * frames as u128 / buckets as u128) as usize;
+        let mut end = ((b as u128 + 1) * frames as u128 / buckets as u128) as usize;
+        let start = start.min(frames - 1);
+        if end <= start {
+            end = start + 1;
+        }
+        let (lo_l, hi_l) = minmax_slice(&audio.left[start..end]);
+        let (lo_r, hi_r) = minmax_slice(&audio.right[start..end]);
+        let lo = lo_l.min(lo_r);
+        let hi = hi_l.max(hi_r);
+        if lo <= hi {
+            data[2 * b] = quantise(lo);
+            data[2 * b + 1] = quantise(hi);
+        }
+    }
+    Peaks { buckets, data }
+}
+
+/// Raw `u8`-typed peak bytes (`2 * buckets`) for interleaved `samples`.
+pub fn compute_peaks_bytes(samples: &[f32], channels: usize, buckets: usize) -> Vec<u8> {
+    compute_peaks(samples, channels, buckets)
+        .data
+        .into_iter()
+        .map(|b| b as u8)
+        .collect()
+}
+
+/// Raw `u8`-typed peak bytes (`2 * buckets`) for planar stereo `audio`.
+pub fn compute_peaks_planar_bytes(audio: &crate::audio::Stereo, buckets: usize) -> Vec<u8> {
+    compute_peaks_planar(audio, buckets)
+        .data
+        .into_iter()
+        .map(|b| b as u8)
+        .collect()
 }
 
 #[cfg(test)]

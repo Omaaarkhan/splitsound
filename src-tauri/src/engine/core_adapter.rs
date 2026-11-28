@@ -8,8 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use splitsound_core as core;
 
@@ -24,31 +25,57 @@ use crate::ipc::{
 };
 use crate::util::lock;
 
+/// How long loaded separator/tagger ONNX sessions stay warm after the last
+/// split or scan completes before being released to reclaim 0.8–2.1 GiB RSS.
+const IDLE_UNLOAD_AFTER: Duration = Duration::from_secs(45);
+
 struct InferenceState {
     busy: bool,
     applied_threads: u32,
+    waiting_splits: usize,
+    models_loaded: bool,
+    last_finished: Option<Instant>,
+    shutdown: bool,
 }
 
-struct InferenceGuard<'a> {
-    lock: &'a Mutex<InferenceState>,
-    cv: &'a Condvar,
+struct InferenceGuard {
+    state: Arc<(Mutex<InferenceState>, Condvar)>,
 }
 
-impl Drop for InferenceGuard<'_> {
+impl Drop for InferenceGuard {
     fn drop(&mut self) {
-        let mut st = lock(self.lock);
+        let mut st = lock(&self.state.0);
         st.busy = false;
-        self.cv.notify_one();
+        st.models_loaded = true;
+        st.last_finished = Some(Instant::now());
+        self.state.1.notify_all();
     }
 }
 
 pub struct CoreEngine {
-    engine: core::Engine,
+    engine: Arc<core::Engine>,
     requested_threads: AtomicU32,
     // The core's preview and split both use the separator. Let either wait
-    // for the other without holding up import, playback, or downloads.
-    inference_state: Mutex<InferenceState>,
-    inference_cv: Condvar,
+    // for the other without holding up import, playback, or downloads, while
+    // giving user-initiated splits priority over background scans and
+    // unloading idle ONNX sessions after IDLE_UNLOAD_AFTER.
+    inference_sync: Arc<(Mutex<InferenceState>, Condvar)>,
+    idle_reaper: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for CoreEngine {
+    fn drop(&mut self) {
+        {
+            let mut st = lock(&self.inference_sync.0);
+            st.shutdown = true;
+        }
+        self.inference_sync.1.notify_all();
+        if let Some(h) = lock(&self.idle_reaper).take()
+            && h.thread().id() != thread::current().id()
+        {
+            let _ = h.join();
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -95,16 +122,60 @@ impl CoreEngine {
                 base_url: format!("{}/", url.trim_end_matches('/')),
             };
         }
-        let engine = core::Engine::new(engine_config)?;
+        let engine = Arc::new(core::Engine::new(engine_config)?);
         engine.models().clean_temp_files();
+        let inference_sync = Arc::new((
+            Mutex::new(InferenceState {
+                busy: false,
+                applied_threads: 0,
+                waiting_splits: 0,
+                models_loaded: false,
+                last_finished: None,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let reaper_engine = Arc::clone(&engine);
+        let reaper_sync = Arc::clone(&inference_sync);
+        let reaper = thread::Builder::new()
+            .name("splitsound-model-gc".into())
+            .spawn(move || {
+                let (mtx, cv) = &*reaper_sync;
+                let mut st = lock(mtx);
+                loop {
+                    if st.shutdown {
+                        return;
+                    }
+                    if st.busy || !st.models_loaded || st.waiting_splits > 0 {
+                        // Zero wakeups while unloaded or actively running.
+                        st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    }
+                    let elapsed = st
+                        .last_finished
+                        .map_or(IDLE_UNLOAD_AFTER, |t| t.elapsed());
+                    if elapsed >= IDLE_UNLOAD_AFTER {
+                        st.models_loaded = false;
+                        st.last_finished = None;
+                        drop(st);
+                        reaper_engine.unload();
+                        log::info!("unloaded idle model sessions to reclaim memory");
+                        st = lock(mtx);
+                        continue;
+                    }
+                    let remaining = IDLE_UNLOAD_AFTER - elapsed;
+                    st = cv
+                        .wait_timeout(st, remaining)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            })
+            .ok();
         Ok(Self {
             engine,
             requested_threads: AtomicU32::new(0),
-            inference_state: Mutex::new(InferenceState {
-                busy: false,
-                applied_threads: 0,
-            }),
-            inference_cv: Condvar::new(),
+            inference_sync,
+            idle_reaper: Mutex::new(reaper),
         })
     }
 
@@ -117,22 +188,32 @@ impl CoreEngine {
         }
     }
 
-    fn inference(&self, cancel: &CancelToken) -> EngineResult<InferenceGuard<'_>> {
-        let mut st = lock(&self.inference_state);
+    fn acquire_inference(&self, is_split: bool, cancel: &CancelToken) -> EngineResult<InferenceGuard> {
+        let (mtx, cv) = &*self.inference_sync;
+        let mut st = lock(mtx);
+        if is_split {
+            st.waiting_splits += 1;
+        }
         loop {
             if cancel.is_cancelled() {
+                if is_split {
+                    st.waiting_splits = st.waiting_splits.saturating_sub(1);
+                    cv.notify_all();
+                }
                 return Err(EngineError::cancelled());
             }
-            if !st.busy {
+            let can_run = !st.busy && (is_split || st.waiting_splits == 0);
+            if can_run {
+                if is_split {
+                    st.waiting_splits = st.waiting_splits.saturating_sub(1);
+                }
                 st.busy = true;
                 self.apply_threads(&mut st.applied_threads);
                 return Ok(InferenceGuard {
-                    lock: &self.inference_state,
-                    cv: &self.inference_cv,
+                    state: Arc::clone(&self.inference_sync),
                 });
             }
-            let (guard, _) = self
-                .inference_cv
+            let (guard, _) = cv
                 .wait_timeout(st, Duration::from_millis(25))
                 .unwrap_or_else(|e| e.into_inner());
             st = guard;
@@ -326,7 +407,7 @@ impl Engine for CoreEngine {
     }
 
     fn scan_instruments(&self, wav: &Path, cancel: &CancelToken) -> EngineResult<ScanOutcome> {
-        let _guard = self.inference(cancel)?;
+        let _guard = self.acquire_inference(false, cancel)?;
         let mix = core::wav::MappedWav::open(wav)?;
         mix.advise_sequential();
         Ok(
@@ -361,8 +442,9 @@ impl Engine for CoreEngine {
         progress: &mut (dyn FnMut(EngineProgress) + Send),
         cancel: &CancelToken,
     ) -> EngineResult<SplitOutput> {
-        let _guard = self.inference(cancel)?;
-        let mix = core::wav::MappedWav::open(&req.mix)?.to_stereo()?;
+        let _guard = self.acquire_inference(true, cancel)?;
+        let mix = core::wav::MappedWav::open(&req.mix)?;
+        mix.advise_sequential();
         let mut request = core::SplitRequest::new(options(&req.options));
         request.accept_restricted = req.accept_restricted;
         // The shell owns downloads so it can also emit per-model progress.
@@ -370,9 +452,13 @@ impl Engine for CoreEngine {
             cancel,
             callback: Some(Mutex::new(progress)),
         };
-        let result =
-            self.engine
-                .split_to_dir_with_sync(&mix, request, &req.out_dir, false, &bridge)?;
+        let result = self.engine.split_mapped_to_dir_with_sync(
+            &mix,
+            request,
+            &req.out_dir,
+            false,
+            &bridge,
+        )?;
         let stems = result
             .stems
             .into_iter()
@@ -391,6 +477,7 @@ impl Engine for CoreEngine {
                             .map(|v| (f64::from(v) * 100.0).round() / 100.0)
                             .collect(),
                         contains: stem.contains.into_iter().map(detection).collect(),
+                        peaks_960: stem.peaks_960,
                     },
                 )
             })
@@ -531,10 +618,23 @@ impl Engine for CoreEngine {
 
     fn configure_threads(&self, threads: u32) {
         self.requested_threads.store(threads, Ordering::Relaxed);
-        if let Ok(mut st) = self.inference_state.try_lock()
+        if let Ok(mut st) = self.inference_sync.0.try_lock()
             && !st.busy
         {
             self.apply_threads(&mut st.applied_threads);
+            st.models_loaded = false;
+            st.last_finished = None;
+        }
+    }
+
+    fn unload_models(&self) {
+        if let Ok(mut st) = self.inference_sync.0.try_lock()
+            && !st.busy
+        {
+            st.models_loaded = false;
+            st.last_finished = None;
+            drop(st);
+            self.engine.unload();
         }
     }
 

@@ -360,11 +360,26 @@ impl AppCore {
     /// Opens the library (repairing what a crash left behind), loads the
     /// settings and starts the split and scan workers.
     pub fn start(opts: CoreOptions) -> io::Result<Arc<AppCore>> {
+        Self::start_inner(opts, false)
+    }
+
+    /// Starts the app immediately and hydrates the library on a background
+    /// thread so window creation and webview startup overlap with disk scans.
+    pub fn start_deferred(opts: CoreOptions) -> io::Result<Arc<AppCore>> {
+        Self::start_inner(opts, true)
+    }
+
+    fn start_inner(opts: CoreOptions, defer_library: bool) -> io::Result<Arc<AppCore>> {
         opts.paths.prepare()?;
-        let (library, report) = Library::open(opts.paths.library_dir.clone())?;
-        for id in &report.repaired {
-            log::info!("library: repaired session {id} interrupted by a previous exit");
-        }
+        let (library, sync_report) = if defer_library {
+            (Library::new_deferred(opts.paths.library_dir.clone())?, None)
+        } else {
+            let (lib, report) = Library::open_with_gc_dir(
+                opts.paths.library_dir.clone(),
+                Some(&opts.paths.cache_dir),
+            )?;
+            (lib, Some(report))
+        };
         let settings = SettingsStore::load(opts.paths.settings_file.clone());
         if let Ok(engine) = &opts.engine {
             engine.configure_threads(settings.get().threads);
@@ -447,8 +462,31 @@ impl AppCore {
                 version: opts.version,
             }
         });
-        for id in report.pending_scans {
-            core.scans.push(id);
+        if let Some(report) = sync_report {
+            for id in &report.repaired {
+                log::info!("library: repaired session {id} interrupted by a previous exit");
+            }
+            for id in report.pending_scans {
+                core.scans.push(id);
+            }
+        } else {
+            let core_bg = Arc::clone(&core);
+            let _ = std::thread::Builder::new()
+                .name("splitsound-library-init".into())
+                .spawn(move || match core_bg.library.hydrate(Some(&core_bg.paths.cache_dir)) {
+                    Ok(report) => {
+                        for id in &report.repaired {
+                            log::info!(
+                                "library: repaired session {id} interrupted by a previous exit"
+                            );
+                        }
+                        for id in report.pending_scans {
+                            core_bg.scans.push(id);
+                        }
+                        core_bg.library_changed();
+                    }
+                    Err(e) => log::error!("library: background hydration failed: {e}"),
+                });
         }
         Ok(core)
     }
@@ -458,6 +496,9 @@ impl AppCore {
         self.downloads.shutdown();
         self.splits.shutdown();
         self.scans.shutdown();
+        if let Ok(engine) = &self.engine {
+            engine.unload_models();
+        }
         let _ = self.player.unload();
     }
 
@@ -514,10 +555,14 @@ impl AppCore {
             if let Some(bytes) = decoded.artwork.as_deref()
                 && let Some(kind) = artwork::sniff(bytes)
             {
-                let p = staging.join(format!("artwork.{}", kind.extension()));
-                has_artwork = util::write_atomic(&p, bytes).is_ok();
-                if has_artwork && let Some(thumb) = artwork::make_thumbnail(bytes) {
-                    let _ = util::write_atomic(&staging.join("artwork-thumb.jpg"), &thumb);
+                // Persist only the 128x128 thumbnail (~5 KiB) when encoding
+                // succeeds; fall back to the raw cover bytes only on decode failure.
+                if let Some(thumb) = artwork::make_thumbnail(bytes) {
+                    has_artwork =
+                        util::write_atomic(&staging.join("artwork-thumb.jpg"), &thumb).is_ok();
+                } else {
+                    let p = staging.join(format!("artwork.{}", kind.extension()));
+                    has_artwork = util::write_atomic(&p, bytes).is_ok();
                 }
             }
             let file_name = input
@@ -655,8 +700,10 @@ impl AppCore {
             if p.is_file() {
                 let bytes = util::read_bounded(&p, artwork::MAX_ARTWORK_BYTES as u64)
                     .map_err(|e| IpcError::io("read the cover art", &e))?;
-                if let Some(thumb) = artwork::make_thumbnail(&bytes) {
-                    let _ = util::write_atomic(&thumb_path, &thumb);
+                if let Some(thumb) = artwork::make_thumbnail(&bytes)
+                    && util::write_atomic(&thumb_path, &thumb).is_ok()
+                {
+                    let _ = util::remove_file_retry(&p);
                     if let Some(url) = artwork::data_url(&thumb) {
                         return Ok(Some(url));
                     }
@@ -1181,22 +1228,53 @@ impl AppCore {
                 }
                 return Err(IpcError::io("save the stems", &e));
             }
+            let mut precomputed_peaks: Vec<(StemId, Vec<u8>)> = Vec::new();
             let infos: Vec<StemInfo> = output
                 .stems
                 .into_iter()
-                .map(|(st, a)| StemInfo {
-                    id: st,
-                    path: path_string(&stem_path(&dir, st)),
-                    present: a.present,
-                    active_fraction: a.active_fraction,
-                    peak_db: a.peak_db,
-                    rms_db: a.rms_db,
-                    activity: a.activity,
-                    contains: a.contains,
+                .map(|(st, a)| {
+                    if let Some(pk) = a.peaks_960 {
+                        precomputed_peaks.push((st, pk));
+                    }
+                    StemInfo {
+                        id: st,
+                        path: path_string(&stem_path(&dir, st)),
+                        present: a.present,
+                        active_fraction: a.active_fraction,
+                        peak_db: a.peak_db,
+                        rms_db: a.rms_db,
+                        activity: a.activity,
+                        contains: a.contains,
+                    }
                 })
                 .collect();
+            // Clear stale stem peaks and publish precomputed 960-bucket stem
+            // peaks before computing `dir_size` and committing session metadata.
+            if let Ok(rd) = fs::read_dir(dir.join("peaks")) {
+                for entry in rd.flatten() {
+                    if let Some(name) = entry.file_name().to_str()
+                        && !name.starts_with("mix-")
+                    {
+                        let _ = util::remove_file_retry(&entry.path());
+                    }
+                }
+            }
+            for (st, pk) in &precomputed_peaks {
+                crate::audio::peaks::write_peak_cache(
+                    &dir,
+                    &stem_path(&dir, *st),
+                    st.as_str(),
+                    960,
+                    pk,
+                );
+            }
+            // Exclude `stems.old` from the committed size calculation (it is
+            // dropped right after the metadata write succeeds).
+            let old = dir.join("stems.old");
+            let old_size = if old.exists() { util::dir_size(&old) } else { 0 };
+            let final_size = util::dir_size(&dir).saturating_sub(old_size);
             let elapsed = started.elapsed().as_secs_f64();
-            let committed = self.library.update(id, |s, prev| {
+            let committed = self.library.update_with_size(id, final_size, |s, prev| {
                 s.status = SessionStatus::Ready;
                 s.stems = infos;
                 s.split = Some(SplitSummary {
@@ -1222,25 +1300,32 @@ impl AppCore {
                     return Err(e);
                 }
             };
-            if let Ok(rd) = fs::read_dir(dir.join("peaks")) {
-                for entry in rd.flatten() {
-                    if let Some(name) = entry.file_name().to_str()
-                        && !name.starts_with("mix-")
-                    {
-                        let _ = util::remove_file_retry(&entry.path());
-                    }
-                }
-            }
             self.player.reattach(&session, &dir);
             session
         };
         let old = dir.join("stems.old");
-        if let Err(e) = util::remove_dir_all_retry(&old)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            log::warn!("couldn't remove old stems in {}: {e}", dir.display());
+        if old.exists() {
+            let trash = self
+                .paths
+                .cache_dir
+                .join(format!(".stems-trash-{}", &util::new_session_id()[..8]));
+            match util::rename_retry(&old, &trash) {
+                Ok(()) => {
+                    let _ = std::thread::Builder::new()
+                        .name("splitsound-stems-gc".into())
+                        .spawn(move || {
+                            let _ = util::remove_dir_all_retry(&trash);
+                        });
+                }
+                Err(_) => {
+                    if let Err(e) = util::remove_dir_all_retry(&old)
+                        && e.kind() != io::ErrorKind::NotFound
+                    {
+                        log::warn!("couldn't remove old stems in {}: {e}", dir.display());
+                    }
+                }
+            }
         }
-        self.library.refresh_size(id);
         rep.report(
             SplitStage::Writing,
             1.0,

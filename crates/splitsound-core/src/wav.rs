@@ -263,6 +263,39 @@ pub(crate) fn create_temp_sibling(path: &Path) -> std::io::Result<(TempFile, Fil
     ))
 }
 
+/// Atomically copies `src` to `dst` via an unpredictable sibling temp file.
+/// Uses `std::fs::copy` onto a fresh non-existent path so macOS APFS takes
+/// the kernel `clonefile` copy-on-write fast path and Linux uses
+/// `copy_file_range`, then renames into place.
+pub(crate) fn copy_file_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = dst
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    for _ in 0..32 {
+        let mut h = RandomState::new().build_hasher();
+        std::process::id().hash(&mut h);
+        COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut h);
+        let token = h.finish();
+        let mut name = base.clone();
+        name.push(format!(".{token:016x}.part"));
+        let tmp_path = dst.with_file_name(name);
+        if std::fs::symlink_metadata(&tmp_path).is_ok() {
+            continue;
+        }
+        let guard = TempFile {
+            path: Some(tmp_path.clone()),
+        };
+        std::fs::copy(src, &tmp_path)?;
+        return guard.persist(dst);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique temporary file",
+    ))
+}
+
 /// Streaming writer for the working format (32-bit float, stereo).
 ///
 /// Samples go to a temporary sibling file; [`WavWriter::finish`] patches the
@@ -346,19 +379,48 @@ impl WavWriter {
             return Err(Error::internal("write after finish"));
         };
         let n = left.len().min(right.len());
-        let mut buf = [0u8; 8192];
-        let mut pos = 0;
-        while pos < n {
-            let take = (n - pos).min(1024);
-            let lslice = &left[pos..pos + take];
-            let rslice = &right[pos..pos + take];
-            for i in 0..take {
-                buf[i * 8..i * 8 + 4].copy_from_slice(&lslice[i].to_le_bytes());
-                buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&rslice[i].to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            let mut buf = [0f32; 2048];
+            let mut pos = 0;
+            while pos < n {
+                let take = (n - pos).min(1024);
+                let lslice = &left[pos..pos + take];
+                let rslice = &right[pos..pos + take];
+                for (dst, (&l, &r)) in buf[..take * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(lslice.iter().zip(rslice))
+                {
+                    dst[0] = l;
+                    dst[1] = r;
+                }
+                // SAFETY: every bit pattern is valid u8 and `buf[..take * 2]` is initialized.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), take * 8)
+                };
+                out.write_all(bytes)
+                    .map_err(|e| Error::from_write(&e, &self.dst))?;
+                pos += take;
             }
-            out.write_all(&buf[..take * 8])
-                .map_err(|e| Error::from_write(&e, &self.dst))?;
-            pos += take;
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = [0u8; 8192];
+            let mut pos = 0;
+            while pos < n {
+                let take = (n - pos).min(1024);
+                let lslice = &left[pos..pos + take];
+                let rslice = &right[pos..pos + take];
+                for i in 0..take {
+                    buf[i * 8..i * 8 + 4].copy_from_slice(&lslice[i].to_le_bytes());
+                    buf[i * 8 + 4..i * 8 + 8].copy_from_slice(&rslice[i].to_le_bytes());
+                }
+                out.write_all(&buf[..take * 8])
+                    .map_err(|e| Error::from_write(&e, &self.dst))?;
+                pos += take;
+            }
         }
         self.data_bytes += n as u64 * 8;
         Ok(())

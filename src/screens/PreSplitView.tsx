@@ -61,6 +61,14 @@ interface PreSplitViewProps {
   onStartSplit: () => void;
 }
 
+function handleSeekPlayback(pos: number): void {
+  void seekPlayback(pos);
+}
+
+function handleChangeLoop(loop: { startSec: number; endSec: number } | null): void {
+  void setLoopRegion(loop);
+}
+
 export const PreSplitView = memo(function PreSplitView({
   session,
   onStartSplit,
@@ -70,8 +78,7 @@ export const PreSplitView = memo(function PreSplitView({
     splitOptions: s.splitOptions,
     estimate: s.estimate,
   }));
-  const { playing, playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
-    playing: s.playback.playing,
+  const { playbackDurationSec, loop } = useShallowStore(playbackStore, (s) => ({
     playbackDurationSec: s.playback.durationSec,
     loop: s.playback.loop,
   }));
@@ -83,9 +90,7 @@ export const PreSplitView = memo(function PreSplitView({
   const scanFillRef = useRef<HTMLDivElement | null>(null);
 
   const durationSec = playbackDurationSec || session.track.durationSec;
-  const seekHandlers = useWellSeekHandlers(durationSec, true, (pos) => {
-    void seekPlayback(pos);
-  });
+  const seekHandlers = useWellSeekHandlers(durationSec, true, handleSeekPlayback);
 
   const restrictedMissing = models.some((m) => m.restricted && !m.installed);
   const topDetections = session.detections.slice(0, 8);
@@ -297,20 +302,14 @@ export const PreSplitView = memo(function PreSplitView({
         <TimeRuler
           durationSec={durationSec}
           loop={loop}
-          onSeek={(pos) => void seekPlayback(pos)}
-          onChangeLoop={(l) => void setLoopRegion(l)}
+          onSeek={handleSeekPlayback}
+          onChangeLoop={handleChangeLoop}
         />
         <LoopWash loop={loop} durationSec={durationSec} />
         <div className="lane">
-          <WaveformCanvas
-            source="mix"
-            peaks={peaks.mix}
-            audible
-            durationSec={durationSec}
-            playing={playing}
-          />
+          <WaveformCanvas source="mix" peaks={peaks.mix} audible durationSec={durationSec} />
         </div>
-        <PlayheadLine durationSec={durationSec} playing={playing} />
+        <PlayheadLine durationSec={durationSec} />
       </section>
     </main>
   );

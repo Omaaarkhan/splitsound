@@ -450,7 +450,44 @@ impl Tagger {
         hop: usize,
         on_window: &mut dyn FnMut(usize, usize) -> Result<()>,
     ) -> Result<TagScores> {
-        let starts = window_starts_with_hop(mono_32k.len(), hop);
+        self.score_with_hop_filtered(mono_32k, hop, |_| true, on_window)
+    }
+
+    /// [`Tagger::score_with_hop`], scoring only windows where `keep_window(start)`
+    /// returns `true`. If `keep_window` rejects every window, falls back to the
+    /// single highest-energy window so callers never receive an empty pass on a
+    /// quiet stem.
+    pub fn score_with_hop_filtered(
+        &mut self,
+        mono_32k: &[f32],
+        hop: usize,
+        mut keep_window: impl FnMut(usize) -> bool,
+        on_window: &mut dyn FnMut(usize, usize) -> Result<()>,
+    ) -> Result<TagScores> {
+        let all_starts = window_starts_with_hop(mono_32k.len(), hop);
+        let mut starts: Vec<usize> = all_starts
+            .iter()
+            .copied()
+            .filter(|&s| keep_window(s))
+            .collect();
+        if starts.is_empty() && !all_starts.is_empty() {
+            let best = all_starts
+                .iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    let energy = |st: usize| -> f64 {
+                        let end = (st + WINDOW).min(mono_32k.len());
+                        mono_32k[st..end]
+                            .iter()
+                            .step_by(8)
+                            .map(|&v| f64::from(v) * f64::from(v))
+                            .sum()
+                    };
+                    energy(a).total_cmp(&energy(b))
+                })
+                .unwrap_or(0);
+            starts.push(best);
+        }
         let mut max = vec![0f32; NUM_CLASSES];
         let mut sum = vec![0f64; NUM_CLASSES];
         for (i, &start) in starts.iter().enumerate() {
@@ -482,7 +519,7 @@ impl Tagger {
             }
             on_window(i + 1, starts.len())?;
         }
-        let n = starts.len() as f64;
+        let n = starts.len().max(1) as f64;
         Ok(TagScores {
             max,
             mean: sum.iter().map(|s| (s / n) as f32).collect(),

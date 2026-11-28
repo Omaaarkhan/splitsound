@@ -21,13 +21,17 @@ import {
 } from "../src/stores/modelsStore";
 import { COPY } from "../src/utils/errors";
 import {
+  applyPlaybackTick,
   isChannelAudible,
   playbackStore,
   resetPlaybackRuntime,
   setLoopRegion,
+  subscribePlaybackFrame,
+  subscribePlaybackTicks,
   toggleChannelMute,
   toggleChannelSolo,
   toggleLoop,
+  togglePlayback,
 } from "../src/stores/playbackStore";
 import { sessionStore } from "../src/stores/sessionStore";
 import { settingsStore } from "../src/stores/settingsStore";
@@ -341,5 +345,88 @@ describe("application stores", () => {
     await new Promise((r) => setTimeout(r, 160));
     expect(sessionStore.getState().current?.analysis).toBe("done");
     expect(sessionStore.getState().current?.detections.length).toBeGreaterThan(0);
+  });
+
+  it("coalesces rapid loop updates and skips frame callbacks during playback:tick when rAF is active", async () => {
+    await openSongById("golden-hour");
+
+    // 1. Coalesce rapid concurrent setLoopRegion calls into first + latest IPC
+    const sentLoops: unknown[] = [];
+    const origInvoke = backend.invoke.bind(backend);
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let firstBlocked = false;
+    const wrappedBackend: MockBackend = {
+      ...backend,
+      invoke: (async (cmd, args) => {
+        if (cmd === "playback_set_loop") {
+          sentLoops.push((args as { loop: unknown }).loop);
+          if (!firstBlocked) {
+            firstBlocked = true;
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+              markFirstStarted();
+            });
+          }
+        }
+        return origInvoke(cmd as never, args as never);
+      }) as MockBackend["invoke"],
+    };
+    setTransportForTesting(wrappedBackend);
+
+    const p1 = setLoopRegion({ startSec: 10, endSec: 50 });
+    await firstStarted;
+    const p2 = setLoopRegion({ startSec: 12, endSec: 50 });
+    const p3 = setLoopRegion({ startSec: 15, endSec: 50 });
+    const p4 = setLoopRegion({ startSec: 20, endSec: 60 });
+    releaseFirst();
+    await Promise.all([p1, p2, p3, p4]);
+    expect(sentLoops).toEqual([
+      { startSec: 10, endSec: 50 },
+      { startSec: 20, endSec: 60 },
+    ]);
+    expect(playbackStore.getState().playback.loop).toEqual({ startSec: 20, endSec: 60 });
+
+    // 2. While rAF is active, applyPlaybackTick notifies tick listeners only (no extra frame paint)
+    const origRaf = globalThis.requestAnimationFrame;
+    const origCancel = globalThis.cancelAnimationFrame;
+    let rafHandle = 1;
+    let activeRafs = 0;
+    globalThis.requestAnimationFrame = () => {
+      activeRafs++;
+      return rafHandle++;
+    };
+    globalThis.cancelAnimationFrame = () => {
+      activeRafs = Math.max(0, activeRafs - 1);
+    };
+    try {
+      let tickCalls = 0;
+      let frameCalls = 0;
+      const unsubTick = subscribePlaybackTicks(() => tickCalls++);
+      const unsubFrame = subscribePlaybackFrame(() => frameCalls++);
+
+      // Paused (rAF inactive): tick updates both tick & frame listeners
+      applyPlaybackTick({ positionSec: 5, levels: [{ id: "vocals", peak: 0.5 }] });
+      expect(tickCalls).toBe(1);
+      expect(frameCalls).toBe(1);
+
+      // Playing (rAF scheduled): tick updates tick listeners only
+      await togglePlayback();
+      expect(activeRafs).toBeGreaterThan(0);
+      tickCalls = 0;
+      frameCalls = 0;
+      applyPlaybackTick({ positionSec: 6, levels: [{ id: "vocals", peak: 0.7 }] });
+      expect(tickCalls).toBe(1);
+      expect(frameCalls).toBe(0);
+
+      unsubTick();
+      unsubFrame();
+    } finally {
+      globalThis.requestAnimationFrame = origRaf;
+      globalThis.cancelAnimationFrame = origCancel;
+    }
   });
 });
